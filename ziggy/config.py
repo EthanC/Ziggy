@@ -16,7 +16,10 @@ from loguru import logger
 from ziggy.urls import normalize_host, normalize_url
 
 _DURATION_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>s|m|h|d)$")
-_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_INTERNET_ARCHIVE_EMAIL_ENV = "ZIGGY_INTERNET_ARCHIVE_EMAIL"
+_INTERNET_ARCHIVE_PASSWORD_ENV = "ZIGGY_INTERNET_ARCHIVE_PASSWORD"  # noqa: S105
+_DISCORD_WEBHOOK_URL_ENV = "ZIGGY_DISCORD_WEBHOOK_URL"
+_LOG_DISCORD_WEBHOOK_URL_ENV = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
 
 
 class ConfigError(ValueError):
@@ -50,14 +53,6 @@ def _positive_float(value: object, name: str) -> float:
     if result == 0:
         raise ConfigError(f"{name} must be greater than zero")
     return result
-
-
-def _env_name(value: object, name: str, *, optional: bool = False) -> str | None:
-    if value is None and optional:
-        return None
-    if not isinstance(value, str) or _ENV_RE.fullmatch(value) is None:
-        raise ConfigError(f"{name} must be a valid environment-variable name")
-    return value
 
 
 def _table(value: object, name: str) -> dict[str, Any]:
@@ -101,8 +96,6 @@ class ArchiveSettings:
     interval: timedelta = timedelta(days=30)
     concurrency: int = 1
     dedupe_window: timedelta = timedelta(hours=24)
-    username_env: str = "ZIGGY_ARCHIVE_ORG_USERNAME"
-    password_env: str = "ZIGGY_ARCHIVE_ORG_PASSWORD"  # noqa: S105
     max_attempts: int = 5
 
 
@@ -111,7 +104,6 @@ class ReportingSettings:
     """Periodic report settings."""
 
     interval: timedelta = timedelta(hours=24)
-    discord_webhook_url_env: str | None = "ZIGGY_DISCORD_WEBHOOK_URL"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +111,6 @@ class LoggingSettings:
     """Local and Discord logging settings."""
 
     level: str = "INFO"
-    discord_webhook_url_env: str | None = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
     discord_min_level: str = "WARNING"
 
 
@@ -159,7 +150,7 @@ class Config:
 class Secrets:
     """Resolved credentials that are never persisted."""
 
-    archive_username: str | None
+    archive_email: str | None
     archive_password: str | None
     reporting_webhook_url: str | None
     logging_webhook_url: str | None
@@ -217,20 +208,6 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveSettings:
         interval=parse_duration(data.get("interval", "30d")),
         concurrency=_positive_int(data.get("concurrency", 1), "archive.concurrency"),
         dedupe_window=parse_duration(data.get("dedupe_window", "24h")),
-        username_env=cast(
-            "str",
-            _env_name(
-                data.get("username_env", "ZIGGY_ARCHIVE_ORG_USERNAME"),
-                "archive.username_env",
-            ),
-        ),
-        password_env=cast(
-            "str",
-            _env_name(
-                data.get("password_env", "ZIGGY_ARCHIVE_ORG_PASSWORD"),
-                "archive.password_env",
-            ),
-        ),
         max_attempts=_positive_int(data.get("max_attempts", 5), "archive.max_attempts"),
     )
 
@@ -238,14 +215,7 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveSettings:
 def _parse_reporting(data: dict[str, Any]) -> ReportingSettings:
     names = {field.name for field in fields(ReportingSettings)}
     _only(data, names, "reporting")
-    return ReportingSettings(
-        interval=parse_duration(data.get("interval", "24h")),
-        discord_webhook_url_env=_env_name(
-            data.get("discord_webhook_url_env", "ZIGGY_DISCORD_WEBHOOK_URL"),
-            "reporting.discord_webhook_url_env",
-            optional=True,
-        ),
-    )
+    return ReportingSettings(interval=parse_duration(data.get("interval", "24h")))
 
 
 def _parse_logging(data: dict[str, Any]) -> LoggingSettings:
@@ -261,11 +231,6 @@ def _parse_logging(data: dict[str, Any]) -> LoggingSettings:
     )
     return LoggingSettings(
         level=normalized_level,
-        discord_webhook_url_env=_env_name(
-            data.get("discord_webhook_url_env", "ZIGGY_LOG_DISCORD_WEBHOOK_URL"),
-            "logging.discord_webhook_url_env",
-            optional=True,
-        ),
         discord_min_level=normalized_discord_level,
     )
 
@@ -360,24 +325,21 @@ def load_config(path: Path) -> Config:
     )
 
 
-def resolve_secrets(config: Config, env: Env | None = None) -> Secrets:
+def resolve_secrets(env: Env | None = None) -> Secrets:
     """Resolve optional secrets from environment variables."""
     env = env or Env()
-    username = env.str(config.archive.username_env, default=None) or None
-    password = env.str(config.archive.password_env, default=None) or None
-    if (username is None) != (password is None):
+    email = env.str(_INTERNET_ARCHIVE_EMAIL_ENV, default=None) or None
+    password = env.str(_INTERNET_ARCHIVE_PASSWORD_ENV, default=None) or None
+    if (email is None) != (password is None):
         raise ConfigError(
-            "Archive.org username and password must both be set or both be unset"
+            "Internet Archive email and password must both be set or both be unset"
         )
 
-    def optional(name: str | None) -> str | None:
-        return (env.str(name, default=None) or None) if name is not None else None
-
     return Secrets(
-        archive_username=username,
+        archive_email=email,
         archive_password=password,
-        reporting_webhook_url=optional(config.reporting.discord_webhook_url_env),
-        logging_webhook_url=optional(config.logging.discord_webhook_url_env),
+        reporting_webhook_url=env.str(_DISCORD_WEBHOOK_URL_ENV, default=None) or None,
+        logging_webhook_url=env.str(_LOG_DISCORD_WEBHOOK_URL_ENV, default=None) or None,
     )
 
 

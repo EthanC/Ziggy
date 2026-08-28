@@ -63,7 +63,7 @@ class LoggingController:
         sensitive = tuple(
             value
             for value in (
-                secrets.archive_username,
+                secrets.archive_email,
                 secrets.archive_password,
                 secrets.reporting_webhook_url,
                 secrets.logging_webhook_url,

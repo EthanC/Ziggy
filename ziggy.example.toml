@@ -16,17 +16,13 @@ max_attempts = 5
 interval = "30d"
 concurrency = 1
 dedupe_window = "24h"
-username_env = "ZIGGY_ARCHIVE_ORG_USERNAME"
-password_env = "ZIGGY_ARCHIVE_ORG_PASSWORD"
 max_attempts = 5
 
 [reporting]
 interval = "24h"
-discord_webhook_url_env = "ZIGGY_DISCORD_WEBHOOK_URL"
 
 [logging]
 level = "INFO"
-discord_webhook_url_env = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
 discord_min_level = "WARNING"
 
 [[domains]]

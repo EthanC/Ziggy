@@ -41,8 +41,8 @@ jobs:
       - name: Smoke-test image
         run: >-
           docker run --rm
-          -e ZIGGY_ARCHIVE_ORG_USERNAME=test
-          -e ZIGGY_ARCHIVE_ORG_PASSWORD=test
+          -e ZIGGY_INTERNET_ARCHIVE_EMAIL=test@example.com
+          -e ZIGGY_INTERNET_ARCHIVE_PASSWORD=test
           -v "${{ github.workspace }}/ziggy.example.toml:/ziggy/ziggy.toml:ro"
           ziggy:test
           python -m ziggy check-config --config /ziggy/ziggy.toml

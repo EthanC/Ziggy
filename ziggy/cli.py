@@ -30,7 +30,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(arguments.config)
         if arguments.command == "check-config":
-            resolve_secrets(config)
+            resolve_secrets()
             return 0
         if arguments.command == "healthcheck":
             return 0 if asyncio.run(check_health(config.ziggy.database)) else 1

@@ -15,7 +15,7 @@ from ziggy.config import LoggingSettings, Secrets
 
 def secrets(webhook: str | None = None) -> Secrets:
     return Secrets(
-        archive_username="archive-user",
+        archive_email="user@example.com",
         archive_password="archive-password",  # noqa: S106
         reporting_webhook_url="https://reports.invalid/hook?token=report-token",
         logging_webhook_url=webhook,
@@ -58,7 +58,9 @@ def test_configure_replaces_stderr_and_selects_terminal_format(
 
     fake_logger.configure.assert_called_once()
     patcher = fake_logger.configure.call_args.kwargs["patcher"]
-    record = {"message": "archive-user archive-password https://x.invalid/?secret=1"}
+    record = {
+        "message": "user@example.com archive-password https://x.invalid/?secret=1"
+    }
     patcher(record)
     assert record["message"] == "<redacted> <redacted> https://x.invalid/?<redacted>"
     assert fake_logger.remove.call_args_list == [call(4)]

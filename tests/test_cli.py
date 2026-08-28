@@ -32,7 +32,7 @@ def test_check_config_resolves_secrets_and_returns_success(monkeypatch):
 
     assert cli.main(["check-config", "--config", str(CONFIG_PATH)]) == 0
     load.assert_called_once_with(CONFIG_PATH)
-    resolve.assert_called_once_with(loaded)
+    resolve.assert_called_once_with()
 
 
 @pytest.mark.parametrize(("healthy", "exit_code"), [(True, 0), (False, 1)])

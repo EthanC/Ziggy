@@ -48,10 +48,10 @@ class ArchiveAuthenticationError(ArchiveError):
 
 
 class ArchiveRateLimitError(ArchiveError):
-    """Archive.org requested a later retry."""
+    """Internet Archive requested a later retry."""
 
     def __init__(self, retry_at: datetime | None) -> None:
-        """Store Archive.org's parsed retry time when available."""
+        """Store the Internet Archive's parsed retry time when available."""
         super().__init__("Internet Archive rate limit")
         self.retry_at = retry_at
 
@@ -115,18 +115,18 @@ class ArchivistClient:
 
     def __init__(
         self,
-        username: str | None = None,
+        email: str | None = None,
         password: str | None = None,
         timeout: float = 30.0,
     ) -> None:
         """Create an anonymous or account-backed Archivist client."""
-        if bool(username) != bool(password):
+        if bool(email) != bool(password):
             raise ValueError(
-                "Archive.org username and password must be provided together"
+                "Internet Archive email and password must be provided together"
             )
         account = (
-            InternetArchiveAccount(username, password, remember=True)
-            if username and password
+            InternetArchiveAccount(email, password, remember=True)
+            if email and password
             else None
         )
         self._has_account = account is not None

@@ -49,7 +49,7 @@ def make_config(database: Path = Path("ziggy.sqlite3"), **changes: object) -> Co
 
 def make_secrets(**changes: object) -> Secrets:
     values = {
-        "archive_username": "user",
+        "archive_email": "user@example.com",
         "archive_password": "password",
         "reporting_webhook_url": None,
         "logging_webhook_url": None,
@@ -500,7 +500,9 @@ async def test_config_watcher_swaps_changed_boundaries_and_applies_reload(monkey
 
     await service._config_watcher(Path("ziggy.toml"), state, Sessions(session), stop)
 
-    archive_factory.assert_called_once_with("user", "new-password", timeout=15.0)
+    archive_factory.assert_called_once_with(
+        "user@example.com", "new-password", timeout=15.0
+    )
     candidate.login.assert_awaited_once_with()
     assert state.archive_client is candidate
     assert state.retired_archive_clients == [old_archive]

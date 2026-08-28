@@ -90,7 +90,7 @@ class RuntimeState:
 async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     """Start Ziggy, own all resources, and stop cleanly on a signal."""
     config = load_config(config_path)
-    secrets = resolve_secrets(config)
+    secrets = resolve_secrets()
     logging_controller = LoggingController()
     logging_controller.configure(config.logging, secrets)
     engine: AsyncEngine | None = None
@@ -100,7 +100,7 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
         await run_migrations(config.ziggy.database)
         engine = create_engine(config.ziggy.database)
         archive_client = ArchivistClient(
-            secrets.archive_username,
+            secrets.archive_email,
             secrets.archive_password,
             timeout=config.crawl.request_timeout,
         )
@@ -184,7 +184,7 @@ async def _config_watcher(
             return
         try:
             replacement = load_config(config_path)
-            secrets = resolve_secrets(replacement)
+            secrets = resolve_secrets()
         except ConfigError as error:
             logger.error("Configuration reload rejected: {}", error)
             continue
@@ -198,12 +198,12 @@ async def _config_watcher(
         ):
             continue
         if (
-            secrets.archive_username != state.secrets.archive_username
+            secrets.archive_email != state.secrets.archive_email
             or secrets.archive_password != state.secrets.archive_password
             or state.archive_paused
         ):
             candidate = ArchivistClient(
-                secrets.archive_username,
+                secrets.archive_email,
                 secrets.archive_password,
                 timeout=replacement.crawl.request_timeout,
             )

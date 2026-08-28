@@ -1045,10 +1045,12 @@ def test_adapter_constructor_wires_account_and_timeout(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(archive, "AsyncInternetArchiveClient", make_native)
 
-    adapter = archive.ArchivistClient("archive-user", "archive-password", timeout=4.5)
+    adapter = archive.ArchivistClient(
+        "user@example.com", "archive-password", timeout=4.5
+    )
 
     assert adapter._client is native  # noqa: SLF001
-    assert captured["account"].username == "archive-user"
+    assert captured["account"].username == "user@example.com"
     assert captured["account"].remember is True
     assert captured["timeout"] == 4.5
 
@@ -1072,12 +1074,12 @@ def test_adapter_constructor_supports_anonymous_client(
 
 
 @pytest.mark.parametrize(
-    ("username", "password"),
-    [("archive-user", None), (None, "archive-password")],
+    ("email", "password"),
+    [("user@example.com", None), (None, "archive-password")],
 )
-def test_adapter_constructor_rejects_partial_credentials(username, password):
+def test_adapter_constructor_rejects_partial_credentials(email, password):
     with pytest.raises(ValueError, match="must be provided together"):
-        archive.ArchivistClient(username, password)
+        archive.ArchivistClient(email, password)
 
 
 async def test_anonymous_adapter_skips_login_and_authenticated_options(
