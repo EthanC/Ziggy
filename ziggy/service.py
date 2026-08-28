@@ -76,6 +76,7 @@ class RuntimeState:
     archive_client: ArchivistClient
     crawler: CrawlerClient
     logging: LoggingController
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     archive_paused: bool = False
     retired_archive_clients: list[ArchivistClient] = field(default_factory=list)
     retired_crawlers: list[CrawlerClient] = field(default_factory=list)
@@ -127,6 +128,7 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     remove_signals = _install_signal_handlers(stop)
     try:
         now = datetime.now(UTC)
+        state.started_at = now
         async with sessions() as session:
             await reconcile_domains(session, config, now)
             session.add(
@@ -499,7 +501,12 @@ async def _report_scheduler(
         now = datetime.now(UTC)
         async with sessions() as session:
             last_end = await session.scalar(select(func.max(Report.window_end)))
-            window = next_report_window(last_end, now, state.config.reporting.interval)
+            interval = state.config.reporting.interval
+            window = (
+                next_report_window(last_end, now, interval)
+                if last_end is not None or now >= state.started_at + interval
+                else None
+            )
             if window is not None:
                 await create_report(session, window, now)
             report = await claim_report(session, instance_id, now, _LEASE_DURATION)

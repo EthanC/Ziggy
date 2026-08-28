@@ -995,6 +995,7 @@ async def test_archive_poll_scheduler_covers_idle_and_work(monkeypatch):
 
 async def test_report_scheduler_creates_claims_and_delivers(monkeypatch):
     state = make_state(secrets=make_secrets(reporting_webhook_url="discord"))
+    state.started_at = datetime.now(UTC) - state.config.reporting.interval
     stop = asyncio.Event()
     session = MagicMock(scalar=AsyncMock(return_value=None))
     window = SimpleNamespace()
@@ -1016,6 +1017,29 @@ async def test_report_scheduler_creates_claims_and_delivers(monkeypatch):
     create.assert_awaited_once()
     deliver.assert_awaited_once()
     assert deliver.call_args.args[2] == "discord"
+
+
+async def test_report_scheduler_waits_one_interval_before_first_report(monkeypatch):
+    state = make_state()
+    state.started_at = datetime.now(UTC)
+    stop = asyncio.Event()
+    session = MagicMock(scalar=AsyncMock(return_value=None))
+    next_window = MagicMock()
+    create = AsyncMock()
+    claim_report = AsyncMock(return_value=None)
+    monkeypatch.setattr(service, "next_report_window", next_window)
+    monkeypatch.setattr(service, "create_report", create)
+    monkeypatch.setattr(service, "claim_report", claim_report)
+
+    async def stop_wait(event, _seconds):
+        event.set()
+
+    monkeypatch.setattr(service, "_wait", stop_wait)
+    await service._report_scheduler(state, Sessions(session), "instance", stop)
+
+    next_window.assert_not_called()
+    create.assert_not_awaited()
+    claim_report.assert_awaited_once()
 
 
 async def test_report_scheduler_skips_absent_window_and_report(monkeypatch):
