@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Protocol, Self, cast
 from urllib.parse import urlsplit
 
 import niquests
+from loguru import logger
 from sqlalchemy.dialects.sqlite import insert
 
 from ziggy.models import Page
@@ -481,7 +482,10 @@ async def crawl_page(  # noqa: PLR0913
             include_subdomains=include_subdomains,
         )
     )
-    if scoped:
+    discovered = tuple(dict.fromkeys(scoped))
+    for value in discovered:
+        logger.info("Page found: {}", value)
+    if discovered:
         await session.execute(
             insert(Page)
             .values(
@@ -498,7 +502,7 @@ async def crawl_page(  # noqa: PLR0913
                         if is_sitemap and value in found
                         else 0,
                     }
-                    for value in dict.fromkeys(scoped)
+                    for value in discovered
                 ]
             )
             .on_conflict_do_update(

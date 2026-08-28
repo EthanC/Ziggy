@@ -721,8 +721,14 @@ def test_discoveries_propagates_invalid_sitemap_error():
         crawler.discoveries(result, 0)
 
 
-async def test_crawl_page_success_updates_metadata_and_inserts_unique_scoped_urls():
+async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
+    monkeypatch,
+):
     page = make_page()
+    logged = []
+    monkeypatch.setattr(
+        crawler.logger, "info", lambda message, url: logged.append((message, url))
+    )
     result = make_result(
         final_url="https://example.com/final",
         headers={
@@ -773,6 +779,11 @@ async def test_crawl_page_success_updates_metadata_and_inserts_unique_scoped_url
         "https://example.com/child",
         "https://example.com/redirect",
         "https://example.com/header",
+    ]
+    assert logged == [
+        ("Page found: {}", "https://example.com/child"),
+        ("Page found: {}", "https://example.com/redirect"),
+        ("Page found: {}", "https://example.com/header"),
     ]
     assert "ON CONFLICT (url) DO UPDATE" in str(statement)
 
