@@ -12,6 +12,7 @@ dependencies = [
     "alembic",
     "archivist-py",
     "discord-clyde",
+    "environs>=15.1.0",
     "loguru",
     "loguru-discord",
     "niquests",

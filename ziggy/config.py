@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import tomllib
 from dataclasses import dataclass, fields
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
+from environs import Env
 from loguru import logger
 
 from ziggy.urls import normalize_host, normalize_url
@@ -360,11 +360,11 @@ def load_config(path: Path) -> Config:
     )
 
 
-def resolve_secrets(config: Config, environ: dict[str, str] | None = None) -> Secrets:
+def resolve_secrets(config: Config, env: Env | None = None) -> Secrets:
     """Resolve required and optional secrets from environment variables."""
-    source = os.environ if environ is None else environ
-    username = source.get(config.archive.username_env)
-    password = source.get(config.archive.password_env)
+    env = env or Env()
+    username = env.str(config.archive.username_env, default=None)
+    password = env.str(config.archive.password_env, default=None)
     missing = [
         name
         for name, value in (
@@ -379,7 +379,7 @@ def resolve_secrets(config: Config, environ: dict[str, str] | None = None) -> Se
         )
 
     def optional(name: str | None) -> str | None:
-        return (source.get(name) or None) if name is not None else None
+        return (env.str(name, default=None) or None) if name is not None else None
 
     return Secrets(
         archive_username=cast("str", username),

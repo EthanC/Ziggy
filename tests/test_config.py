@@ -343,21 +343,19 @@ def test_load_config_wraps_io_and_toml_errors(tmp_path):
         load_config(write_config(tmp_path, "not = [valid"))
 
 
-def test_resolve_secrets_reads_required_and_optional_environment(tmp_path):
+def test_resolve_secrets_reads_required_and_optional_environment(tmp_path, monkeypatch):
     config = minimal_config(
         tmp_path,
         '[archive]\nusername_env = "USER_SECRET"\npassword_env = "PASS_SECRET"\n'
         '[reporting]\ndiscord_webhook_url_env = "REPORT_SECRET"\n'
         '[logging]\ndiscord_webhook_url_env = "LOG_SECRET"\n',
     )
-    environ = {
-        "USER_SECRET": "alice",
-        "PASS_SECRET": "password",
-        "REPORT_SECRET": "https://report.example/",
-        "LOG_SECRET": "https://log.example/",
-    }
+    monkeypatch.setenv("USER_SECRET", "alice")
+    monkeypatch.setenv("PASS_SECRET", "password")
+    monkeypatch.setenv("REPORT_SECRET", "https://report.example/")
+    monkeypatch.setenv("LOG_SECRET", "https://log.example/")
 
-    secrets = resolve_secrets(config, environ)
+    secrets = resolve_secrets(config)
 
     assert secrets.archive_username == "alice"
     assert secrets.archive_password == "password"  # noqa: S105
@@ -374,7 +372,7 @@ def test_resolve_secrets_uses_process_environment(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("environ", "names"),
+    ("values", "names"),
     [
         ({}, "ZIGGY_ARCHIVE_ORG_USERNAME, ZIGGY_ARCHIVE_ORG_PASSWORD"),
         (
@@ -387,43 +385,39 @@ def test_resolve_secrets_uses_process_environment(tmp_path, monkeypatch):
     ],
 )
 def test_resolve_secrets_rejects_missing_or_empty_required_values(
-    tmp_path, environ, names
+    tmp_path, monkeypatch, values, names
 ):
     config = minimal_config(tmp_path)
+    for name in ("ZIGGY_ARCHIVE_ORG_USERNAME", "ZIGGY_ARCHIVE_ORG_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
 
     with pytest.raises(ConfigError, match=names):
-        resolve_secrets(config, environ)
+        resolve_secrets(config)
 
 
-def test_resolve_secrets_supports_disabled_optional_values(tmp_path):
+def test_resolve_secrets_supports_disabled_optional_values(tmp_path, monkeypatch):
     parsed = minimal_config(tmp_path)
     config = replace(
         parsed,
         reporting=replace(parsed.reporting, discord_webhook_url_env=None),
         logging=replace(parsed.logging, discord_webhook_url_env=None),
     )
-    secrets = resolve_secrets(
-        config,
-        {
-            "ZIGGY_ARCHIVE_ORG_USERNAME": "user",
-            "ZIGGY_ARCHIVE_ORG_PASSWORD": "pass",
-        },
-    )
+    monkeypatch.setenv("ZIGGY_ARCHIVE_ORG_USERNAME", "user")
+    monkeypatch.setenv("ZIGGY_ARCHIVE_ORG_PASSWORD", "pass")
+    secrets = resolve_secrets(config)
 
     assert secrets.reporting_webhook_url is None
     assert secrets.logging_webhook_url is None
 
 
-def test_resolve_secrets_treats_empty_optional_values_as_unset(tmp_path):
-    secrets = resolve_secrets(
-        minimal_config(tmp_path),
-        {
-            "ZIGGY_ARCHIVE_ORG_USERNAME": "user",
-            "ZIGGY_ARCHIVE_ORG_PASSWORD": "pass",
-            "ZIGGY_DISCORD_WEBHOOK_URL": "",
-            "ZIGGY_LOG_DISCORD_WEBHOOK_URL": "",
-        },
-    )
+def test_resolve_secrets_treats_empty_optional_values_as_unset(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZIGGY_ARCHIVE_ORG_USERNAME", "user")
+    monkeypatch.setenv("ZIGGY_ARCHIVE_ORG_PASSWORD", "pass")
+    monkeypatch.setenv("ZIGGY_DISCORD_WEBHOOK_URL", "")
+    monkeypatch.setenv("ZIGGY_LOG_DISCORD_WEBHOOK_URL", "")
+    secrets = resolve_secrets(minimal_config(tmp_path))
 
     assert secrets.reporting_webhook_url is None
     assert secrets.logging_webhook_url is None
