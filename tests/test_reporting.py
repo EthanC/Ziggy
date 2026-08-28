@@ -272,6 +272,34 @@ async def test_deliver_report_without_webhook_logs_and_releases_lease(monkeypatc
     info.assert_called_once()
 
 
+async def test_deliver_report_with_no_changes_logs_without_discord(monkeypatch):
+    report = make_report(
+        discovered_count=0,
+        archived_count=0,
+        outstanding_count=0,
+    )
+    session = MagicMock()
+    session.commit = AsyncMock()
+    info = MagicMock()
+    build_webhook = MagicMock()
+    monkeypatch.setattr(reporting.logger, "info", info)
+    monkeypatch.setattr(reporting, "build_report_webhook", build_webhook)
+
+    await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
+
+    assert report.state is ReportState.LOGGED
+    assert report.delivered_at == NOW
+    assert report.lease_owner is None
+    assert report.lease_expires_at is None
+    info.assert_called_once_with(
+        "Archive report {} to {}: no changes to report",
+        report.window_start,
+        report.window_end,
+    )
+    build_webhook.assert_not_called()
+    session.commit.assert_awaited_once()
+
+
 async def test_deliver_report_persists_discord_metadata(monkeypatch):
     report = make_report(error="old")
     response = MagicMock()

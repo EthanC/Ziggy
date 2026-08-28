@@ -137,6 +137,19 @@ async def deliver_report(
     now: datetime,
 ) -> None:
     """Deliver, log, or reschedule one persisted report row."""
+    if not any(
+        (report.discovered_count, report.archived_count, report.outstanding_count)
+    ):
+        logger.info(
+            "Archive report {} to {}: no changes to report",
+            report.window_start,
+            report.window_end,
+        )
+        report.state = ReportState.LOGGED
+        report.delivered_at = now
+        _release_report(report)
+        await session.commit()
+        return
     if webhook_url is None:
         logger.info(
             "Archive report {} to {}: {} discovered, {} archived, {} outstanding",
