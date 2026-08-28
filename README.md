@@ -20,7 +20,7 @@ Ziggy crawls and preserves the websites you care about.
 
 ## Docker Compose
 
-Copy `ziggy.example.toml` to `ziggy.toml`, set `database = "/data/ziggy.sqlite3"`, and configure the domains to crawl. Copy `.env.example` to `.env` and add your Archive.org credentials, then create `compose.yaml` beside them:
+Create `/path/to/ziggy`, copy `ziggy.example.toml` to `/path/to/ziggy/ziggy.toml`, and configure the domains to crawl. Copy `.env.example` to `.env`, add your Archive.org credentials, and create `compose.yaml` beside `.env`:
 
 ```yaml
 services:
@@ -29,13 +29,11 @@ services:
     image: ghcr.io/ethanc/ziggy:latest
     env_file: .env
     volumes:
-      - ./ziggy.toml:/config/ziggy.toml:ro
-      - ziggy-data:/data
+      - /path/to/ziggy:/ziggy
     restart: unless-stopped
-
-volumes:
-  ziggy-data:
 ```
+
+On Linux, `/path/to/ziggy` must be writable by UID/GID `10001` so Ziggy can create `ziggy.db` and its sidecar files.
 
 Start Ziggy:
 

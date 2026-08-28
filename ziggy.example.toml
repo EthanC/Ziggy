@@ -1,5 +1,5 @@
 [ziggy]
-database = "./data/ziggy.sqlite3"
+database = "./ziggy.db"
 config_reload_interval = "30s"
 
 [crawl]

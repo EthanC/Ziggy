@@ -24,14 +24,13 @@ LABEL org.opencontainers.image.title="Ziggy" \
 
 RUN groupadd --gid 10001 ziggy \
     && useradd --uid 10001 --gid ziggy --no-create-home --shell /usr/sbin/nologin ziggy \
-    && mkdir -p /app /config /data \
-    && chown ziggy:ziggy /config /data
+    && mkdir -p /app /ziggy \
+    && chown ziggy:ziggy /ziggy
 WORKDIR /app
 COPY --from=builder /app /app
 COPY ziggy ./ziggy
 ENV PATH="/app/.venv/bin:${PATH}" PYTHONUNBUFFERED=1
 USER 10001:10001
-VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
-    CMD ["python", "-m", "ziggy", "healthcheck", "--config", "/config/ziggy.toml"]
-CMD ["python", "-m", "ziggy", "run", "--config", "/config/ziggy.toml"]
+    CMD ["python", "-m", "ziggy", "healthcheck", "--config", "/ziggy/ziggy.toml"]
+CMD ["python", "-m", "ziggy", "run", "--config", "/ziggy/ziggy.toml"]

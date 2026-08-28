@@ -43,6 +43,6 @@ jobs:
           docker run --rm
           -e ZIGGY_ARCHIVE_ORG_USERNAME=test
           -e ZIGGY_ARCHIVE_ORG_PASSWORD=test
-          -v "${{ github.workspace }}/ziggy.example.toml:/config/ziggy.toml:ro"
+          -v "${{ github.workspace }}/ziggy.example.toml:/ziggy/ziggy.toml:ro"
           ziggy:test
-          python -m ziggy check-config --config /config/ziggy.toml
+          python -m ziggy check-config --config /ziggy/ziggy.toml
