@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.14"
+      - run: uv sync --locked
+      - run: uv lock --check
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run ty check
+      - run: >-
+          uv run pytest
+          --cov=ziggy
+          --cov-branch
+          --cov-report=term-missing
+          --cov-report=xml
+          --cov-report=html
+          --cov-fail-under=100
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            htmlcov/
+      - name: Build image
+        run: docker build --build-arg REVISION=${{ github.sha }} -t ziggy:test .
+      - name: Smoke-test image
+        run: >-
+          docker run --rm
+          -e ZIGGY_ARCHIVE_ORG_USERNAME=test
+          -e ZIGGY_ARCHIVE_ORG_PASSWORD=test
+          -v "${{ github.workspace }}/ziggy.example.toml:/config/ziggy.toml:ro"
+          ziggy:test
+          python -m ziggy check-config --config /config/ziggy.toml

@@ -1,0 +1,83 @@
+[project]
+name = "ziggy"
+version = "0.1.0"
+description = "Continuously crawl configured sites and preserve their pages in the Internet Archive"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+license = "AGPL-3.0-only"
+authors = [{ name = "Ethan C" }]
+license-files = ["LICENSE"]
+dependencies = [
+    "aiosqlite",
+    "alembic",
+    "archivist-py",
+    "discord-clyde",
+    "loguru",
+    "loguru-discord",
+    "niquests",
+    "sqlalchemy",
+]
+
+[dependency-groups]
+dev = [
+    "coverage",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "ty",
+]
+
+[tool.uv]
+required-version = ">=0.12.5"
+package = false
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = ["."]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812",
+    "CPY001",
+    "D203",
+    "D213",
+    "EM101",
+    "EM102",
+    "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN", "ARG", "D", "INP001", "PLR2004", "S101"]
+"ziggy/migrations/**" = ["D"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["ziggy"]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+skip_covered = false
+exclude_also = []
+
+[tool.coverage.html]
+directory = "htmlcov"
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.ty.environment]
+python-version = "3.14"
+
+[tool.ty.src]
+include = ["ziggy"]

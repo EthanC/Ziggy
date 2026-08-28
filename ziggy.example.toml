@@ -1,0 +1,36 @@
+[ziggy]
+database = "./data/ziggy.sqlite3"
+config_reload_interval = "30s"
+
+[crawl]
+interval = "24h"
+concurrency = 8
+per_host_concurrency = 2
+request_delay = 1.0
+request_timeout = 30.0
+max_response_bytes = 10485760
+max_redirects = 10
+max_attempts = 5
+
+[archive]
+interval = "30d"
+concurrency = 1
+dedupe_window = "24h"
+username_env = "ZIGGY_ARCHIVE_ORG_USERNAME"
+password_env = "ZIGGY_ARCHIVE_ORG_PASSWORD"
+max_attempts = 5
+
+[reporting]
+interval = "24h"
+discord_webhook_url_env = "ZIGGY_DISCORD_WEBHOOK_URL"
+
+[logging]
+level = "INFO"
+discord_webhook_url_env = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
+discord_min_level = "WARNING"
+
+[[domains]]
+host = "example.com"
+scheme = "https"
+include_subdomains = false
+seeds = ["/"]
