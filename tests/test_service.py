@@ -14,7 +14,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ziggy import service
-from ziggy.archive import ArchiveAuthenticationError, ArchiveError, ArchiveJobState
+from ziggy.archive import (
+    ArchiveAuthenticationError,
+    ArchiveError,
+    ArchiveJobState,
+    ArchiveRateLimitError,
+)
 from ziggy.config import (
     ArchiveSettings,
     Config,
@@ -96,7 +101,9 @@ def make_state(config: Config | None = None, secrets: Secrets | None = None):
     return service.RuntimeState(
         config or make_config(),
         secrets or make_secrets(),
-        SimpleNamespace(close=AsyncMock()),
+        SimpleNamespace(
+            close=AsyncMock(), submission_capacity=AsyncMock(return_value=None)
+        ),
         SimpleNamespace(close=AsyncMock()),
         SimpleNamespace(configure=MagicMock()),
     )
@@ -501,7 +508,7 @@ async def test_config_watcher_swaps_changed_boundaries_and_applies_reload(monkey
     await service._config_watcher(Path("ziggy.toml"), state, Sessions(session), stop)
 
     archive_factory.assert_called_once_with(
-        "user@example.com", "new-password", timeout=15.0
+        "user@example.com", "new-password", timeout=15.0, request_delay=1.0
     )
     candidate.login.assert_awaited_once_with()
     assert state.archive_client is candidate
@@ -546,6 +553,45 @@ async def test_config_watcher_applies_logging_only_change_without_client_swap(
     assert state.archive_client is archive
     assert state.crawler is crawler
     assert state.config == replacement
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        replace(
+            make_config(), crawl=replace(make_config().crawl, request_timeout=15.0)
+        ),
+        replace(
+            make_config(), archive=replace(make_config().archive, request_delay=2.0)
+        ),
+    ],
+)
+async def test_config_watcher_replaces_archive_client_for_network_settings(
+    monkeypatch, replacement
+):
+    state = make_state()
+    candidate = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+    stop = SequencedStop(False, False, True)
+    monkeypatch.setattr(service, "_wait", AsyncMock())
+    monkeypatch.setattr(service, "load_config", MagicMock(return_value=replacement))
+    monkeypatch.setattr(
+        service, "resolve_secrets", MagicMock(return_value=state.secrets)
+    )
+    archive_factory = MagicMock(return_value=candidate)
+    monkeypatch.setattr(service, "ArchivistClient", archive_factory)
+    monkeypatch.setattr(service, "reconcile_domains", AsyncMock())
+
+    await service._config_watcher(
+        Path("ziggy.toml"), state, Sessions(MagicMock()), stop
+    )
+
+    archive_factory.assert_called_once_with(
+        "user@example.com",
+        "password",
+        timeout=replacement.crawl.request_timeout,
+        request_delay=replacement.archive.request_delay,
+    )
+    assert state.archive_client is candidate
 
 
 async def test_crawl_one_handles_missing_and_inactive_records(monkeypatch):
@@ -806,6 +852,9 @@ async def test_archive_submission_scheduler_covers_pause_idle_and_work(monkeypat
         event.set()
 
     monkeypatch.setattr(service, "_wait", stop_wait)
+    monkeypatch.setattr(
+        service, "available_archive_submission_slots", AsyncMock(return_value=1)
+    )
     state.archive_paused = True
     claim = AsyncMock()
     monkeypatch.setattr(service, "claim_due_page", claim)
@@ -831,6 +880,91 @@ async def test_archive_submission_scheduler_covers_pause_idle_and_work(monkeypat
     await service._archive_submission_scheduler(
         state, Sessions(MagicMock()), "instance", stop
     )
+
+
+async def test_archive_submission_scheduler_stops_after_admission_wait(monkeypatch):
+    state = make_state()
+    stop = asyncio.Event()
+
+    async def no_slots(_state, _sessions, event):
+        event.set()
+        return 0
+
+    monkeypatch.setattr(service, "_archive_submission_slots", no_slots)
+    claim = AsyncMock()
+    monkeypatch.setattr(service, "claim_due_page", claim)
+
+    await service._archive_submission_scheduler(
+        state, Sessions(MagicMock()), "instance", stop
+    )
+
+    claim.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("local_slots", "remote_result", "expected", "paused", "wait_seconds"),
+    [
+        (0, None, 0, False, service._IDLE_DELAY),
+        (2, None, 1, False, None),
+        (2, 1, 1, False, None),
+        (2, 0, 0, False, service._ARCHIVE_CAPACITY_RECHECK_DELAY),
+        (2, ArchiveAuthenticationError("denied"), 0, True, None),
+        (
+            2,
+            ArchiveRateLimitError(datetime.now(UTC) + timedelta(seconds=20)),
+            0,
+            False,
+            None,
+        ),
+        (
+            2,
+            ArchiveRateLimitError(None),
+            0,
+            False,
+            service._ARCHIVE_CAPACITY_RECHECK_DELAY,
+        ),
+        (
+            2,
+            ArchiveError("offline"),
+            0,
+            False,
+            service._ARCHIVE_CAPACITY_RECHECK_DELAY,
+        ),
+    ],
+)
+async def test_archive_submission_admission(  # noqa: PLR0913, PLR0917
+    monkeypatch,
+    local_slots,
+    remote_result,
+    expected,
+    paused,
+    wait_seconds,
+):
+    state = make_state()
+    available = AsyncMock(return_value=local_slots)
+    monkeypatch.setattr(service, "available_archive_submission_slots", available)
+    if isinstance(remote_result, Exception):
+        state.archive_client.submission_capacity.side_effect = remote_result
+    else:
+        state.archive_client.submission_capacity.return_value = remote_result
+    wait = AsyncMock()
+    monkeypatch.setattr(service, "_wait", wait)
+    stop = asyncio.Event()
+
+    result = await service._archive_submission_slots(state, Sessions(MagicMock()), stop)
+
+    assert result == expected
+    assert state.archive_paused is paused
+    if local_slots == 0:
+        state.archive_client.submission_capacity.assert_not_awaited()
+    if wait_seconds is None:
+        if isinstance(remote_result, ArchiveRateLimitError) and remote_result.retry_at:
+            wait.assert_awaited_once()
+            assert 0 < wait.await_args.args[1] <= 20
+        else:
+            wait.assert_not_awaited()
+    else:
+        wait.assert_awaited_once_with(stop, wait_seconds)
 
 
 async def test_archive_poll_scheduler_covers_idle_and_work(monkeypatch):

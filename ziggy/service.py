@@ -19,7 +19,9 @@ from ziggy.archive import (
     ArchiveAuthenticationError,
     ArchiveError,
     ArchiveJobState,
+    ArchiveRateLimitError,
     ArchivistClient,
+    available_archive_submission_slots,
     claim_archive_job,
     create_archive_intent,
     poll_archive_job,
@@ -62,6 +64,7 @@ _IDLE_DELAY = 0.5
 _LEASE_DURATION = timedelta(minutes=5)
 _HEARTBEAT_INTERVAL = 30.0
 _HEALTH_MAX_AGE = timedelta(seconds=90)
+_ARCHIVE_CAPACITY_RECHECK_DELAY = 30.0
 
 
 @dataclass(slots=True)
@@ -103,6 +106,7 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
             secrets.archive_email,
             secrets.archive_password,
             timeout=config.crawl.request_timeout,
+            request_delay=config.archive.request_delay,
         )
         await archive_client.login()
     except BaseException:
@@ -200,12 +204,15 @@ async def _config_watcher(
         if (
             secrets.archive_email != state.secrets.archive_email
             or secrets.archive_password != state.secrets.archive_password
+            or replacement.crawl.request_timeout != state.config.crawl.request_timeout
+            or replacement.archive.request_delay != state.config.archive.request_delay
             or state.archive_paused
         ):
             candidate = ArchivistClient(
                 secrets.archive_email,
                 secrets.archive_password,
                 timeout=replacement.crawl.request_timeout,
+                request_delay=replacement.archive.request_delay,
             )
             candidate_ready = False
             try:
@@ -303,8 +310,11 @@ async def _archive_submission_scheduler(
         if state.archive_paused:
             await _wait(stop, _IDLE_DELAY)
             continue
+        available_slots = await _archive_submission_slots(state, sessions, stop)
+        if available_slots == 0:
+            continue
         claimed: list[int] = []
-        for _ in range(state.config.archive.concurrency):
+        for _ in range(available_slots):
             async with sessions() as session:
                 page = await claim_due_page(
                     session, "archive", instance_id, datetime.now(UTC), _LEASE_DURATION
@@ -321,6 +331,45 @@ async def _archive_submission_scheduler(
                     _submit_one(state, sessions, page_id),
                     name=f"archive-submit-{page_id}",
                 )
+
+
+async def _archive_submission_slots(
+    state: RuntimeState,
+    sessions: async_sessionmaker[AsyncSession],
+    stop: asyncio.Event,
+) -> int:
+    async with sessions() as session:
+        local_slots = await available_archive_submission_slots(
+            session, state.config.archive.max_pending_jobs
+        )
+    if local_slots == 0:
+        await _wait(stop, _IDLE_DELAY)
+        return 0
+    try:
+        remote_slots = await state.archive_client.submission_capacity()
+    except ArchiveAuthenticationError:
+        state.archive_paused = True
+        logger.error("Internet Archive authentication paused new submissions")
+        return 0
+    except ArchiveRateLimitError as error:
+        retry_delay = (
+            (error.retry_at - datetime.now(UTC)).total_seconds()
+            if error.retry_at is not None
+            else _ARCHIVE_CAPACITY_RECHECK_DELAY
+        )
+        await _wait(stop, max(_IDLE_DELAY, retry_delay))
+        return 0
+    except ArchiveError:
+        await _wait(stop, _ARCHIVE_CAPACITY_RECHECK_DELAY)
+        return 0
+    if remote_slots == 0:
+        await _wait(stop, _ARCHIVE_CAPACITY_RECHECK_DELAY)
+        return 0
+    return min(
+        state.config.archive.concurrency,
+        local_slots,
+        remote_slots if remote_slots is not None else local_slots,
+    )
 
 
 async def _submit_one(

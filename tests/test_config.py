@@ -60,6 +60,8 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.crawl.max_attempts == 5
     assert config.archive.interval == timedelta(days=30)
     assert config.archive.concurrency == 1
+    assert config.archive.max_pending_jobs == 2
+    assert config.archive.request_delay == 1.0
     assert config.archive.dedupe_window == timedelta(hours=24)
     assert config.archive.max_attempts == 5
     assert config.reporting.interval == timedelta(hours=24)
@@ -91,6 +93,8 @@ max_attempts = 3
 [archive]
 interval = "5d"
 concurrency = 2
+max_pending_jobs = 3
+request_delay = 2.5
 dedupe_window = "10m"
 max_attempts = 4
 
@@ -114,6 +118,8 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
     assert config.ziggy.config_reload_interval == timedelta(minutes=2)
     assert config.crawl.request_delay == 0.0
     assert config.crawl.request_timeout == 4.5
+    assert config.archive.max_pending_jobs == 3
+    assert config.archive.request_delay == 2.5
     assert config.reporting.interval == timedelta(hours=6)
     assert config.logging.level == "DEBUG"
     assert config.logging.discord_min_level == "ERROR"
@@ -174,7 +180,9 @@ def test_load_config_rejects_structure_errors(tmp_path, body, message):
         ("crawl", "max_redirects", "-1", "must be a positive integer"),
         ("crawl", "max_attempts", '"5"', "must be a positive integer"),
         ("archive", "concurrency", "0", "must be a positive integer"),
+        ("archive", "max_pending_jobs", "0", "must be a positive integer"),
         ("archive", "max_attempts", "false", "must be a positive integer"),
+        ("archive", "request_delay", "-0.1", "must be a nonnegative number"),
         ("crawl", "request_delay", "-0.1", "must be a nonnegative number"),
         ("crawl", "request_delay", "true", "must be a nonnegative number"),
         ("crawl", "request_timeout", "0", "must be greater than zero"),

@@ -95,6 +95,8 @@ class ArchiveSettings:
 
     interval: timedelta = timedelta(days=30)
     concurrency: int = 1
+    max_pending_jobs: int = 2
+    request_delay: float = 1.0
     dedupe_window: timedelta = timedelta(hours=24)
     max_attempts: int = 5
 
@@ -207,6 +209,12 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveSettings:
     return ArchiveSettings(
         interval=parse_duration(data.get("interval", "30d")),
         concurrency=_positive_int(data.get("concurrency", 1), "archive.concurrency"),
+        max_pending_jobs=_positive_int(
+            data.get("max_pending_jobs", 2), "archive.max_pending_jobs"
+        ),
+        request_delay=_nonnegative_float(
+            data.get("request_delay", 1.0), "archive.request_delay"
+        ),
         dedupe_window=parse_duration(data.get("dedupe_window", "24h")),
         max_attempts=_positive_int(data.get("max_attempts", 5), "archive.max_attempts"),
     )

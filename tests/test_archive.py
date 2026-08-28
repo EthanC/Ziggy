@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock
 
 import pytest
 from archivist import (
@@ -12,6 +13,7 @@ from archivist import (
     InternetArchiveFailedStatus,
     InternetArchivePendingStatus,
     InternetArchiveSuccessStatus,
+    InternetArchiveUserStatus,
     RateLimitError,
 )
 from sqlalchemy import select
@@ -773,6 +775,31 @@ async def test_claims_incomplete_post_processing_for_inactive_domain(
         assert claimed.id == job.id
 
 
+async def test_available_submission_slots_count_only_unfinished_direct_jobs(
+    database: Database,
+):
+    async with database.sessions() as session:
+        _, page = await add_page(session)
+
+        assert await archive.available_archive_submission_slots(session, 2) == 2
+
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-pending",
+        )
+        await session.commit()
+
+        assert await archive.available_archive_submission_slots(session, 2) == 1
+        assert await archive.available_archive_submission_slots(session, 1) == 0
+
+        job.state = ArchiveJobState.SUCCEEDED
+        await session.commit()
+
+        assert await archive.available_archive_submission_slots(session, 2) == 2
+
+
 async def test_poll_retry_exhaustion_fails_job_and_reschedules_page(
     database: Database,
 ):
@@ -946,6 +973,10 @@ async def test_adapter_submit_builds_required_options_without_network():
     adapter = object.__new__(archive.ArchivistClient)
     adapter._has_account = True  # noqa: SLF001
     adapter._client = native  # noqa: SLF001
+    adapter._request_lock = asyncio.Lock()  # noqa: SLF001
+    adapter._request_delay = 0  # noqa: SLF001
+    adapter._last_request_at = None  # noqa: SLF001
+    adapter._rate_limit_until = None  # noqa: SLF001
 
     result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
 
@@ -967,6 +998,9 @@ class NativeClient:
         self.outlink_results: Sequence[Any] = ()
         self.search_results: list[Any] = []
         self.add_error: Exception | None = None
+        self.user_status_result: Any = InternetArchiveUserStatus(
+            available=2, processing=0
+        )
         self.submit_calls: list[tuple[str, Any]] = []
         self.status_calls: list[str] = []
         self.search_calls: list[tuple[str, dict[str, Any]]] = []
@@ -1002,6 +1036,11 @@ class NativeClient:
         if self.add_error is not None:
             raise self.add_error
 
+    async def user_status(self) -> Any:
+        if isinstance(self.user_status_result, BaseException):
+            raise self.user_status_result
+        return self.user_status_result
+
     async def search(self, url: str, **kwargs: Any) -> Any:
         self.search_calls.append((url, kwargs))
         result = self.search_results.pop(0)
@@ -1017,6 +1056,10 @@ def adapter_with(native: NativeClient) -> archive.ArchivistClient:
     adapter = object.__new__(archive.ArchivistClient)
     adapter._has_account = True  # noqa: SLF001
     adapter._client = native  # noqa: SLF001
+    adapter._request_lock = asyncio.Lock()  # noqa: SLF001
+    adapter._request_delay = 0  # noqa: SLF001
+    adapter._last_request_at = None  # noqa: SLF001
+    adapter._rate_limit_until = None  # noqa: SLF001
     return adapter
 
 
@@ -1109,6 +1152,41 @@ async def test_anonymous_adapter_skips_login_and_authenticated_options(
     assert options.if_not_archived_within == SETTINGS.dedupe_window
 
 
+async def test_adapter_reads_authenticated_submission_capacity():
+    native = NativeClient()
+    native.user_status_result = InternetArchiveUserStatus(available=3, processing=1)
+
+    assert await adapter_with(native).submission_capacity() == 3
+
+    native.user_status_result = InternetArchiveUserStatus(available=-1, processing=1)
+    assert await adapter_with(native).submission_capacity() == 0
+
+
+async def test_anonymous_adapter_has_no_submission_capacity_endpoint():
+    native = NativeClient()
+    adapter = adapter_with(native)
+    adapter._has_account = False  # noqa: SLF001
+
+    assert await adapter.submission_capacity() is None
+
+
+@pytest.mark.parametrize(
+    ("native_error", "local_error"),
+    [
+        (AuthenticationError("denied"), ArchiveAuthenticationError),
+        (ArchivistError("offline"), ArchiveError),
+    ],
+)
+async def test_adapter_submission_capacity_translates_errors(
+    native_error: Exception, local_error: type[ArchiveError]
+):
+    native = NativeClient()
+    native.user_status_result = native_error
+
+    with pytest.raises(local_error):
+        await adapter_with(native).submission_capacity()
+
+
 async def test_adapter_context_logs_in_and_closes():
     native = NativeClient()
     adapter = adapter_with(native)
@@ -1159,6 +1237,66 @@ async def test_adapter_submit_translates_errors(
         assert caught.value.retry_at is not None
         assert before + timedelta(seconds=2.5) <= caught.value.retry_at
         assert caught.value.retry_at <= datetime.now(UTC) + timedelta(seconds=2.5)
+
+
+async def test_adapter_rate_limit_delays_the_next_request(monkeypatch):
+    retry_at = datetime.now(UTC) + timedelta(seconds=30)
+    native = NativeClient()
+    native.submit_result = RateLimitError("slow down", retry_after=retry_at)
+    adapter = adapter_with(native)
+
+    with pytest.raises(ArchiveRateLimitError) as caught:
+        await adapter.submit("https://example.com/", timedelta(hours=1))
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+    native.submit_result = NativeJob("accepted-after-cooldown")
+    result = await adapter.submit("https://example.com/next", timedelta(hours=1))
+
+    assert caught.value.retry_at == retry_at
+    assert result == "accepted-after-cooldown"
+    sleep.assert_awaited_once()
+    assert 0 < sleep.await_args.args[0] <= 30
+
+
+async def test_adapter_rate_limit_without_retry_metadata_uses_one_minute_fallback():
+    native = NativeClient()
+    native.submit_result = RateLimitError("slow down")
+    before = datetime.now(UTC)
+
+    with pytest.raises(ArchiveRateLimitError) as caught:
+        await adapter_with(native).submit("https://example.com/", timedelta(hours=1))
+
+    assert caught.value.retry_at is not None
+    assert before + timedelta(minutes=1) <= caught.value.retry_at
+    assert caught.value.retry_at <= datetime.now(UTC) + timedelta(minutes=1)
+
+
+async def test_adapter_does_not_sleep_for_expired_rate_limit(monkeypatch):
+    native = NativeClient()
+    adapter = adapter_with(native)
+    adapter._rate_limit_until = NOW  # noqa: SLF001
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+
+    await adapter.status("native-job")
+
+    sleep.assert_not_awaited()
+    assert adapter._rate_limit_until is None  # noqa: SLF001
+
+
+async def test_adapter_spaces_consecutive_requests(monkeypatch):
+    native = NativeClient()
+    adapter = adapter_with(native)
+    adapter._request_delay = 2.0  # noqa: SLF001
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+
+    await adapter.status("native-job")
+    await adapter.status("native-job")
+
+    sleep.assert_awaited_once()
+    assert 0 < sleep.await_args.args[0] <= 2
 
 
 async def test_adapter_status_translates_success():

@@ -75,4 +75,4 @@ seeds = ["/", "/sitemap.xml"]
 | `include_subdomains` | Include descendants of `host` in the crawl | No | `false` |
 | `seeds` | Starting paths or in-scope URLs | No | `["/"]` |
 
-Crawler, archive, reporting, and logging settings are documented with their defaults in [`ziggy.example.toml`](ziggy.example.toml). Durations use an integer followed by `s`, `m`, `h`, or `d`.
+Crawler, archive, reporting, and logging settings are documented with their defaults in [`ziggy.example.toml`](ziggy.example.toml). `archive.max_pending_jobs` limits captures still processing at Internet Archive, while `archive.request_delay` sets the minimum delay between Archive.org operations. Authenticated instances also consult the account's live Save Page Now capacity before submitting. Durations use an integer followed by `s`, `m`, `h`, or `d`.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, Self
@@ -16,9 +17,10 @@ from archivist import (
     InternetArchivePendingStatus,
     InternetArchiveSaveOptions,
     InternetArchiveSuccessStatus,
+    InternetArchiveUserStatus,
     RateLimitError,
 )
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
 from ziggy.models import (
@@ -32,7 +34,7 @@ from ziggy.models import (
 from ziggy.urls import UrlError, normalize_url, url_in_scope
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -118,6 +120,7 @@ class ArchivistClient:
         email: str | None = None,
         password: str | None = None,
         timeout: float = 30.0,
+        request_delay: float = 1.0,
     ) -> None:
         """Create an anonymous or account-backed Archivist client."""
         if bool(email) != bool(password):
@@ -131,6 +134,10 @@ class ArchivistClient:
         )
         self._has_account = account is not None
         self._client = AsyncInternetArchiveClient(account=account, timeout=timeout)
+        self._request_lock = asyncio.Lock()
+        self._request_delay = request_delay
+        self._last_request_at: float | None = None
+        self._rate_limit_until: datetime | None = None
 
     async def __aenter__(self) -> Self:
         """Verify configured account credentials before accepting work."""
@@ -152,11 +159,25 @@ class ArchivistClient:
         if not self._has_account:
             return
         try:
-            await self._client.login()
+            await self._request(self._client.login)
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
+
+    async def submission_capacity(self) -> int | None:
+        """Return authenticated SPN queue capacity when it is available."""
+        if not self._has_account:
+            return None
+        try:
+            status: InternetArchiveUserStatus = await self._request(
+                self._client.user_status
+            )
+        except AuthenticationError as error:
+            raise ArchiveAuthenticationError("Internet Archive login failed") from error
+        except ArchivistError as error:
+            raise ArchiveError(type(error).__name__) from error
+        return max(0, status.available)
 
     async def submit(self, url: str, dedupe_window: timedelta) -> str:
         """Submit with account-only options when credentials are configured."""
@@ -167,11 +188,9 @@ class ArchivistClient:
             if_not_archived_within=dedupe_window,
         )
         try:
-            job = await self._client.submit(url, options)
+            job = await self._request(lambda: self._client.submit(url, options))
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
-        except RateLimitError as error:
-            raise ArchiveRateLimitError(_retry_at(error.retry_after)) from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
         return job.job_id
@@ -179,11 +198,9 @@ class ArchivistClient:
     async def status(self, job_id: str) -> ArchiveStatus:
         """Translate one remote status model."""
         try:
-            status = await self._client.status(job_id)
+            status = await self._request(lambda: self._client.status(job_id))
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
-        except RateLimitError as error:
-            raise ArchiveRateLimitError(_retry_at(error.retry_after)) from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
         return _status(status)
@@ -191,11 +208,9 @@ class ArchivistClient:
     async def outlinks(self, job_id: str) -> tuple[SuccessStatus, ...]:
         """Translate successful outlink statuses with known original URLs."""
         try:
-            statuses = await self._client.status_outlinks(job_id)
+            statuses = await self._request(lambda: self._client.status_outlinks(job_id))
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
-        except RateLimitError as error:
-            raise ArchiveRateLimitError(_retry_at(error.retry_after)) from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
         return tuple(
@@ -210,14 +225,14 @@ class ArchivistClient:
         if not self._has_account:
             return
         try:
-            status = await self._client.status(job_id)
+            status = await self._request(lambda: self._client.status(job_id))
             if not isinstance(status, InternetArchiveSuccessStatus):
                 raise ArchiveError("capture is not successful")
-            await self._client.add_to_my_web_archive(status, tags=("ziggy",))
+            await self._request(
+                lambda: self._client.add_to_my_web_archive(status, tags=("ziggy",))
+            )
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
-        except RateLimitError as error:
-            raise ArchiveRateLimitError(_retry_at(error.retry_after)) from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
 
@@ -229,12 +244,14 @@ class ArchivistClient:
         resume_key: str | None = None
         try:
             while True:
-                page = await self._client.search(
-                    url,
-                    match_type="exact",
-                    from_timestamp=since,
-                    show_resume_key=True,
-                    resume_key=resume_key,
+                page = await self._request(
+                    lambda resume_key=resume_key: self._client.search(
+                        url,
+                        match_type="exact",
+                        from_timestamp=since,
+                        show_resume_key=True,
+                        resume_key=resume_key,
+                    )
                 )
                 found.extend(
                     SuccessStatus(
@@ -251,10 +268,38 @@ class ArchivistClient:
                     return tuple(found)
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
-        except RateLimitError as error:
-            raise ArchiveRateLimitError(_retry_at(error.retry_after)) from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
+
+    async def _request[T](self, request: Callable[[], Awaitable[T]]) -> T:
+        """Serialize requests and make a remote rate limit apply to later work."""
+        async with self._request_lock:
+            delay = 0.0
+            rate_limited = self._rate_limit_until is not None
+            if rate_limited:
+                delay = max(
+                    delay,
+                    (self._rate_limit_until - datetime.now(UTC)).total_seconds(),
+                )
+            if self._last_request_at is not None:
+                delay = max(
+                    delay,
+                    self._request_delay
+                    - (asyncio.get_running_loop().time() - self._last_request_at),
+                )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if rate_limited:
+                self._rate_limit_until = None
+            self._last_request_at = asyncio.get_running_loop().time()
+            try:
+                return await request()
+            except RateLimitError as error:
+                retry_at = _retry_at(error.retry_after) or datetime.now(
+                    UTC
+                ) + timedelta(minutes=1)
+                self._rate_limit_until = retry_at
+                raise ArchiveRateLimitError(retry_at) from error
 
     async def close(self) -> None:
         """Close Archivist's owned Niquests session."""
@@ -660,6 +705,28 @@ async def claim_archive_job(
     job = (await session.scalars(statement)).one_or_none()
     await session.commit()
     return job
+
+
+async def available_archive_submission_slots(
+    session: AsyncSession, max_pending_jobs: int
+) -> int:
+    """Return local capacity after counting unfinished remote capture jobs."""
+    pending = await session.scalar(
+        select(func.count())
+        .select_from(ArchiveJob)
+        .where(
+            ArchiveJob.kind == ArchiveJobKind.DIRECT,
+            ArchiveJob.external_job_id.is_not(None),
+            ArchiveJob.state.in_(
+                (
+                    ArchiveJobState.SUBMITTED,
+                    ArchiveJobState.PENDING,
+                    ArchiveJobState.RATE_LIMITED,
+                )
+            ),
+        )
+    )
+    return max(0, max_pending_jobs - (pending or 0))
 
 
 def _rate_limit(job: ArchiveJob, now: datetime, retry_at: datetime | None) -> None:
