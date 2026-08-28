@@ -536,6 +536,7 @@ async def _heartbeat(
 async def check_health(path: Path, now: datetime | None = None) -> bool:
     """Return whether any running instance has a recent database heartbeat."""
     if not await asyncio.to_thread(path.exists):
+        logger.error("Health check failed: database does not exist at {}", path)
         return False
     engine = create_async_engine(database_url(path))
     try:
@@ -545,9 +546,21 @@ async def check_health(path: Path, now: datetime | None = None) -> bool:
                 select(func.max(ServiceState.heartbeat_at))
             )
         current = now or datetime.now(UTC)
-        return heartbeat is not None and current - heartbeat <= _HEALTH_MAX_AGE
+        if heartbeat is None:
+            logger.error("Health check failed: no service heartbeat found")
+            return False
+        heartbeat_age = current - heartbeat
+        if heartbeat_age > _HEALTH_MAX_AGE:
+            logger.error(
+                "Health check failed: service heartbeat is {:.0f}s old",
+                heartbeat_age.total_seconds(),
+            )
+            return False
     except OSError, SQLAlchemyError, ValueError:
+        logger.exception("Health check failed while reading the service heartbeat")
         return False
+    else:
+        return True
     finally:
         await engine.dispose()
 

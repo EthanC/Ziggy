@@ -174,36 +174,54 @@ def test_signal_handlers_fall_back_on_platform_without_loop_support(monkeypatch)
     loop.remove_signal_handler.assert_not_called()
 
 
-async def test_check_health_handles_absence_empty_recent_and_stale_database(tmp_path):
+async def test_check_health_handles_absence_empty_recent_and_stale_database(
+    monkeypatch, tmp_path
+):
     path = tmp_path / "health.sqlite3"
+    log_error = MagicMock()
+    monkeypatch.setattr(service.logger, "error", log_error)
+
     assert await service.check_health(path, NOW) is False
+    log_error.assert_called_once_with(
+        "Health check failed: database does not exist at {}", path
+    )
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{path.as_posix()}")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     assert await service.check_health(path, NOW) is False
+    log_error.assert_called_with("Health check failed: no service heartbeat found")
 
     async with factory() as session:
         session.add(ServiceState(instance_id="old", started_at=NOW, heartbeat_at=NOW))
         await session.commit()
     assert await service.check_health(path, NOW + timedelta(seconds=90)) is True
     assert await service.check_health(path, NOW + timedelta(seconds=91)) is False
+    log_error.assert_called_with(
+        "Health check failed: service heartbeat is {:.0f}s old", 91.0
+    )
+    assert log_error.call_count == 3
     await engine.dispose()
 
 
 async def test_check_health_returns_false_on_database_error(monkeypatch, tmp_path):
     path = tmp_path / "broken.sqlite3"
     path.touch()
+    log_exception = MagicMock()
     session = MagicMock()
     session.scalar = AsyncMock(side_effect=SQLAlchemyError("broken"))
     engine = SimpleNamespace(dispose=AsyncMock())
+    monkeypatch.setattr(service.logger, "exception", log_exception)
     monkeypatch.setattr(service, "create_async_engine", lambda _url: engine)
     monkeypatch.setattr(
         service, "async_sessionmaker", lambda *_args, **_kwargs: Sessions(session)
     )
 
     assert await service.check_health(path, NOW) is False
+    log_exception.assert_called_once_with(
+        "Health check failed while reading the service heartbeat"
+    )
     engine.dispose.assert_awaited_once_with()
 
 
