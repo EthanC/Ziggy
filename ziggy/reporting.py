@@ -19,9 +19,6 @@ from ziggy.models import Capture, Domain, Page, Report, ReportState
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-_COMPLETE_COLOR = 0x43A25A
-_OUTSTANDING_COLOR = 0xCE9C5C
-
 
 @dataclass(frozen=True, slots=True)
 class ReportWindow:
@@ -98,26 +95,27 @@ async def create_report(
 
 def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
     """Construct the required Components v2 message without legacy fields."""
-    period = f"{report.window_start.isoformat()} to {report.window_end.isoformat()}"
     counts = (
-        f"**Discovered:** {report.discovered_count}\n"
-        f"**Archived:** {report.archived_count}\n"
-        f"**Outstanding:** {report.outstanding_count}"
+        "__**Domains**__\n"
+        f"* Crawled: {report.active_domain_count:,}\n\n"
+        "__**Pages**__\n"
+        f"* Discovered: {report.discovered_count:,}\n"
+        f"* Archived: {report.archived_count:,}\n"
+        f"* Pending: {report.outstanding_count:,}"
     )
     context = (
-        f"Active domains: {report.active_domain_count} | "
-        f"Generated: {report.generated_at.isoformat()}"
+        f"-# Report for <t:{int(report.window_start.timestamp())}:d> to "
+        f"<t:{int(report.window_end.timestamp())}:d> "
+        f"(Generated <t:{int(report.generated_at.timestamp())}:R>)"
     )
     container = Container(
         components=[
-            TextDisplay(content=f"## Ziggy archive report\n{period}"),
-            Seperator(divider=True, spacing=SeperatorSpacing.SMALL),
+            TextDisplay(content="## Archival Report"),
             TextDisplay(content=counts),
+            Seperator(divider=True, spacing=SeperatorSpacing.SMALL),
             TextDisplay(content=context),
         ],
-        accent_color=_OUTSTANDING_COLOR
-        if report.outstanding_count
-        else _COMPLETE_COLOR,
+        accent_color=0xDA3E44,
     )
     webhook = Webhook(
         url=webhook_url,

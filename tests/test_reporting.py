@@ -203,14 +203,13 @@ async def test_create_report_raises_if_insert_cannot_be_read():
         )
 
 
-@pytest.mark.parametrize(
-    ("outstanding", "color"),
-    [(0, reporting._COMPLETE_COLOR), (2, reporting._OUTSTANDING_COLOR)],
-)
-def test_build_report_webhook_is_components_v2_without_legacy_fields(
-    outstanding, color
-):
-    report = make_report(outstanding_count=outstanding)
+def test_build_report_webhook_uses_archival_report_layout():
+    report = make_report(
+        discovered_count=1_234,
+        archived_count=1_000,
+        outstanding_count=234,
+        active_domain_count=2_345,
+    )
 
     webhook = reporting.build_report_webhook(
         report, "https://discord.invalid/api/webhooks/id/token"
@@ -223,20 +222,29 @@ def test_build_report_webhook_is_components_v2_without_legacy_fields(
     assert len(webhook.components) == 1
     container = webhook.components[0]
     assert isinstance(container, Container)
-    assert container.accent_color == color
+    assert container.accent_color == 0xDA3E44
+    assert container.spoiler is msgspec.UNSET
     assert [type(component) for component in container.components] == [
+        TextDisplay,
         TextDisplay,
         Seperator,
         TextDisplay,
-        TextDisplay,
     ]
-    assert "2026-08-27T12:34:56+00:00 to 2026-08-28T12:34:56+00:00" in (
-        container.components[0].content
+    assert container.components[0].content == "## Archival Report"
+    assert container.components[1].content == (
+        "__**Domains**__\n"
+        "* Crawled: 2,345\n\n"
+        "__**Pages**__\n"
+        "* Discovered: 1,234\n"
+        "* Archived: 1,000\n"
+        "* Pending: 234"
     )
-    assert container.components[2].content == (
-        f"**Discovered:** 5\n**Archived:** 3\n**Outstanding:** {outstanding}"
+    assert container.components[2].divider is True
+    assert container.components[2].spacing == 1
+    assert container.components[3].content == (
+        "-# Report for <t:1787834096:d> to <t:1787920496:d> "
+        "(Generated <t:1787920496:R>)"
     )
-    assert "Active domains: 4" in container.components[3].content
     assert webhook.content is msgspec.UNSET
     assert webhook.embeds is msgspec.UNSET
     assert webhook.poll is msgspec.UNSET
