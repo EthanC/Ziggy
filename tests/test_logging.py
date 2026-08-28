@@ -164,6 +164,26 @@ def test_intercept_handler_forwards_named_level_exception_and_message(monkeypatc
     optimized.log.assert_called_once_with("WARNING", "hello world")
 
 
+def test_intercept_handler_demotes_archive_rate_limit_warning(monkeypatch):
+    fake_logger = MagicMock()
+    optimized = fake_logger.opt.return_value
+    monkeypatch.setattr(ziggy_logging, "logger", fake_logger)
+    record = logging.LogRecord(
+        "archivist.services.internet_archive.async_client",
+        logging.WARNING,
+        __file__,
+        10,
+        "Internet Archive rate limit reached",
+        (),
+        None,
+    )
+
+    ziggy_logging.InterceptHandler().emit(record)
+
+    fake_logger.level.assert_not_called()
+    optimized.log.assert_called_once_with("INFO", "Internet Archive rate limit reached")
+
+
 def test_intercept_handler_falls_back_to_numeric_custom_level(monkeypatch):
     fake_logger = MagicMock()
     fake_logger.level.side_effect = ValueError

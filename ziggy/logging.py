@@ -29,6 +29,7 @@ _COLOR_FORMAT = (
     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
     "<level>{message}</level>"
 )
+_ARCHIVE_RATE_LIMIT_MESSAGE = "Internet Archive rate limit reached"
 
 
 class InterceptHandler(logging.Handler):
@@ -36,18 +37,24 @@ class InterceptHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         """Forward one record while preserving exception information."""
-        try:
-            level: str | int = logger.level(record.levelname).name
-        except ValueError:
-            level = record.levelno
+        message = record.getMessage()
+        if (
+            record.name.startswith("archivist")
+            and record.levelno == logging.WARNING
+            and message == _ARCHIVE_RATE_LIMIT_MESSAGE
+        ):
+            level: str | int = "INFO"
+        else:
+            try:
+                level = logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
         frame = logging.currentframe()
         depth = 2
         while frame is not None and frame.f_code.co_filename == logging.__file__:
             frame = frame.f_back
             depth += 1
-        logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
+        logger.opt(depth=depth, exception=record.exc_info).log(level, message)
 
 
 @dataclass(slots=True)
