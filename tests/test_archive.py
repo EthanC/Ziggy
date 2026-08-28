@@ -944,6 +944,7 @@ class NativeJob:
 async def test_adapter_submit_builds_required_options_without_network():
     native = NativeSubmitClient(NativeJob("native-job"))
     adapter = object.__new__(archive.ArchivistClient)
+    adapter._has_account = True  # noqa: SLF001
     adapter._client = native  # noqa: SLF001
 
     result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
@@ -1014,6 +1015,7 @@ class NativeClient:
 
 def adapter_with(native: NativeClient) -> archive.ArchivistClient:
     adapter = object.__new__(archive.ArchivistClient)
+    adapter._has_account = True  # noqa: SLF001
     adapter._client = native  # noqa: SLF001
     return adapter
 
@@ -1049,6 +1051,60 @@ def test_adapter_constructor_wires_account_and_timeout(monkeypatch: pytest.Monke
     assert captured["account"].username == "archive-user"
     assert captured["account"].remember is True
     assert captured["timeout"] == 4.5
+
+
+def test_adapter_constructor_supports_anonymous_client(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, Any] = {}
+    native = NativeClient()
+
+    def make_native(*, account: Any, timeout: float) -> NativeClient:
+        captured.update(account=account, timeout=timeout)
+        return native
+
+    monkeypatch.setattr(archive, "AsyncInternetArchiveClient", make_native)
+
+    adapter = archive.ArchivistClient(timeout=6.0)
+
+    assert adapter._client is native  # noqa: SLF001
+    assert captured == {"account": None, "timeout": 6.0}
+
+
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [("archive-user", None), (None, "archive-password")],
+)
+def test_adapter_constructor_rejects_partial_credentials(username, password):
+    with pytest.raises(ValueError, match="must be provided together"):
+        archive.ArchivistClient(username, password)
+
+
+async def test_anonymous_adapter_skips_login_and_authenticated_options(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    native = NativeClient()
+    native.login_error = AuthenticationError("login should not be attempted")
+    captured: dict[str, Any] = {}
+
+    def make_native(*, account: Any, timeout: float) -> NativeClient:
+        captured.update(account=account, timeout=timeout)
+        return native
+
+    monkeypatch.setattr(archive, "AsyncInternetArchiveClient", make_native)
+    adapter = archive.ArchivistClient()
+
+    await adapter.login()
+    result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
+    await adapter.add_to_my_archive(result)
+
+    assert result == "native-job"
+    assert native.status_calls == []
+    _, options = native.submit_calls[0]
+    assert options.capture_outlinks is True
+    assert options.capture_screenshot is False
+    assert options.save_to_archive is False
+    assert options.if_not_archived_within == SETTINGS.dedupe_window
 
 
 async def test_adapter_context_logs_in_and_closes():

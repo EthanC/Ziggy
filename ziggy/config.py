@@ -159,8 +159,8 @@ class Config:
 class Secrets:
     """Resolved credentials that are never persisted."""
 
-    archive_username: str
-    archive_password: str
+    archive_username: str | None
+    archive_password: str | None
     reporting_webhook_url: str | None
     logging_webhook_url: str | None
 
@@ -361,29 +361,21 @@ def load_config(path: Path) -> Config:
 
 
 def resolve_secrets(config: Config, env: Env | None = None) -> Secrets:
-    """Resolve required and optional secrets from environment variables."""
+    """Resolve optional secrets from environment variables."""
     env = env or Env()
-    username = env.str(config.archive.username_env, default=None)
-    password = env.str(config.archive.password_env, default=None)
-    missing = [
-        name
-        for name, value in (
-            (config.archive.username_env, username),
-            (config.archive.password_env, password),
-        )
-        if not value
-    ]
-    if missing:
+    username = env.str(config.archive.username_env, default=None) or None
+    password = env.str(config.archive.password_env, default=None) or None
+    if (username is None) != (password is None):
         raise ConfigError(
-            f"missing required environment variable(s): {', '.join(missing)}"
+            "Archive.org username and password must both be set or both be unset"
         )
 
     def optional(name: str | None) -> str | None:
         return (env.str(name, default=None) or None) if name is not None else None
 
     return Secrets(
-        archive_username=cast("str", username),
-        archive_password=cast("str", password),
+        archive_username=username,
+        archive_password=password,
         reporting_webhook_url=optional(config.reporting.discord_webhook_url_env),
         logging_webhook_url=optional(config.logging.discord_webhook_url_env),
     )

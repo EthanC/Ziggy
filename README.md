@@ -20,7 +20,7 @@ Ziggy crawls and preserves the websites you care about.
 
 ## Docker Compose
 
-Create `/path/to/ziggy`, copy `ziggy.example.toml` to `/path/to/ziggy/ziggy.toml`, and configure the domains to crawl. Copy `.env.example` to `.env`, add your Archive.org credentials, and create `compose.yaml` beside `.env`:
+Create `/path/to/ziggy`, copy `ziggy.example.toml` to `/path/to/ziggy/ziggy.toml`, and configure the domains to crawl. Copy `.env.example` to `.env` and create `compose.yaml` beside it. Archive.org credentials are optional; authenticated captures also request screenshots and add captures to My Web Archive.
 
 ```yaml
 services:
@@ -49,7 +49,7 @@ Python 3.14 and [`uv`](https://docs.astral.sh/uv/) are required.
 uv sync --locked
 ```
 
-Copy `ziggy.example.toml` to `ziggy.toml`. Copy `.env.example` to `.env`, add your Archive.org credentials, and export its variables through your shell or secret manager. Ziggy does not load `.env` files itself.
+Copy `ziggy.example.toml` to `ziggy.toml`. Archive.org credentials are optional. If used, export both variables through your shell or secret manager. Ziggy does not load `.env` files itself.
 
 ```console
 uv run python -m ziggy check-config --config ziggy.toml

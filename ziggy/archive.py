@@ -113,13 +113,27 @@ class ArchiveClient(Protocol):
 class ArchivistClient:
     """Adapter from Archivist models and exceptions to Ziggy's boundary."""
 
-    def __init__(self, username: str, password: str, timeout: float = 30.0) -> None:
-        """Create an authenticated Archivist client without logging in yet."""
-        account = InternetArchiveAccount(username, password, remember=True)
+    def __init__(
+        self,
+        username: str | None = None,
+        password: str | None = None,
+        timeout: float = 30.0,
+    ) -> None:
+        """Create an anonymous or account-backed Archivist client."""
+        if bool(username) != bool(password):
+            raise ValueError(
+                "Archive.org username and password must be provided together"
+            )
+        account = (
+            InternetArchiveAccount(username, password, remember=True)
+            if username and password
+            else None
+        )
+        self._has_account = account is not None
         self._client = AsyncInternetArchiveClient(account=account, timeout=timeout)
 
     async def __aenter__(self) -> Self:
-        """Verify account credentials before accepting work."""
+        """Verify configured account credentials before accepting work."""
         await self.login()
         return self
 
@@ -135,6 +149,8 @@ class ArchivistClient:
 
     async def login(self) -> None:
         """Authenticate eagerly and expose a safe local exception."""
+        if not self._has_account:
+            return
         try:
             await self._client.login()
         except AuthenticationError as error:
@@ -143,11 +159,11 @@ class ArchivistClient:
             raise ArchiveError(type(error).__name__) from error
 
     async def submit(self, url: str, dedupe_window: timedelta) -> str:
-        """Submit with all capture options required by Ziggy."""
+        """Submit with account-only options when credentials are configured."""
         options = InternetArchiveSaveOptions(
             capture_outlinks=True,
-            capture_screenshot=True,
-            save_to_archive=True,
+            capture_screenshot=self._has_account,
+            save_to_archive=self._has_account,
             if_not_archived_within=dedupe_window,
         )
         try:
@@ -191,6 +207,8 @@ class ArchivistClient:
 
     async def add_to_my_archive(self, job_id: str) -> None:
         """Add the successful status represented by a persisted remote ID."""
+        if not self._has_account:
+            return
         try:
             status = await self._client.status(job_id)
             if not isinstance(status, InternetArchiveSuccessStatus):

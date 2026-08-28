@@ -371,21 +371,30 @@ def test_resolve_secrets_uses_process_environment(tmp_path, monkeypatch):
     assert resolve_secrets(config).archive_username == "user"
 
 
+def test_resolve_secrets_allows_missing_archive_credentials(tmp_path, monkeypatch):
+    config = minimal_config(tmp_path)
+    for name in ("ZIGGY_ARCHIVE_ORG_USERNAME", "ZIGGY_ARCHIVE_ORG_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
+
+    secrets = resolve_secrets(config)
+
+    assert secrets.archive_username is None
+    assert secrets.archive_password is None
+
+
 @pytest.mark.parametrize(
-    ("values", "names"),
+    "values",
     [
-        ({}, "ZIGGY_ARCHIVE_ORG_USERNAME, ZIGGY_ARCHIVE_ORG_PASSWORD"),
-        (
-            {
-                "ZIGGY_ARCHIVE_ORG_USERNAME": "user",
-                "ZIGGY_ARCHIVE_ORG_PASSWORD": "",
-            },
-            "ZIGGY_ARCHIVE_ORG_PASSWORD",
-        ),
+        {"ZIGGY_ARCHIVE_ORG_USERNAME": "user"},
+        {"ZIGGY_ARCHIVE_ORG_PASSWORD": "password"},
+        {
+            "ZIGGY_ARCHIVE_ORG_USERNAME": "user",
+            "ZIGGY_ARCHIVE_ORG_PASSWORD": "",
+        },
     ],
 )
-def test_resolve_secrets_rejects_missing_or_empty_required_values(
-    tmp_path, monkeypatch, values, names
+def test_resolve_secrets_rejects_partial_archive_credentials(
+    tmp_path, monkeypatch, values
 ):
     config = minimal_config(tmp_path)
     for name in ("ZIGGY_ARCHIVE_ORG_USERNAME", "ZIGGY_ARCHIVE_ORG_PASSWORD"):
@@ -393,7 +402,7 @@ def test_resolve_secrets_rejects_missing_or_empty_required_values(
     for name, value in values.items():
         monkeypatch.setenv(name, value)
 
-    with pytest.raises(ConfigError, match=names):
+    with pytest.raises(ConfigError, match="must both be set or both be unset"):
         resolve_secrets(config)
 
 
