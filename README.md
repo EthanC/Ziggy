@@ -7,7 +7,6 @@ Ziggy crawls and preserves the websites you care about.
 [![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![CI](https://img.shields.io/github/actions/workflow/status/EthanC/Ziggy/ci.yml?branch=main&style=flat-square&label=build)](https://github.com/EthanC/Ziggy/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?style=flat-square)](https://github.com/EthanC/Ziggy/actions/workflows/ci.yml)
-[![GHCR image size](https://ghcr-badge.egpl.dev/ethanc/ziggy/size?tag=latest&label=image%20size)](https://github.com/EthanC/Ziggy/pkgs/container/ziggy)
 
 </div>
 
