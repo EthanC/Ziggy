@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from clyde import AllowedMentions, Webhook
+from clyde import AllowedMentions, Markdown, Timestamp, Webhook
 from clyde.components import Container, Seperator, SeperatorSpacing, TextDisplay
 from clyde.webhook import MessageFlags
 from loguru import logger
@@ -101,25 +101,71 @@ async def create_report(
     return report
 
 
-def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
+def build_report_webhook(
+    report: Report, webhook_url: str, previous_report: Report | None = None
+) -> Webhook:
     """Construct the required Components v2 message without legacy fields."""
-    counts = (
-        "__**Domains**__\n"
-        f"* Crawled: {report.active_domain_count:,}\n\n"
-        "__**Pages**__\n"
-        f"* Discovered: {report.discovered_count:,}\n"
-        f"* Archived: {report.archived_count:,} "
-        f"({report.first_archive_count:,} New)\n"
-        f"* Pending: {report.outstanding_count:,}"
+    previous_active_domains = (
+        previous_report.active_domain_count if previous_report is not None else 0
     )
-    context = (
-        f"-# Report for <t:{int(report.window_start.timestamp())}:d> to "
-        f"<t:{int(report.window_end.timestamp())}:d> "
-        f"(Generated <t:{int(report.generated_at.timestamp())}:R>)"
+    previous_discovered = (
+        previous_report.discovered_count if previous_report is not None else 0
+    )
+    previous_archived = (
+        previous_report.archived_count if previous_report is not None else 0
+    )
+    previous_first_archives = (
+        previous_report.first_archive_count if previous_report is not None else 0
+    )
+    previous_outstanding = (
+        previous_report.outstanding_count if previous_report is not None else 0
+    )
+    domain_stats = Markdown.bulleted_list(
+        [
+            (
+                f"Crawled: {Markdown.bold(f'{report.active_domain_count:,}')} "
+                f"{_change_stat(report.active_domain_count, previous_active_domains)}"
+            )
+        ]
+    )
+    first_archive_stats = Markdown.bulleted_list(
+        [
+            (
+                "First Archives: "
+                f"{Markdown.bold(f'{report.first_archive_count:,}')} "
+                f"{_change_stat(report.first_archive_count, previous_first_archives)}"
+            )
+        ]
+    )
+    page_stats = Markdown.bulleted_list(
+        [
+            (
+                f"Discovered: {Markdown.bold(f'{report.discovered_count:,}')} "
+                f"{_change_stat(report.discovered_count, previous_discovered)}"
+            ),
+            (
+                f"Archived: {Markdown.bold(f'{report.archived_count:,}')} "
+                f"{_change_stat(report.archived_count, previous_archived)}\n"
+                f"  {first_archive_stats}"
+            ),
+            (
+                f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')} "
+                f"{_change_stat(report.outstanding_count, previous_outstanding)}"
+            ),
+        ]
+    )
+    counts = (
+        f"{Markdown.header_3('Domains')}\n{domain_stats}\n"
+        f"{Markdown.header_3('Pages')}\n{page_stats}"
+    )
+    context = Markdown.subtext(
+        f"Report for {Timestamp.short_date(report.window_start)} to "
+        f"{Timestamp.short_date(report.window_end)} "
+        f"(Generated {Timestamp.relative_time(report.generated_at)})"
     )
     container = Container(
         components=[
-            TextDisplay(content="## Archival Report"),
+            TextDisplay(content=Markdown.header_2("Archival Report")),
             TextDisplay(content=counts),
             Seperator(divider=True, spacing=SeperatorSpacing.SMALL),
             TextDisplay(content=context),
@@ -178,8 +224,16 @@ async def deliver_report(
         _release_report(report)
         await session.commit()
         return
+    previous_report = await session.scalar(
+        select(Report)
+        .where(Report.window_end <= report.window_start)
+        .order_by(Report.window_end.desc())
+        .limit(1)
+    )
     try:
-        response = await build_report_webhook(report, webhook_url).execute_async()
+        response = await build_report_webhook(
+            report, webhook_url, previous_report
+        ).execute_async()
         payload = response.json()
     except (niquests_exceptions.RequestException, ValueError, TypeError) as error:
         _fail_report(report, now, type(error).__name__)
@@ -236,6 +290,10 @@ async def claim_report(
 def _release_report(report: Report) -> None:
     report.lease_owner = None
     report.lease_expires_at = None
+
+
+def _change_stat(current: int, previous: int) -> str:
+    return f"({current - previous:+,})"
 
 
 def _message_metadata(payload: object) -> tuple[str, str, str | None] | None:

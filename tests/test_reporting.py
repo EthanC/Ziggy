@@ -252,9 +252,18 @@ def test_build_report_webhook_uses_archival_report_layout():
         first_archive_count=123,
         active_domain_count=2_345,
     )
+    previous_report = make_report(
+        discovered_count=1_218,
+        archived_count=1_010,
+        outstanding_count=234,
+        first_archive_count=100,
+        active_domain_count=2_300,
+    )
 
     webhook = reporting.build_report_webhook(
-        report, "https://discord.invalid/api/webhooks/id/token"
+        report,
+        "https://discord.invalid/api/webhooks/id/token",
+        previous_report,
     )
 
     assert webhook.get_flag(MessageFlags.IS_COMPONENTS_V2)
@@ -274,12 +283,13 @@ def test_build_report_webhook_uses_archival_report_layout():
     ]
     assert container.components[0].content == "## Archival Report"
     assert container.components[1].content == (
-        "__**Domains**__\n"
-        "* Crawled: 2,345\n\n"
-        "__**Pages**__\n"
-        "* Discovered: 1,234\n"
-        "* Archived: 1,000 (123 New)\n"
-        "* Pending: 234"
+        "### Domains\n"
+        "- Crawled: **2,345** (+45)\n"
+        "### Pages\n"
+        "- Discovered: **1,234** (+16)\n"
+        "- Archived: **1,000** (-10)\n"
+        "  - First Archives: **123** (+23)\n"
+        "- Pending: **234** (+0)"
     )
     assert container.components[2].divider is True
     assert container.components[2].spacing == 1
@@ -303,6 +313,22 @@ def test_build_report_webhook_defensively_rejects_missing_v2_flag(monkeypatch):
 
     webhook.set_wait.assert_called_once_with(True)  # noqa: FBT003
     webhook.add_component.assert_called_once()
+
+
+def test_build_report_webhook_uses_zero_baseline_for_first_report():
+    webhook = reporting.build_report_webhook(
+        make_report(), "https://discord.invalid/hook"
+    )
+
+    assert webhook.components[0].components[1].content == (
+        "### Domains\n"
+        "- Crawled: **4** (+4)\n"
+        "### Pages\n"
+        "- Discovered: **5** (+5)\n"
+        "- Archived: **3** (+3)\n"
+        "  - First Archives: **1** (+1)\n"
+        "- Pending: **2** (+2)"
+    )
 
 
 async def test_deliver_report_without_webhook_logs_and_releases_lease(monkeypatch):
@@ -373,6 +399,7 @@ async def test_deliver_report_persists_discord_metadata(monkeypatch):
     webhook.execute_async = AsyncMock(return_value=response)
     monkeypatch.setattr(reporting, "build_report_webhook", lambda *_: webhook)
     session = MagicMock()
+    session.scalar = AsyncMock(return_value=None)
     session.commit = AsyncMock()
 
     await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
@@ -389,6 +416,35 @@ async def test_deliver_report_persists_discord_metadata(monkeypatch):
     session.commit.assert_awaited_once()
 
 
+async def test_deliver_report_builds_webhook_with_previous_report(
+    sessions, monkeypatch
+):
+    previous_report = make_report(
+        window_start=NOW - timedelta(days=2),
+        window_end=NOW - timedelta(days=1),
+        state=ReportState.DELIVERED,
+        lease_owner=None,
+        lease_expires_at=None,
+    )
+    report = make_report()
+    response = MagicMock()
+    response.json.return_value = {"id": "message", "channel_id": "channel"}
+    webhook = MagicMock()
+    webhook.execute_async = AsyncMock(return_value=response)
+    build_webhook = MagicMock(return_value=webhook)
+    monkeypatch.setattr(reporting, "build_report_webhook", build_webhook)
+
+    async with sessions() as session:
+        session.add_all([previous_report, report])
+        await session.commit()
+
+        await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
+
+    build_webhook.assert_called_once_with(
+        report, "https://discord.invalid", previous_report
+    )
+
+
 @pytest.mark.parametrize(
     "failure",
     [RequestException("offline"), ValueError("bad json"), TypeError("bad json")],
@@ -399,6 +455,7 @@ async def test_deliver_report_retries_boundary_failures(monkeypatch, failure):
     webhook.execute_async = AsyncMock(side_effect=failure)
     monkeypatch.setattr(reporting, "build_report_webhook", lambda *_: webhook)
     session = MagicMock()
+    session.scalar = AsyncMock(return_value=None)
     session.commit = AsyncMock()
 
     await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
@@ -419,6 +476,7 @@ async def test_deliver_report_retries_invalid_discord_response(monkeypatch):
     webhook.execute_async = AsyncMock(return_value=response)
     monkeypatch.setattr(reporting, "build_report_webhook", lambda *_: webhook)
     session = MagicMock()
+    session.scalar = AsyncMock(return_value=None)
     session.commit = AsyncMock()
 
     await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
