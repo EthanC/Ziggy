@@ -50,7 +50,7 @@ Python 3.14 and [`uv`](https://docs.astral.sh/uv/) are required.
 uv sync --locked
 ```
 
-Copy `ziggy.example.toml` to `ziggy.toml`. Internet Archive credentials are optional. If used, export `ZIGGY_INTERNET_ARCHIVE_EMAIL` with the account email address and `ZIGGY_INTERNET_ARCHIVE_PASSWORD` with its password through your shell or secret manager. Ziggy does not load `.env` files itself.
+Copy `ziggy.example.toml` to `ziggy.toml`. Internet Archive credentials are optional. If used, export `ZIGGY_INTERNET_ARCHIVE_EMAIL` with the account email address and `ZIGGY_INTERNET_ARCHIVE_PASSWORD` with its password through your shell or secret manager. `ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD` sets how long Archive.org must avoid HTTP 5XX responses before Ziggy resets its backoff level; the default is `15m`. Ziggy does not load `.env` files itself.
 
 ```console
 uv run python -m ziggy check-config --config ziggy.toml

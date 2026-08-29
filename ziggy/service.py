@@ -108,6 +108,7 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
             secrets.archive_password,
             timeout=config.crawl.request_timeout,
             request_delay=config.archive.request_delay,
+            server_error_recovery_period=config.archive.server_error_recovery_period,
         )
         await archive_client.login()
     except BaseException:
@@ -211,6 +212,8 @@ async def _config_watcher(
             or secrets.archive_password != state.secrets.archive_password
             or replacement.crawl.request_timeout != state.config.crawl.request_timeout
             or replacement.archive.request_delay != state.config.archive.request_delay
+            or replacement.archive.server_error_recovery_period
+            != state.config.archive.server_error_recovery_period
             or state.archive_paused
         ):
             candidate = ArchivistClient(
@@ -218,6 +221,9 @@ async def _config_watcher(
                 secrets.archive_password,
                 timeout=replacement.crawl.request_timeout,
                 request_delay=replacement.archive.request_delay,
+                server_error_recovery_period=(
+                    replacement.archive.server_error_recovery_period
+                ),
             )
             candidate_ready = False
             try:

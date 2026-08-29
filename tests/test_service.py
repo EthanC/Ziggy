@@ -578,7 +578,11 @@ async def test_config_watcher_swaps_changed_boundaries_and_applies_reload(monkey
     await service._config_watcher(Path("ziggy.toml"), state, Sessions(session), stop)
 
     archive_factory.assert_called_once_with(
-        "user@example.com", "new-password", timeout=15.0, request_delay=1.0
+        "user@example.com",
+        "new-password",
+        timeout=15.0,
+        request_delay=1.0,
+        server_error_recovery_period=timedelta(minutes=15),
     )
     candidate.login.assert_awaited_once_with()
     assert state.archive_client is candidate
@@ -634,6 +638,13 @@ async def test_config_watcher_applies_logging_only_change_without_client_swap(
         replace(
             make_config(), archive=replace(make_config().archive, request_delay=2.0)
         ),
+        replace(
+            make_config(),
+            archive=replace(
+                make_config().archive,
+                server_error_recovery_period=timedelta(minutes=5),
+            ),
+        ),
     ],
 )
 async def test_config_watcher_replaces_archive_client_for_network_settings(
@@ -660,6 +671,7 @@ async def test_config_watcher_replaces_archive_client_for_network_settings(
         "password",
         timeout=replacement.crawl.request_timeout,
         request_delay=replacement.archive.request_delay,
+        server_error_recovery_period=(replacement.archive.server_error_recovery_period),
     )
     assert state.archive_client is candidate
 

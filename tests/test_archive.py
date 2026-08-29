@@ -1012,9 +1012,11 @@ async def test_adapter_submit_builds_required_options_without_network():
     adapter._client = native  # noqa: SLF001
     adapter._request_lock = asyncio.Lock()  # noqa: SLF001
     adapter._request_delay = 0  # noqa: SLF001
+    adapter._server_error_recovery_period = timedelta(minutes=15)  # noqa: SLF001
     adapter._last_request_at = None  # noqa: SLF001
     adapter._rate_limit_until = None  # noqa: SLF001
     adapter._server_error_failures = 0  # noqa: SLF001
+    adapter._last_server_error_at = None  # noqa: SLF001
     adapter._server_error_until = None  # noqa: SLF001
 
     result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
@@ -1097,9 +1099,11 @@ def adapter_with(native: NativeClient) -> archive.ArchivistClient:
     adapter._client = native  # noqa: SLF001
     adapter._request_lock = asyncio.Lock()  # noqa: SLF001
     adapter._request_delay = 0  # noqa: SLF001
+    adapter._server_error_recovery_period = timedelta(minutes=15)  # noqa: SLF001
     adapter._last_request_at = None  # noqa: SLF001
     adapter._rate_limit_until = None  # noqa: SLF001
     adapter._server_error_failures = 0  # noqa: SLF001
+    adapter._last_server_error_at = None  # noqa: SLF001
     adapter._server_error_until = None  # noqa: SLF001
     return adapter
 
@@ -1130,13 +1134,17 @@ def test_adapter_constructor_wires_account_and_timeout(monkeypatch: pytest.Monke
     monkeypatch.setattr(archive, "AsyncInternetArchiveClient", make_native)
 
     adapter = archive.ArchivistClient(
-        "user@example.com", "archive-password", timeout=4.5
+        "user@example.com",
+        "archive-password",
+        timeout=4.5,
+        server_error_recovery_period=timedelta(minutes=7),
     )
 
     assert adapter._client is native  # noqa: SLF001
     assert captured["account"].username == "user@example.com"
     assert captured["account"].remember is True
     assert captured["timeout"] == 4.5
+    assert adapter._server_error_recovery_period == timedelta(minutes=7)  # noqa: SLF001
 
 
 def test_adapter_constructor_supports_anonymous_client(
@@ -1326,7 +1334,7 @@ async def test_adapter_does_not_sleep_for_expired_rate_limit(monkeypatch):
     assert adapter._rate_limit_until is None  # noqa: SLF001
 
 
-async def test_adapter_backs_off_repeated_server_errors_and_resets(monkeypatch):
+async def test_adapter_requires_sustained_recovery_to_reset_backoff(monkeypatch):
     native = NativeClient()
     native.status_result = InvalidServiceResponseError(
         "Internet Archive returned HTTP 503",
@@ -1334,24 +1342,46 @@ async def test_adapter_backs_off_repeated_server_errors_and_resets(monkeypatch):
         status_code=503,
     )
     adapter = adapter_with(native)
+    adapter._server_error_recovery_period = timedelta(minutes=5)  # noqa: SLF001
     sleep = AsyncMock()
     monkeypatch.setattr(archive.asyncio, "sleep", sleep)
 
     with pytest.raises(ArchiveError):
         await adapter.status("native-job")
+
+    native.status_result = InternetArchivePendingStatus("native-job")
+    await adapter.status("native-job")
+
+    assert adapter._server_error_failures == 1  # noqa: SLF001
+    assert adapter._last_server_error_at is not None  # noqa: SLF001
+    sleep.assert_awaited_once()
+    assert 59 < sleep.await_args.args[0] <= 60
+
+    native.status_result = InvalidServiceResponseError(
+        "Internet Archive returned HTTP 503",
+        service="Internet Archive",
+        status_code=503,
+    )
     with pytest.raises(ArchiveError):
         await adapter.status("native-job")
 
     assert adapter._server_error_failures == 2  # noqa: SLF001
-    sleep.assert_awaited_once()
-    assert 59 < sleep.await_args.args[0] <= 60
 
     native.status_result = InternetArchivePendingStatus("native-job")
     await adapter.status("native-job")
 
     assert sleep.await_count == 2
     assert 119 < sleep.await_args_list[1].args[0] <= 120
+    assert adapter._server_error_failures == 2  # noqa: SLF001
+    assert adapter._server_error_until is None  # noqa: SLF001
+
+    adapter._last_server_error_at = datetime.now(UTC) - timedelta(  # noqa: SLF001
+        minutes=6
+    )
+    await adapter.status("native-job")
+
     assert adapter._server_error_failures == 0  # noqa: SLF001
+    assert adapter._last_server_error_at is None  # noqa: SLF001
     assert adapter._server_error_until is None  # noqa: SLF001
 
 

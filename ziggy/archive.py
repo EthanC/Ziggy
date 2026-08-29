@@ -36,6 +36,7 @@ from ziggy.urls import UrlError, normalize_url, url_in_scope
 
 _SERVER_ERROR_MIN = 500
 _SERVER_ERROR_MAX = 599
+_DEFAULT_SERVER_ERROR_RECOVERY_PERIOD = timedelta(minutes=15)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -126,6 +127,7 @@ class ArchivistClient:
         password: str | None = None,
         timeout: float = 30.0,
         request_delay: float = 1.0,
+        server_error_recovery_period: timedelta = _DEFAULT_SERVER_ERROR_RECOVERY_PERIOD,
     ) -> None:
         """Create an anonymous or account-backed Archivist client."""
         if bool(email) != bool(password):
@@ -141,9 +143,11 @@ class ArchivistClient:
         self._client = AsyncInternetArchiveClient(account=account, timeout=timeout)
         self._request_lock = asyncio.Lock()
         self._request_delay = request_delay
+        self._server_error_recovery_period = server_error_recovery_period
         self._last_request_at: float | None = None
         self._rate_limit_until: datetime | None = None
         self._server_error_failures = 0
+        self._last_server_error_at: datetime | None = None
         self._server_error_until: datetime | None = None
 
     async def __aenter__(self) -> Self:
@@ -317,15 +321,20 @@ class ArchivistClient:
                 if error.status_code is not None and (
                     _SERVER_ERROR_MIN <= error.status_code <= _SERVER_ERROR_MAX
                 ):
+                    occurred_at = datetime.now(UTC)
                     self._server_error_failures += 1
                     exponent = min(self._server_error_failures - 1, 6)
                     minutes = min(60, 2**exponent)
-                    self._server_error_until = datetime.now(UTC) + timedelta(
-                        minutes=minutes
-                    )
+                    self._last_server_error_at = occurred_at
+                    self._server_error_until = occurred_at + timedelta(minutes=minutes)
                 raise
             else:
-                self._server_error_failures = 0
+                if self._last_server_error_at is None or (
+                    datetime.now(UTC) - self._last_server_error_at
+                    >= self._server_error_recovery_period
+                ):
+                    self._server_error_failures = 0
+                    self._last_server_error_at = None
                 self._server_error_until = None
                 return result
 

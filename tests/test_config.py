@@ -62,6 +62,7 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.archive.concurrency == 1
     assert config.archive.max_pending_jobs == 2
     assert config.archive.request_delay == 1.0
+    assert config.archive.server_error_recovery_period == timedelta(minutes=15)
     assert config.archive.dedupe_window == timedelta(hours=24)
     assert config.archive.max_attempts == 5
     assert config.reporting.interval == timedelta(hours=24)
@@ -132,6 +133,23 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
     )
 
 
+def test_load_config_reads_archive_recovery_period_from_environment(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD", "45m")
+
+    config = minimal_config(tmp_path)
+
+    assert config.archive.server_error_recovery_period == timedelta(minutes=45)
+
+
+def test_load_config_rejects_invalid_archive_recovery_period(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD", "0m")
+
+    with pytest.raises(ConfigError, match="ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD"):
+        minimal_config(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("body", "message"),
     [
@@ -149,6 +167,10 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
         ),
         (
             '[ziggy]\ndatabase = "x"\n[archive]\npassword_env = "ARCHIVE_PASSWORD"',
+            "unknown archive field",
+        ),
+        (
+            '[ziggy]\ndatabase = "x"\n[archive]\nserver_error_recovery_period = "1h"',
             "unknown archive field",
         ),
         (

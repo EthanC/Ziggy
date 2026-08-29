@@ -18,6 +18,7 @@ from ziggy.urls import normalize_host, normalize_url
 _DURATION_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>s|m|h|d)$")
 _INTERNET_ARCHIVE_EMAIL_ENV = "ZIGGY_INTERNET_ARCHIVE_EMAIL"
 _INTERNET_ARCHIVE_PASSWORD_ENV = "ZIGGY_INTERNET_ARCHIVE_PASSWORD"  # noqa: S105
+_INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV = "ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD"
 _DISCORD_WEBHOOK_URL_ENV = "ZIGGY_DISCORD_WEBHOOK_URL"
 _LOG_DISCORD_WEBHOOK_URL_ENV = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
 
@@ -97,6 +98,7 @@ class ArchiveSettings:
     concurrency: int = 1
     max_pending_jobs: int = 2
     request_delay: float = 1.0
+    server_error_recovery_period: timedelta = timedelta(minutes=15)
     dedupe_window: timedelta = timedelta(hours=24)
     max_attempts: int = 5
 
@@ -203,8 +205,12 @@ def _parse_crawl(data: dict[str, Any]) -> CrawlSettings:
     )
 
 
-def _parse_archive(data: dict[str, Any]) -> ArchiveSettings:
-    names = {field.name for field in fields(ArchiveSettings)}
+def _parse_archive(
+    data: dict[str, Any], server_error_recovery_period: timedelta
+) -> ArchiveSettings:
+    names = {field.name for field in fields(ArchiveSettings)} - {
+        "server_error_recovery_period"
+    }
     _only(data, names, "archive")
     return ArchiveSettings(
         interval=parse_duration(data.get("interval", "30d")),
@@ -215,6 +221,7 @@ def _parse_archive(data: dict[str, Any]) -> ArchiveSettings:
         request_delay=_nonnegative_float(
             data.get("request_delay", 1.0), "archive.request_delay"
         ),
+        server_error_recovery_period=server_error_recovery_period,
         dedupe_window=parse_duration(data.get("dedupe_window", "24h")),
         max_attempts=_positive_int(data.get("max_attempts", 5), "archive.max_attempts"),
     )
@@ -302,7 +309,7 @@ def _validate_domain_scopes(domains: tuple[DomainSettings, ...]) -> None:
                 )
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path, env: Env | None = None) -> Config:
     """Read and validate a complete configuration file."""
     try:
         with path.open("rb") as file:
@@ -323,10 +330,19 @@ def load_config(path: Path) -> Config:
         _parse_domain(value, index) for index, value in enumerate(domains_value)
     )
     _validate_domain_scopes(domains)
+    recovery_value = (env or Env()).str(
+        _INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV, default="15m"
+    )
+    try:
+        server_error_recovery_period = parse_duration(recovery_value)
+    except ConfigError as error:
+        raise ConfigError(
+            f"{_INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV}: {error}"
+        ) from error
     return Config(
         ziggy=_parse_ziggy(_section(data, "ziggy"), path.parent.resolve()),
         crawl=_parse_crawl(_section(data, "crawl")),
-        archive=_parse_archive(_section(data, "archive")),
+        archive=_parse_archive(_section(data, "archive"), server_error_recovery_period),
         reporting=_parse_reporting(_section(data, "reporting")),
         logging=_parse_logging(_section(data, "logging")),
         domains=domains,
