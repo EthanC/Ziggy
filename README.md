@@ -1,6 +1,6 @@
 <div align="center">
 
-# Ziggy
+<img src="brand/Ziggy_Lockup_Color.png" alt="Ziggy">
 
 Ziggy crawls and preserves the websites you care about.
 
