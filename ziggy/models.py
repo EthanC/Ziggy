@@ -166,7 +166,7 @@ class ArchiveJob(Base):
         Enum(ArchiveJobState, native_enum=False, validate_strings=True)
     )
     cycle_key: Mapped[str] = mapped_column(String(255), unique=True)
-    external_job_id: Mapped[str | None] = mapped_column(String(255), unique=True)
+    external_job_id: Mapped[str | None] = mapped_column(String(255))
     intent_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now)
     submitted_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     completed_at: Mapped[datetime | None] = mapped_column(UtcDateTime())

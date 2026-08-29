@@ -298,6 +298,58 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
     logging_controller.close.assert_awaited_once_with()
 
 
+async def test_run_service_logs_runtime_exception_group(monkeypatch, tmp_path):
+    config = make_config(tmp_path / "ziggy.sqlite3")
+    logging_controller = SimpleNamespace(configure=MagicMock(), close=AsyncMock())
+    archive_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+    crawler = SimpleNamespace(close=AsyncMock())
+    engine = SimpleNamespace(dispose=AsyncMock())
+    session = MagicMock(add=MagicMock(), commit=AsyncMock(), execute=AsyncMock())
+    remove_signals = MagicMock()
+    runtime_error = RuntimeError("worker failed")
+    log_exception = MagicMock()
+    monkeypatch.setattr(service, "load_config", MagicMock(return_value=config))
+    monkeypatch.setattr(
+        service, "resolve_secrets", MagicMock(return_value=make_secrets())
+    )
+    monkeypatch.setattr(
+        service, "LoggingController", MagicMock(return_value=logging_controller)
+    )
+    monkeypatch.setattr(service, "run_migrations", AsyncMock())
+    monkeypatch.setattr(service, "create_engine", MagicMock(return_value=engine))
+    monkeypatch.setattr(
+        service, "session_factory", MagicMock(return_value=Sessions(session))
+    )
+    monkeypatch.setattr(
+        service, "ArchivistClient", MagicMock(return_value=archive_client)
+    )
+    monkeypatch.setattr(service, "CrawlerClient", MagicMock(return_value=crawler))
+    monkeypatch.setattr(
+        service, "_install_signal_handlers", MagicMock(return_value=remove_signals)
+    )
+    monkeypatch.setattr(service, "reconcile_domains", AsyncMock())
+    monkeypatch.setattr(service, "release_leases", AsyncMock())
+    monkeypatch.setattr(service.logger, "exception", log_exception)
+    monkeypatch.setattr(
+        service, "_config_watcher", AsyncMock(side_effect=runtime_error)
+    )
+    for name in (
+        "_crawl_scheduler",
+        "_archive_submission_scheduler",
+        "_archive_poll_scheduler",
+        "_report_scheduler",
+        "_heartbeat",
+    ):
+        monkeypatch.setattr(service, name, AsyncMock())
+
+    with pytest.raises(ExceptionGroup) as raised:
+        await service.run_service(tmp_path / "ziggy.toml")
+
+    assert runtime_error in raised.value.exceptions
+    log_exception.assert_called_once_with("Ziggy service failed")
+    logging_controller.close.assert_awaited_once_with()
+
+
 async def test_run_service_cleans_resources_when_archive_login_fails(
     monkeypatch, tmp_path
 ):
@@ -804,7 +856,7 @@ async def test_poll_one_delays_no_id_work_while_archive_is_paused(monkeypatch):
 
 
 async def test_worker_failure_helpers_release_and_delay_work():
-    session = MagicMock(commit=AsyncMock())
+    session = MagicMock(commit=AsyncMock(), rollback=AsyncMock())
     page = SimpleNamespace(
         error=None,
         crawl_lease_owner="worker",
@@ -828,6 +880,7 @@ async def test_worker_failure_helpers_release_and_delay_work():
     assert job.lease_owner is None
     assert before <= job.next_attempt_at <= after
     assert session.commit.await_count == 2
+    assert session.rollback.await_count == 2
 
 
 async def test_crawl_scheduler_claims_batch_and_waits_when_idle(monkeypatch):

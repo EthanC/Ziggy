@@ -267,6 +267,31 @@ async def test_submit_success_persists_remote_acceptance(database: Database):
         assert job.lease_expires_at is None
 
 
+async def test_submit_accepts_reused_remote_job_id(database: Database):
+    client = FakeArchiveClient(submit_result="shared-remote-job")
+    async with database.sessions() as session:
+        _, page = await add_page(session)
+        previous = await add_job(
+            session,
+            page,
+            job_id="previous",
+            state=ArchiveJobState.SUCCEEDED,
+            external_job_id="shared-remote-job",
+            saved=True,
+            outlinks_processed=True,
+        )
+        job = await add_job(session, page, job_id="current")
+        await session.commit()
+
+        await submit_archive_job(
+            session, job, page=page, client=client, settings=SETTINGS, now=NOW
+        )
+
+        assert previous.external_job_id == "shared-remote-job"
+        assert job.external_job_id == "shared-remote-job"
+        assert job.state is ArchiveJobState.SUBMITTED
+
+
 async def test_submit_authentication_failure_is_persisted_and_raised(
     database: Database,
 ):

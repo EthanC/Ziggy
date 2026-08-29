@@ -605,6 +605,7 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
             child_page.next_archive_at, child.captured_at + settings.interval
         )
         child_job_id = str(uuid4())
+        child_cycle_key = f"outlink:{parent.id}:{child.job_id}"
         await session.execute(
             insert(ArchiveJob)
             .values(
@@ -613,7 +614,7 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
                 parent_job_id=parent.id,
                 kind=ArchiveJobKind.OUTLINK,
                 state=ArchiveJobState.SUCCEEDED,
-                cycle_key=f"outlink:{parent.id}:{child.job_id}",
+                cycle_key=child_cycle_key,
                 external_job_id=child.job_id,
                 intent_at=parent.intent_at,
                 submitted_at=parent.submitted_at,
@@ -625,7 +626,7 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
             .on_conflict_do_nothing()
         )
         child_job = await session.scalar(
-            select(ArchiveJob).where(ArchiveJob.external_job_id == child.job_id)
+            select(ArchiveJob).where(ArchiveJob.cycle_key == child_cycle_key)
         )
         if child_job is not None:
             await session.execute(

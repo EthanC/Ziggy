@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "f5c2b31a8d4e"
+HEAD_REVISION = "9d14f3a7c2e1"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -133,6 +133,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     assert migrations.joinpath(
         "versions", "f5c2b31a8d4e_add_page_scope_state.py"
     ).is_file()
+    assert migrations.joinpath(
+        "versions", "9d14f3a7c2e1_allow_reused_archive_job_ids.py"
+    ).is_file()
 
 
 async def test_scope_migration_preserves_existing_pages_and_defaults_them_in_scope(
@@ -170,6 +173,72 @@ async def test_scope_migration_preserves_existing_pages_and_defaults_them_in_sco
     try:
         async with engine.connect() as connection:
             assert await connection.scalar(text("SELECT in_scope FROM pages")) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_remote_job_id_migration_preserves_and_allows_reused_ids(tmp_path):
+    path = tmp_path / "reused-job-id.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "f5c2b31a8d4e")
+    engine = create_engine(path)
+    timestamp = "2026-08-28T09:00:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) VALUES ('example.com', 'https', 0, 1, :now, :now)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(domain_id, url, in_scope, discovered_at, next_crawl_at, "
+                    "next_archive_at, sitemap_depth, crawl_attempts) "
+                    "VALUES (1, 'https://example.com/', 1, :now, :now, :now, 0, 0)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, external_job_id, "
+                    "intent_at, next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed) VALUES "
+                    "('first', 1, 'DIRECT', 'SUCCEEDED', 'first-cycle', "
+                    "'shared-job', :now, :now, 0, 1, 1)"
+                ),
+                {"now": timestamp},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, external_job_id, "
+                    "intent_at, next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed) VALUES "
+                    "('second', 1, 'DIRECT', 'SUCCEEDED', 'second-cycle', "
+                    "'shared-job', :now, :now, 0, 1, 1)"
+                ),
+                {"now": timestamp},
+            )
+            assert (
+                await connection.scalar(
+                    text(
+                        "SELECT COUNT(*) FROM archive_jobs "
+                        "WHERE external_job_id = 'shared-job'"
+                    )
+                )
+                == 2
+            )
     finally:
         await engine.dispose()
 

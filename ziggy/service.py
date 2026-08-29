@@ -158,6 +158,9 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
                 name="report-scheduler",
             )
             tasks.create_task(_heartbeat(sessions, instance_id, stop), name="heartbeat")
+    except Exception:
+        logger.exception("Ziggy service failed")
+        raise
     finally:
         stop.set()
         remove_signals()
@@ -568,6 +571,7 @@ async def check_health(path: Path, now: datetime | None = None) -> bool:
 async def _worker_failure(
     session: AsyncSession, page: Page, kind: str, error: Exception
 ) -> None:
+    await session.rollback()
     page.error = type(error).__name__
     page.crawl_lease_owner = None
     page.crawl_lease_expires_at = None
@@ -579,6 +583,7 @@ async def _worker_failure(
 async def _archive_worker_failure(
     session: AsyncSession, job: ArchiveJob, error: Exception
 ) -> None:
+    await session.rollback()
     job.error = type(error).__name__
     job.lease_owner = None
     job.lease_expires_at = None
