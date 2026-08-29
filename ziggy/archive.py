@@ -19,6 +19,7 @@ from archivist import (
     InternetArchiveSuccessStatus,
     InternetArchiveUserStatus,
     RateLimitError,
+    ServiceError,
 )
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
@@ -32,6 +33,9 @@ from ziggy.models import (
     Page,
 )
 from ziggy.urls import UrlError, normalize_url, url_in_scope
+
+_SERVER_ERROR_MIN = 500
+_SERVER_ERROR_MAX = 599
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -139,6 +143,8 @@ class ArchivistClient:
         self._request_delay = request_delay
         self._last_request_at: float | None = None
         self._rate_limit_until: datetime | None = None
+        self._server_error_failures = 0
+        self._server_error_until: datetime | None = None
 
     async def __aenter__(self) -> Self:
         """Verify configured account credentials before accepting work."""
@@ -274,15 +280,20 @@ class ArchivistClient:
             raise ArchiveError(type(error).__name__) from error
 
     async def _request[T](self, request: Callable[[], Awaitable[T]]) -> T:
-        """Serialize requests and make a remote rate limit apply to later work."""
+        """Serialize requests and apply service cooldowns to later work."""
         async with self._request_lock:
-            delay = 0.0
-            rate_limited = self._rate_limit_until is not None
-            if rate_limited:
-                delay = max(
-                    delay,
-                    (self._rate_limit_until - datetime.now(UTC)).total_seconds(),
-                )
+            now = datetime.now(UTC)
+            delay = max(
+                (
+                    (cooldown - now).total_seconds()
+                    for cooldown in (
+                        self._rate_limit_until,
+                        self._server_error_until,
+                    )
+                    if cooldown is not None
+                ),
+                default=0.0,
+            )
             if self._last_request_at is not None:
                 delay = max(
                     delay,
@@ -291,17 +302,32 @@ class ArchivistClient:
                 )
             if delay > 0:
                 await asyncio.sleep(delay)
-            if rate_limited:
-                self._rate_limit_until = None
+            self._rate_limit_until = None
+            self._server_error_until = None
             self._last_request_at = asyncio.get_running_loop().time()
             try:
-                return await request()
+                result = await request()
             except RateLimitError as error:
                 retry_at = _retry_at(error.retry_after) or datetime.now(
                     UTC
                 ) + timedelta(minutes=1)
                 self._rate_limit_until = retry_at
                 raise ArchiveRateLimitError(retry_at) from error
+            except ServiceError as error:
+                if error.status_code is not None and (
+                    _SERVER_ERROR_MIN <= error.status_code <= _SERVER_ERROR_MAX
+                ):
+                    self._server_error_failures += 1
+                    exponent = min(self._server_error_failures - 1, 6)
+                    minutes = min(60, 2**exponent)
+                    self._server_error_until = datetime.now(UTC) + timedelta(
+                        minutes=minutes
+                    )
+                raise
+            else:
+                self._server_error_failures = 0
+                self._server_error_until = None
+                return result
 
     async def close(self) -> None:
         """Close Archivist's owned Niquests session."""

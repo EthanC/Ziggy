@@ -14,6 +14,7 @@ from archivist import (
     InternetArchivePendingStatus,
     InternetArchiveSuccessStatus,
     InternetArchiveUserStatus,
+    InvalidServiceResponseError,
     RateLimitError,
 )
 from sqlalchemy import select
@@ -1013,6 +1014,8 @@ async def test_adapter_submit_builds_required_options_without_network():
     adapter._request_delay = 0  # noqa: SLF001
     adapter._last_request_at = None  # noqa: SLF001
     adapter._rate_limit_until = None  # noqa: SLF001
+    adapter._server_error_failures = 0  # noqa: SLF001
+    adapter._server_error_until = None  # noqa: SLF001
 
     result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
 
@@ -1096,6 +1099,8 @@ def adapter_with(native: NativeClient) -> archive.ArchivistClient:
     adapter._request_delay = 0  # noqa: SLF001
     adapter._last_request_at = None  # noqa: SLF001
     adapter._rate_limit_until = None  # noqa: SLF001
+    adapter._server_error_failures = 0  # noqa: SLF001
+    adapter._server_error_until = None  # noqa: SLF001
     return adapter
 
 
@@ -1319,6 +1324,68 @@ async def test_adapter_does_not_sleep_for_expired_rate_limit(monkeypatch):
 
     sleep.assert_not_awaited()
     assert adapter._rate_limit_until is None  # noqa: SLF001
+
+
+async def test_adapter_backs_off_repeated_server_errors_and_resets(monkeypatch):
+    native = NativeClient()
+    native.status_result = InvalidServiceResponseError(
+        "Internet Archive returned HTTP 503",
+        service="Internet Archive",
+        status_code=503,
+    )
+    adapter = adapter_with(native)
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+
+    with pytest.raises(ArchiveError):
+        await adapter.status("native-job")
+    with pytest.raises(ArchiveError):
+        await adapter.status("native-job")
+
+    assert adapter._server_error_failures == 2  # noqa: SLF001
+    sleep.assert_awaited_once()
+    assert 59 < sleep.await_args.args[0] <= 60
+
+    native.status_result = InternetArchivePendingStatus("native-job")
+    await adapter.status("native-job")
+
+    assert sleep.await_count == 2
+    assert 119 < sleep.await_args_list[1].args[0] <= 120
+    assert adapter._server_error_failures == 0  # noqa: SLF001
+    assert adapter._server_error_until is None  # noqa: SLF001
+
+
+async def test_adapter_server_error_backoff_caps_at_one_hour(monkeypatch):
+    native = NativeClient()
+    native.status_result = InvalidServiceResponseError(
+        "Internet Archive returned HTTP 500",
+        service="Internet Archive",
+        status_code=500,
+    )
+    adapter = adapter_with(native)
+    adapter._server_error_failures = 6  # noqa: SLF001
+
+    with pytest.raises(ArchiveError):
+        await adapter.status("native-job")
+
+    remaining = adapter._server_error_until - datetime.now(UTC)  # noqa: SLF001
+    assert timedelta(minutes=59, seconds=59) < remaining <= timedelta(hours=1)
+
+
+async def test_adapter_does_not_back_off_non_server_errors():
+    native = NativeClient()
+    native.status_result = InvalidServiceResponseError(
+        "Internet Archive returned HTTP 404",
+        service="Internet Archive",
+        status_code=404,
+    )
+    adapter = adapter_with(native)
+
+    with pytest.raises(ArchiveError):
+        await adapter.status("native-job")
+
+    assert adapter._server_error_failures == 0  # noqa: SLF001
+    assert adapter._server_error_until is None  # noqa: SLF001
 
 
 async def test_adapter_spaces_consecutive_requests(monkeypatch):
