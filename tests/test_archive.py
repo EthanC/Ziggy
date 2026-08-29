@@ -206,6 +206,8 @@ def success(
     job_id: str = "remote-1",
     url: str = "https://example.com/page",
     captured_at: datetime = CAPTURED_AT,
+    *,
+    first_archive: bool | None = None,
 ) -> SuccessStatus:
     return SuccessStatus(
         job_id=job_id,
@@ -213,6 +215,7 @@ def success(
         captured_at=captured_at,
         wayback_url=f"https://web.archive.org/web/{job_id}",
         screenshot=f"https://web.archive.org/screenshot/{job_id}",
+        first_archive=first_archive,
     )
 
 
@@ -509,7 +512,7 @@ async def test_poll_terminal_failure_records_service_code(database: Database):
 async def test_poll_success_persists_capture_and_finishes_post_processing(
     database: Database,
 ):
-    remote_success = success()
+    remote_success = success(first_archive=True)
     client = FakeArchiveClient(status_result=remote_success)
     async with database.sessions() as session:
         domain, page = await add_page(session)
@@ -542,6 +545,7 @@ async def test_poll_success_persists_capture_and_finishes_post_processing(
         assert capture.page_id == page.id
         assert capture.archive_job_id == job.id
         assert capture.captured_at == CAPTURED_AT
+        assert capture.first_archive is True
         assert client.status_calls == ["remote-1"]
         assert client.add_calls == ["remote-1"]
         assert client.outlink_calls == ["remote-1"]
@@ -635,7 +639,11 @@ async def test_outlinks_use_exact_subdomain_scope_and_persist_child_captures(
     database: Database,
 ):
     children = (
-        success("child-exact", "https://NEWS.example.com/a/../child#fragment"),
+        success(
+            "child-exact",
+            "https://NEWS.example.com/a/../child#fragment",
+            first_archive=True,
+        ),
         success("child-parent", "https://example.com/parent-host"),
         success("child-sibling", "https://shop.example.com/sibling"),
         success("child-nested", "https://deep.news.example.com/nested"),
@@ -702,6 +710,7 @@ async def test_outlinks_use_exact_subdomain_scope_and_persist_child_captures(
         assert child_capture.page_id == child_page.id
         assert child_capture.captured_at == CAPTURED_AT
         assert child_capture.wayback_url.endswith("child-exact")
+        assert child_capture.first_archive is True
 
 
 async def test_claims_persisted_intent_for_recovery_even_when_domain_is_inactive(
@@ -955,6 +964,7 @@ def test_native_status_translation_helpers():
         "success-1",
         "https://example.com/original",
         CAPTURED_AT,
+        first_archive=True,
         screenshot="https://web.archive.org/screenshot.png",
     )
     failed = InternetArchiveFailedStatus(
@@ -971,6 +981,7 @@ def test_native_status_translation_helpers():
             "https://web.archive.org/web/20260304050637/https://example.com/original"
         ),
         screenshot="https://web.archive.org/screenshot.png",
+        first_archive=True,
     )
     assert archive._success(native_success) == translated  # noqa: SLF001
     assert archive._status(failed) == FailedStatus("failed-1", "blocked")  # noqa: SLF001
@@ -1378,6 +1389,7 @@ async def test_adapter_outlinks_filters_and_translates_successes():
                 "https://web.archive.org/web/20260304050637/https://example.com/child"
             ),
             screenshot=None,
+            first_archive=None,
         ),
     )
 

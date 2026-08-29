@@ -216,6 +216,7 @@ class Capture(Base):
     captured_at: Mapped[datetime] = mapped_column(UtcDateTime())
     wayback_url: Mapped[str] = mapped_column(Text)
     screenshot: Mapped[str | None] = mapped_column(Text)
+    first_archive: Mapped[bool | None] = mapped_column(Boolean)
     completed_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now)
 
     __table_args__ = (
@@ -236,6 +237,9 @@ class Report(Base):
     discovered_count: Mapped[int] = mapped_column(Integer)
     archived_count: Mapped[int] = mapped_column(Integer)
     outstanding_count: Mapped[int] = mapped_column(Integer)
+    first_archive_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
     active_domain_count: Mapped[int] = mapped_column(Integer)
     state: Mapped[ReportState] = mapped_column(
         Enum(ReportState, native_enum=False, validate_strings=True)

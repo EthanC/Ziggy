@@ -40,6 +40,7 @@ def make_report(**overrides: object) -> Report:
         "discovered_count": 5,
         "archived_count": 3,
         "outstanding_count": 2,
+        "first_archive_count": 1,
         "active_domain_count": 4,
         "state": ReportState.PENDING,
         "attempts": 0,
@@ -164,8 +165,47 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
                 archive_job_id=job.id,
                 captured_at=end,
                 wayback_url="https://web.archive.invalid/capture",
+                first_archive=True,
                 completed_at=end,
             )
+        )
+        first_archive_job = ArchiveJob(
+            page_id=before.id,
+            kind=ArchiveJobKind.DIRECT,
+            state=ArchiveJobState.SUCCEEDED,
+            cycle_key="first-archive-cycle",
+            intent_at=start,
+            next_attempt_at=start,
+        )
+        non_first_archive_job = ArchiveJob(
+            page_id=boundary.id,
+            kind=ArchiveJobKind.DIRECT,
+            state=ArchiveJobState.SUCCEEDED,
+            cycle_key="non-first-archive-cycle",
+            intent_at=start,
+            next_attempt_at=start,
+        )
+        session.add_all([first_archive_job, non_first_archive_job])
+        await session.flush()
+        session.add_all(
+            [
+                Capture(
+                    page_id=before.id,
+                    archive_job_id=first_archive_job.id,
+                    captured_at=start,
+                    wayback_url="https://web.archive.invalid/first",
+                    first_archive=True,
+                    completed_at=start,
+                ),
+                Capture(
+                    page_id=boundary.id,
+                    archive_job_id=non_first_archive_job.id,
+                    captured_at=start,
+                    wayback_url="https://web.archive.invalid/not-first",
+                    first_archive=False,
+                    completed_at=end - timedelta(microseconds=1),
+                ),
+            ]
         )
         await session.commit()
 
@@ -176,8 +216,9 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
             report.discovered_count,
             report.archived_count,
             report.outstanding_count,
+            report.first_archive_count,
             report.active_domain_count,
-        ) == (2, 1, 1, 1)
+        ) == (2, 1, 1, 1, 1)
         assert report.state is ReportState.PENDING
         assert report.next_attempt_at == generated
 
@@ -193,7 +234,7 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
 
 async def test_create_report_raises_if_insert_cannot_be_read():
     session = MagicMock()
-    session.scalar = AsyncMock(side_effect=[None, None, None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, None, None, None])
     session.execute = AsyncMock()
     session.commit = AsyncMock()
 
@@ -208,6 +249,7 @@ def test_build_report_webhook_uses_archival_report_layout():
         discovered_count=1_234,
         archived_count=1_000,
         outstanding_count=234,
+        first_archive_count=123,
         active_domain_count=2_345,
     )
 
@@ -237,6 +279,7 @@ def test_build_report_webhook_uses_archival_report_layout():
         "__**Pages**__\n"
         "* Discovered: 1,234\n"
         "* Archived: 1,000\n"
+        "* First archives: 123\n"
         "* Pending: 234"
     )
     assert container.components[2].divider is True
@@ -278,6 +321,16 @@ async def test_deliver_report_without_webhook_logs_and_releases_lease(monkeypatc
     assert report.lease_expires_at is None
     session.commit.assert_awaited_once()
     info.assert_called_once()
+    info.assert_called_once_with(
+        "Archive report {} to {}: {} discovered, {} archived, "
+        "{} first archives, {} outstanding",
+        report.window_start,
+        report.window_end,
+        report.discovered_count,
+        report.archived_count,
+        report.first_archive_count,
+        report.outstanding_count,
+    )
 
 
 async def test_deliver_report_with_no_changes_logs_without_discord(monkeypatch):
@@ -285,6 +338,7 @@ async def test_deliver_report_with_no_changes_logs_without_discord(monkeypatch):
         discovered_count=0,
         archived_count=0,
         outstanding_count=0,
+        first_archive_count=0,
     )
     session = MagicMock()
     session.commit = AsyncMock()

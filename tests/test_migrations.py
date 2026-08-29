@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "9d14f3a7c2e1"
+HEAD_REVISION = "c83d91e4a672"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -136,6 +136,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     assert migrations.joinpath(
         "versions", "9d14f3a7c2e1_allow_reused_archive_job_ids.py"
     ).is_file()
+    assert migrations.joinpath(
+        "versions", "c83d91e4a672_track_first_archives.py"
+    ).is_file()
 
 
 async def test_scope_migration_preserves_existing_pages_and_defaults_them_in_scope(
@@ -212,6 +215,24 @@ async def test_remote_job_id_migration_preserves_and_allows_reused_ids(tmp_path)
                 ),
                 {"now": timestamp},
             )
+            await connection.execute(
+                text(
+                    "INSERT INTO captures "
+                    "(page_id, archive_job_id, captured_at, wayback_url, completed_at) "
+                    "VALUES (1, 'first', :now, 'https://web.archive.org/old', :now)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reports "
+                    "(window_start, window_end, generated_at, discovered_count, "
+                    "archived_count, outstanding_count, active_domain_count, state, "
+                    "attempts, next_attempt_at) VALUES "
+                    "(:now, :now, :now, 1, 1, 0, 1, 'PENDING', 0, :now)"
+                ),
+                {"now": timestamp},
+            )
     finally:
         await engine.dispose()
 
@@ -238,6 +259,14 @@ async def test_remote_job_id_migration_preserves_and_allows_reused_ids(tmp_path)
                     )
                 )
                 == 2
+            )
+            assert (
+                await connection.scalar(text("SELECT first_archive FROM captures"))
+                is None
+            )
+            assert (
+                await connection.scalar(text("SELECT first_archive_count FROM reports"))
+                == 0
             )
     finally:
         await engine.dispose()

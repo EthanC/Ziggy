@@ -61,6 +61,13 @@ async def create_report(
             exists(select(Capture.id).where(Capture.page_id == Page.id)),
         )
     )
+    first_archives = await session.scalar(
+        select(func.count(Capture.id)).where(
+            Capture.completed_at >= window.start,
+            Capture.completed_at < window.end,
+            Capture.first_archive.is_(True),
+        )
+    )
     active_domains = await session.scalar(
         select(func.count(Domain.id)).where(Domain.active.is_(True))
     )
@@ -75,6 +82,7 @@ async def create_report(
             discovered_count=discovered_count,
             archived_count=archived_count,
             outstanding_count=discovered_count - archived_count,
+            first_archive_count=first_archives or 0,
             active_domain_count=active_domains or 0,
             state=ReportState.PENDING,
             next_attempt_at=generated_at,
@@ -101,6 +109,7 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
         "__**Pages**__\n"
         f"* Discovered: {report.discovered_count:,}\n"
         f"* Archived: {report.archived_count:,}\n"
+        f"* First archives: {report.first_archive_count:,}\n"
         f"* Pending: {report.outstanding_count:,}"
     )
     context = (
@@ -136,7 +145,12 @@ async def deliver_report(
 ) -> None:
     """Deliver, log, or reschedule one persisted report row."""
     if not any(
-        (report.discovered_count, report.archived_count, report.outstanding_count)
+        (
+            report.discovered_count,
+            report.archived_count,
+            report.outstanding_count,
+            report.first_archive_count,
+        )
     ):
         logger.info(
             "Archive report {} to {}: no changes to report",
@@ -150,11 +164,13 @@ async def deliver_report(
         return
     if webhook_url is None:
         logger.info(
-            "Archive report {} to {}: {} discovered, {} archived, {} outstanding",
+            "Archive report {} to {}: {} discovered, {} archived, "
+            "{} first archives, {} outstanding",
             report.window_start,
             report.window_end,
             report.discovered_count,
             report.archived_count,
+            report.first_archive_count,
             report.outstanding_count,
         )
         report.state = ReportState.LOGGED

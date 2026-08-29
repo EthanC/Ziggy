@@ -75,6 +75,7 @@ class SuccessStatus:
     captured_at: datetime
     wayback_url: str
     screenshot: str | None
+    first_archive: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +261,7 @@ class ArchivistClient:
                         captured_at=record.timestamp,
                         wayback_url=record.archive_url(),
                         screenshot=None,
+                        first_archive=None,
                     )
                     for record in page
                 )
@@ -333,6 +335,7 @@ def _success(status: InternetArchiveSuccessStatus) -> SuccessStatus:
         captured_at=status.timestamp,
         wayback_url=status.archive_url(),
         screenshot=status.screenshot,
+        first_archive=status.first_archive,
     )
 
 
@@ -522,6 +525,7 @@ async def _record_success(  # noqa: PLR0913, PLR0917
             captured_at=status.captured_at,
             wayback_url=status.wayback_url,
             screenshot=status.screenshot,
+            first_archive=status.first_archive,
             completed_at=now,
         )
         .on_conflict_do_nothing()
@@ -637,6 +641,7 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
                     captured_at=child.captured_at,
                     wayback_url=child.wayback_url,
                     screenshot=child.screenshot,
+                    first_archive=child.first_archive,
                     completed_at=now,
                 )
                 .on_conflict_do_nothing()
