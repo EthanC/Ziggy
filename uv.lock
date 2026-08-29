@@ -149,15 +149,15 @@ wheels = [
 
 [[package]]
 name = "discord-clyde"
-version = "1.0.0"
+version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgspec" },
     { name = "niquests" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/23/df/6808c57ff7982c249050b5972bedf23baa9c602223eccb02d3cfc6cdd207/discord_clyde-1.0.0.tar.gz", hash = "sha256:dc612234f04b243ca1611716970761be7146f9a608d754b4af3c9ea1e9fb7714", size = 7897246, upload-time = "2026-07-23T09:22:25.258Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/cf/75700f146c3f58f43d83c5b096b0733e18ac15307d92e872b8ced9391c95/discord_clyde-1.0.1.tar.gz", hash = "sha256:f53ef6a48fa43ed06edacf56de8f050b58e86f58c06baf20c9ec5841d1f9a8a3", size = 7898235, upload-time = "2026-08-29T10:13:01.199Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/38/769cc976ab73bb4ea3cc3b1c25175d4950eb3d22e1ea359db8660c06c994/discord_clyde-1.0.0-py3-none-any.whl", hash = "sha256:3749910137ef3f7f7b404fff782c41a84c7fda846727fe11c8ad33740529dbee", size = 52682, upload-time = "2026-07-23T09:22:23.976Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/8f/80f8b5b155a7d9f5180f803028083353a4c7a0a65662e168a0eaee160657/discord_clyde-1.0.1-py3-none-any.whl", hash = "sha256:d2cd7671103447794e4af8e57e45b8ab147fb7f4b3d9250a2ae4f159160c763a", size = 53110, upload-time = "2026-08-29T10:12:59.709Z" },
 ]
 
 [[package]]
@@ -631,7 +631,7 @@ requires-dist = [
     { name = "aiosqlite" },
     { name = "alembic" },
     { name = "archivist-py" },
-    { name = "discord-clyde" },
+    { name = "discord-clyde", specifier = ">=1.0.1" },
     { name = "environs", specifier = ">=15.1.0" },
     { name = "loguru" },
     { name = "loguru-discord" },

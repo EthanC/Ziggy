@@ -120,20 +120,14 @@ def build_report_webhook(
     previous_outstanding = (
         previous_report.outstanding_count if previous_report is not None else 0
     )
+    first_archive_change = _change_stat(
+        report.first_archive_count, previous_first_archives
+    )
     domain_stats = Markdown.bulleted_list(
         [
             (
                 f"Crawled: {Markdown.bold(f'{report.active_domain_count:,}')} "
                 f"{_change_stat(report.active_domain_count, previous_active_domains)}"
-            )
-        ]
-    )
-    first_archive_stats = Markdown.bulleted_list(
-        [
-            (
-                "First Archives: "
-                f"{Markdown.bold(f'{report.first_archive_count:,}')} "
-                f"{_change_stat(report.first_archive_count, previous_first_archives)}"
             )
         ]
     )
@@ -145,9 +139,16 @@ def build_report_webhook(
             ),
             (
                 f"Archived: {Markdown.bold(f'{report.archived_count:,}')} "
-                f"{_change_stat(report.archived_count, previous_archived)}\n"
-                f"  {first_archive_stats}"
+                f"{_change_stat(report.archived_count, previous_archived)}"
             ),
+            {
+                "value": (
+                    "First Archives: "
+                    f"{Markdown.bold(f'{report.first_archive_count:,}')} "
+                    f"{first_archive_change}"
+                ),
+                "indent": 1,
+            },
             (
                 f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')} "
                 f"{_change_stat(report.outstanding_count, previous_outstanding)}"
