@@ -278,8 +278,7 @@ def test_build_report_webhook_uses_archival_report_layout():
         "* Crawled: 2,345\n\n"
         "__**Pages**__\n"
         "* Discovered: 1,234\n"
-        "* Archived: 1,000\n"
-        "* First archives: 123\n"
+        "* Archived: 1,000 (123 New)\n"
         "* Pending: 234"
     )
     assert container.components[2].divider is True

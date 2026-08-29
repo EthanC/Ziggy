@@ -108,8 +108,8 @@ def build_report_webhook(report: Report, webhook_url: str) -> Webhook:
         f"* Crawled: {report.active_domain_count:,}\n\n"
         "__**Pages**__\n"
         f"* Discovered: {report.discovered_count:,}\n"
-        f"* Archived: {report.archived_count:,}\n"
-        f"* First archives: {report.first_archive_count:,}\n"
+        f"* Archived: {report.archived_count:,} "
+        f"({report.first_archive_count:,} New)\n"
         f"* Pending: {report.outstanding_count:,}"
     )
     context = (
