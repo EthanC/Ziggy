@@ -101,7 +101,9 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     archive_client: ArchivistClient | None = None
     try:
         config.ziggy.database.parent.mkdir(parents=True, exist_ok=True)
-        await run_migrations(config.ziggy.database)
+        await run_migrations(
+            config.ziggy.database, config.crawl.max_query_variants_per_base
+        )
         engine = create_engine(config.ziggy.database)
         archive_client = ArchivistClient(
             secrets.archive_email,
@@ -370,7 +372,11 @@ async def _archive_submission_slots(
         )
         await _wait(stop, max(_IDLE_DELAY, retry_delay))
         return 0
-    except ArchiveError:
+    except ArchiveError as error:
+        logger.warning(
+            "Internet Archive capacity check failed: {}",
+            type(error).__name__,
+        )
         await _wait(stop, _ARCHIVE_CAPACITY_RECHECK_DELAY)
         return 0
     if remote_slots == 0:
@@ -492,6 +498,9 @@ async def _poll_one(
                     client=state.archive_client,
                     settings=state.config.archive,
                     now=datetime.now(UTC),
+                    max_query_variants_per_base=(
+                        state.config.crawl.max_query_variants_per_base
+                    ),
                 )
         except ArchiveAuthenticationError:
             state.archive_paused = True
@@ -512,8 +521,17 @@ async def _report_scheduler(
             last_end = await session.scalar(select(func.max(Report.window_end)))
             interval = state.config.reporting.interval
             window = (
-                next_report_window(last_end, now, interval)
-                if last_end is not None or now >= state.started_at + interval
+                next_report_window(
+                    last_end,
+                    now,
+                    interval,
+                    state.config.reporting.finalization_grace,
+                )
+                if last_end is not None
+                or now
+                >= state.started_at
+                + interval
+                + state.config.reporting.finalization_grace
                 else None
             )
             if window is not None:

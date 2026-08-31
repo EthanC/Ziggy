@@ -79,12 +79,20 @@ class FakeSession:
 
 
 class FakeDatabaseSession:
-    def __init__(self):
+    def __init__(self, inserted_urls=None):
         self.statements = []
         self.commits = 0
+        self.inserted_urls = inserted_urls
 
     async def execute(self, statement):
         self.statements.append(statement)
+        params = statement.compile().params
+        urls = [value for key, value in params.items() if key.startswith("url_m")]
+        returned = urls if self.inserted_urls is None else self.inserted_urls
+        return SimpleNamespace(scalars=lambda: iter(returned))
+
+    async def scalars(self, _statement):
+        return ()
 
     async def commit(self):
         self.commits += 1
@@ -381,6 +389,26 @@ async def test_fetch_blocks_redirects_outside_exact_host_scope(
     assert result.redirect_urls == (target,)
     assert result.blocked_redirect == target
     assert result.body == b""
+
+
+async def test_fetch_blocks_sensitive_redirect_without_retaining_target(monkeypatch):
+    client, _, _ = install_client(
+        monkeypatch,
+        [
+            FakeResponse(
+                302,
+                headers={"Location": "https://example.com/login?loginToken=secret"},
+            )
+        ],
+    )
+
+    result = await client.fetch(
+        "https://example.com/", "example.com", include_subdomains=False
+    )
+
+    assert result.redirect_urls == ()
+    assert result.blocked_redirect == "sensitive query"
+    assert "secret" not in repr(result)
 
 
 async def test_fetch_rejects_invalid_redirect_and_releases_slots(monkeypatch):
@@ -785,7 +813,31 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
         ("Page found: {}", "https://example.com/redirect"),
         ("Page found: {}", "https://example.com/header"),
     ]
-    assert "ON CONFLICT (url) DO UPDATE" in str(statement)
+    assert "ON CONFLICT DO NOTHING" in str(statement)
+
+
+async def test_crawl_page_logs_only_urls_inserted_by_database(monkeypatch):
+    page = make_page()
+    session = FakeDatabaseSession(inserted_urls=("https://example.com/new",))
+    logged = []
+    monkeypatch.setattr(
+        crawler.logger, "info", lambda message, url: logged.append((message, url))
+    )
+    result = make_result(
+        body=(b'<!doctype html><a href="/existing">existing</a><a href="/new">new</a>')
+    )
+
+    await crawler.crawl_page(
+        session,
+        page,
+        configured_host="example.com",
+        include_subdomains=False,
+        client=FakeClient(result),
+        settings=make_settings(),
+        now=NOW,
+    )
+
+    assert logged == [("Page found: {}", "https://example.com/new")]
 
 
 async def test_crawl_page_allows_exact_subdomains_when_configured():

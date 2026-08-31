@@ -139,11 +139,21 @@ class Page(Base):
     crawl_lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     archive_lease_owner: Mapped[str | None] = mapped_column(String(36))
     archive_lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    query_base_url: Mapped[str | None] = mapped_column(Text)
+    query_variant_slot: Mapped[int | None] = mapped_column(Integer)
+    blocked_reason: Mapped[str | None] = mapped_column(String(32))
 
     __table_args__ = (
         Index("ix_pages_due_crawl", "next_crawl_at", "crawl_lease_expires_at"),
         Index("ix_pages_due_archive", "next_archive_at", "archive_lease_expires_at"),
         Index("ix_pages_domain", "domain_id"),
+        Index(
+            "uq_pages_query_variant_slot",
+            "query_base_url",
+            "query_variant_slot",
+            unique=True,
+            sqlite_where=query_variant_slot.is_not(None),
+        ),
     )
 
 

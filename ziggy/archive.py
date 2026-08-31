@@ -21,9 +21,11 @@ from archivist import (
     RateLimitError,
     ServiceError,
 )
+from loguru import logger
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
+from ziggy.database import insert_page_candidates
 from ziggy.models import (
     ArchiveJob,
     ArchiveJobKind,
@@ -32,7 +34,13 @@ from ziggy.models import (
     Domain,
     Page,
 )
-from ziggy.urls import UrlError, normalize_url, url_in_scope
+from ziggy.urls import (
+    DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+    UrlError,
+    normalize_url,
+    sensitive_query_key,
+    url_in_scope,
+)
 
 _SERVER_ERROR_MIN = 500
 _SERVER_ERROR_MAX = 599
@@ -435,10 +443,16 @@ async def submit_archive_job(  # noqa: PLR0913
     except ArchiveRateLimitError as error:
         _retry_uncertain(job, now, error, retry_at=error.retry_at)
         await session.commit()
+        logger.warning("Archive submission rate limited for job {}", job.id)
         return
     except ArchiveError as error:
         _retry_uncertain(job, now, error)
         await session.commit()
+        logger.warning(
+            "Archive submission failed for job {}: {}",
+            job.id,
+            type(error).__name__,
+        )
         return
     job.external_job_id = external_job_id
     job.state = ArchiveJobState.SUBMITTED
@@ -472,10 +486,16 @@ async def _recover_uncertain(  # noqa: PLR0913
     except ArchiveRateLimitError as error:
         _retry_uncertain(job, now, error, retry_at=error.retry_at)
         await session.commit()
+        logger.warning("Archive recovery rate limited for job {}", job.id)
         return False
     except ArchiveError as error:
         _retry_uncertain(job, now, error)
         await session.commit()
+        logger.warning(
+            "Archive recovery failed for job {}: {}",
+            job.id,
+            type(error).__name__,
+        )
         return False
     if captures:
         job.saved_to_my_archive = True
@@ -498,12 +518,22 @@ async def poll_archive_job(  # noqa: PLR0913
     client: ArchiveClient,
     settings: ArchiveSettings,
     now: datetime,
+    max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
 ) -> None:
     """Poll one persisted remote ID and finish resumable post-processing."""
     if job.external_job_id is None:
         raise ArchiveError("persisted polling job has no remote ID")
     if job.state == ArchiveJobState.SUCCEEDED:
-        await _post_process(session, job, page, domain, client, settings, now)
+        await _post_process(
+            session,
+            job,
+            page,
+            domain,
+            client,
+            settings,
+            now,
+            max_query_variants_per_base,
+        )
         return
     try:
         status = await client.status(job.external_job_id)
@@ -516,12 +546,28 @@ async def poll_archive_job(  # noqa: PLR0913
     except ArchiveRateLimitError as error:
         _rate_limit(job, now, error.retry_at)
         await session.commit()
+        logger.warning("Archive polling rate limited for job {}", job.id)
         return
     except ArchiveError as error:
         _retry_job(job, page, settings, now, error)
         await session.commit()
+        logger.warning(
+            "Archive polling failed for job {}: {}",
+            job.id,
+            type(error).__name__,
+        )
         return
     if isinstance(status, PendingStatus):
+        if now >= (job.submitted_at or job.intent_at) + settings.pending_timeout:
+            job.state = ArchiveJobState.FAILED
+            job.completed_at = now
+            job.error = "remote job exceeded pending timeout"
+            job.service_code = "pending_timeout"
+            page.next_archive_at = now
+            _release_job(job)
+            await session.commit()
+            logger.warning("Archive job {} exceeded pending timeout", job.id)
+            return
         job.state = ArchiveJobState.PENDING
         job.next_attempt_at = status.retry_at or now + timedelta(seconds=2)
         job.error = None
@@ -535,9 +581,23 @@ async def poll_archive_job(  # noqa: PLR0913
         page.next_archive_at = now + settings.interval
         _release_job(job)
         await session.commit()
+        logger.warning(
+            "Archive job {} failed with service code {}",
+            job.id,
+            status.service_code or "unknown",
+        )
         return
     await _record_success(session, job, page, status, settings, now)
-    await _post_process(session, job, page, domain, client, settings, now)
+    await _post_process(
+        session,
+        job,
+        page,
+        domain,
+        client,
+        settings,
+        now,
+        max_query_variants_per_base,
+    )
 
 
 async def _record_success(  # noqa: PLR0913, PLR0917
@@ -577,6 +637,7 @@ async def _post_process(  # noqa: PLR0913, PLR0917
     client: ArchiveClient,
     settings: ArchiveSettings,
     now: datetime,
+    max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
 ) -> None:
     try:
         if not job.saved_to_my_archive:
@@ -585,7 +646,16 @@ async def _post_process(  # noqa: PLR0913, PLR0917
             await session.commit()
         if not job.outlinks_processed:
             children = await client.outlinks(job.external_job_id or "")
-            await _record_outlinks(session, job, page, domain, children, settings, now)
+            await _record_outlinks(
+                session,
+                job,
+                page,
+                domain,
+                children,
+                settings,
+                now,
+                max_query_variants_per_base,
+            )
             job.outlinks_processed = True
             job.error = None
             await session.commit()
@@ -611,34 +681,36 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
     children: Sequence[SuccessStatus],
     settings: ArchiveSettings,
     now: datetime,
+    max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
 ) -> None:
     for child in children:
         try:
             url = normalize_url(child.original_url)
         except UrlError:
             continue
+        if sensitive_query_key(url) is not None:
+            continue
         if not url_in_scope(
             url, domain.host, include_subdomains=domain.include_subdomains
         ):
             continue
-        await session.execute(
-            insert(Page)
-            .values(
-                domain_id=domain.id,
-                url=url,
-                in_scope=True,
-                discovered_at=now,
-                discovered_from_id=parent_page.id,
-                next_crawl_at=now,
-                next_archive_at=child.captured_at + settings.interval,
-            )
-            .on_conflict_do_update(
-                index_elements=[Page.url],
-                set_={"domain_id": domain.id, "in_scope": True},
-            )
+        await insert_page_candidates(
+            session,
+            [
+                {
+                    "domain_id": domain.id,
+                    "url": url,
+                    "in_scope": True,
+                    "discovered_at": now,
+                    "discovered_from_id": parent_page.id,
+                    "next_crawl_at": now,
+                    "next_archive_at": child.captured_at + settings.interval,
+                }
+            ],
+            max_query_variants_per_base,
         )
         child_page = await session.scalar(select(Page).where(Page.url == url))
-        if child_page is None:
+        if child_page is None or child_page.blocked_reason is not None:
             continue
         child_page.next_archive_at = max(
             child_page.next_archive_at, child.captured_at + settings.interval
@@ -757,9 +829,10 @@ async def available_archive_submission_slots(
         .select_from(ArchiveJob)
         .where(
             ArchiveJob.kind == ArchiveJobKind.DIRECT,
-            ArchiveJob.external_job_id.is_not(None),
             ArchiveJob.state.in_(
                 (
+                    ArchiveJobState.INTENT,
+                    ArchiveJobState.UNCERTAIN,
                     ArchiveJobState.SUBMITTED,
                     ArchiveJobState.PENDING,
                     ArchiveJobState.RATE_LIMITED,

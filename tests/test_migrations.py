@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "c83d91e4a672"
+HEAD_REVISION = "2f4a8c1d9e70"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -138,6 +138,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     ).is_file()
     assert migrations.joinpath(
         "versions", "c83d91e4a672_track_first_archives.py"
+    ).is_file()
+    assert migrations.joinpath(
+        "versions", "2f4a8c1d9e70_secure_query_frontier.py"
     ).is_file()
 
 
@@ -268,6 +271,139 @@ async def test_remote_job_id_migration_preserves_and_allows_reused_ids(tmp_path)
                 await connection.scalar(text("SELECT first_archive_count FROM reports"))
                 == 0
             )
+    finally:
+        await engine.dispose()
+
+
+async def test_query_frontier_migration_cleans_and_quarantines_existing_rows(
+    tmp_path,
+):
+    path = tmp_path / "query-cleanup.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "c83d91e4a672")
+    engine = create_engine(path)
+    timestamp = "2026-08-28T09:00:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(id, host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) VALUES "
+                    "(1, 'example.com', 'https', 0, 1, :now, :now)"
+                ),
+                {"now": timestamp},
+            )
+            page_rows = [
+                (1, "https://example.com/", None, timestamp),
+                (2, "https://example.com/page?a=1", None, timestamp),
+                (3, "https://example.com/page?a=2", None, "2026-08-28T09:01:00+00:00"),
+                (4, "https://example.com/page?a=3", None, "2026-08-28T09:02:00+00:00"),
+                (5, "https://example.com/page?a=4", None, "2026-08-28T09:03:00+00:00"),
+                (6, "https://example.com/login?loginToken=secret", None, timestamp),
+                (7, "https://example.com/child", 5, timestamp),
+            ]
+            for page_id, url, source_id, discovered_at in page_rows:
+                await connection.execute(
+                    text(
+                        "INSERT INTO pages "
+                        "(id, domain_id, url, in_scope, discovered_at, "
+                        "discovered_from_id, next_crawl_at, next_archive_at, "
+                        "sitemap_depth, crawl_attempts) VALUES "
+                        "(:id, 1, :url, 1, :discovered, :source, :now, :now, 0, 0)"
+                    ),
+                    {
+                        "id": page_id,
+                        "url": url,
+                        "source": source_id,
+                        "discovered": discovered_at,
+                        "now": timestamp,
+                    },
+                )
+            for page_id in (2, 3, 4, 5, 6):
+                await connection.execute(
+                    text(
+                        "INSERT INTO archive_jobs "
+                        "(id, page_id, kind, state, cycle_key, intent_at, "
+                        "next_attempt_at, attempts, saved_to_my_archive, "
+                        "outlinks_processed) VALUES "
+                        "(:job, :page, 'DIRECT', 'SUCCEEDED', :cycle, :now, "
+                        ":now, 0, 1, 1)"
+                    ),
+                    {
+                        "job": f"job-{page_id}",
+                        "page": page_id,
+                        "cycle": f"cycle-{page_id}",
+                        "now": timestamp,
+                    },
+                )
+            for page_id in (2, 3, 4, 6):
+                await connection.execute(
+                    text(
+                        "INSERT INTO captures "
+                        "(page_id, archive_job_id, captured_at, wayback_url, "
+                        "completed_at, first_archive) VALUES "
+                        "(:page, :job, :now, :wayback, :now, 1)"
+                    ),
+                    {
+                        "page": page_id,
+                        "job": f"job-{page_id}",
+                        "now": timestamp,
+                        "wayback": f"https://web.archive.invalid/{page_id}",
+                    },
+                )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path, query_variant_cap=2)
+    engine = create_engine(path)
+    try:
+        async with engine.begin() as connection:
+            pages = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT id, query_base_url, query_variant_slot, "
+                            "blocked_reason, in_scope, discovered_from_id "
+                            "FROM pages ORDER BY id"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            assert [page["id"] for page in pages] == [1, 2, 3, 4, 7]
+            assert (pages[1]["query_base_url"], pages[1]["query_variant_slot"]) == (
+                "https://example.com/page",
+                1,
+            )
+            assert (pages[2]["query_base_url"], pages[2]["query_variant_slot"]) == (
+                "https://example.com/page",
+                2,
+            )
+            assert (pages[3]["blocked_reason"], pages[3]["in_scope"]) == (
+                "query_variant_cap",
+                0,
+            )
+            assert pages[4]["discovered_from_id"] is None
+            assert await connection.scalar(text("SELECT count(*) FROM captures")) == 3
+            assert (
+                await connection.scalar(text("SELECT count(*) FROM archive_jobs")) == 3
+            )
+            assert (
+                await connection.execute(text("PRAGMA foreign_key_check"))
+            ).all() == []
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    text(
+                        "INSERT INTO pages "
+                        "(domain_id, url, in_scope, discovered_at, next_crawl_at, "
+                        "next_archive_at, sitemap_depth, crawl_attempts, "
+                        "query_base_url, query_variant_slot) VALUES "
+                        "(1, 'https://example.com/page?a=9', 1, :now, :now, :now, "
+                        "0, 0, 'https://example.com/page', 1)"
+                    ),
+                    {"now": timestamp},
+                )
     finally:
         await engine.dispose()
 

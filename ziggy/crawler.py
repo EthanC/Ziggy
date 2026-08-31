@@ -15,9 +15,8 @@ from urllib.parse import urlsplit
 
 import niquests
 from loguru import logger
-from sqlalchemy.dialects.sqlite import insert
 
-from ziggy.models import Page
+from ziggy.database import insert_page_candidates
 from ziggy.urls import (
     SitemapContents,
     UrlError,
@@ -25,6 +24,7 @@ from ziggy.urls import (
     extract_http_link_urls,
     extract_sitemap,
     normalize_url,
+    sensitive_query_key,
     url_in_scope,
 )
 
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from ziggy.config import CrawlSettings
+    from ziggy.models import Page
 
 _TRANSIENT_STATUSES = {408, 425, 429}
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -190,7 +191,7 @@ class CrawlerClient:
             raise
         return response, limit
 
-    async def fetch(
+    async def fetch(  # noqa: C901
         self,
         url: str,
         configured_host: str,
@@ -232,6 +233,21 @@ class CrawlerClient:
                             target = normalize_url(location, base=current)
                         except UrlError as error:
                             raise FetchError(str(error), transient=False) from error
+                        if sensitive_query_key(target) is not None:
+                            safe_headers = {
+                                key: value
+                                for key, value in headers.items()
+                                if key.lower() != "location"
+                            }
+                            return FetchResult(
+                                status_code,
+                                current,
+                                safe_headers,
+                                b"",
+                                response.encoding,
+                                tuple(redirects),
+                                blocked_redirect="sensitive query",
+                            )
                         redirects.append(target)
                         if not url_in_scope(
                             target,
@@ -483,35 +499,31 @@ async def crawl_page(  # noqa: PLR0913
         )
     )
     discovered = tuple(dict.fromkeys(scoped))
-    for value in discovered:
-        logger.info("Page found: {}", value)
+    inserted = ()
     if discovered:
-        await session.execute(
-            insert(Page)
-            .values(
-                [
-                    {
-                        "domain_id": page.domain_id,
-                        "url": value,
-                        "in_scope": True,
-                        "discovered_at": now,
-                        "discovered_from_id": page.id,
-                        "next_crawl_at": now,
-                        "next_archive_at": now,
-                        "sitemap_depth": page.sitemap_depth + 1
-                        if is_sitemap and value in found
-                        else 0,
-                    }
-                    for value in discovered
-                ]
-            )
-            .on_conflict_do_update(
-                index_elements=[Page.url],
-                set_={"domain_id": page.domain_id, "in_scope": True},
-            )
+        inserted = await insert_page_candidates(
+            session,
+            [
+                {
+                    "domain_id": page.domain_id,
+                    "url": value,
+                    "in_scope": True,
+                    "discovered_at": now,
+                    "discovered_from_id": page.id,
+                    "next_crawl_at": now,
+                    "next_archive_at": now,
+                    "sitemap_depth": page.sitemap_depth + 1
+                    if is_sitemap and value in found
+                    else 0,
+                }
+                for value in discovered
+            ],
+            settings.max_query_variants_per_base,
         )
     _release_crawl(page)
     await session.commit()
+    for value in inserted:
+        logger.info("Page found: {}", value)
 
 
 def _release_crawl(page: Page) -> None:

@@ -58,6 +58,7 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.crawl.max_response_bytes == 10_485_760
     assert config.crawl.max_redirects == 10
     assert config.crawl.max_attempts == 5
+    assert config.crawl.max_query_variants_per_base == 20
     assert config.archive.interval == timedelta(days=30)
     assert config.archive.concurrency == 1
     assert config.archive.max_pending_jobs == 2
@@ -65,7 +66,9 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.archive.server_error_recovery_period == timedelta(minutes=15)
     assert config.archive.dedupe_window == timedelta(hours=24)
     assert config.archive.max_attempts == 5
+    assert config.archive.pending_timeout == timedelta(hours=24)
     assert config.reporting.interval == timedelta(hours=24)
+    assert config.reporting.finalization_grace == timedelta(minutes=5)
     assert config.logging.level == "INFO"
     assert config.logging.discord_min_level == "WARNING"
     assert config.domains == ()
@@ -90,6 +93,7 @@ request_timeout = 4.5
 max_response_bytes = 100
 max_redirects = 2
 max_attempts = 3
+max_query_variants_per_base = 7
 
 [archive]
 interval = "5d"
@@ -98,9 +102,11 @@ max_pending_jobs = 3
 request_delay = 2.5
 dedupe_window = "10m"
 max_attempts = 4
+pending_timeout = "2h"
 
 [reporting]
 interval = "6h"
+finalization_grace = "2m"
 
 [logging]
 level = "debug"
@@ -119,9 +125,12 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
     assert config.ziggy.config_reload_interval == timedelta(minutes=2)
     assert config.crawl.request_delay == 0.0
     assert config.crawl.request_timeout == 4.5
+    assert config.crawl.max_query_variants_per_base == 7
     assert config.archive.max_pending_jobs == 3
     assert config.archive.request_delay == 2.5
+    assert config.archive.pending_timeout == timedelta(hours=2)
     assert config.reporting.interval == timedelta(hours=6)
+    assert config.reporting.finalization_grace == timedelta(minutes=2)
     assert config.logging.level == "DEBUG"
     assert config.logging.discord_min_level == "ERROR"
     assert config.domains[0].host == "example.com"
@@ -131,6 +140,23 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
         "http://example.com/",
         "https://child.example.com/path",
     )
+
+
+@pytest.mark.parametrize("value", ["-1", "true", "1.5", '"2"'])
+def test_query_variant_cap_rejects_invalid_values(tmp_path, value):
+    with pytest.raises(ConfigError, match="must be a nonnegative integer"):
+        minimal_config(
+            tmp_path,
+            f"\n[crawl]\nmax_query_variants_per_base = {value}\n",
+        )
+
+
+def test_domain_seed_rejects_sensitive_query(tmp_path):
+    with pytest.raises(ConfigError, match="sensitive query parameter"):
+        minimal_config(
+            tmp_path,
+            '\n[[domains]]\nhost = "example.com"\nseeds = ["/?token=secret"]\n',
+        )
 
 
 def test_load_config_reads_archive_recovery_period_from_environment(

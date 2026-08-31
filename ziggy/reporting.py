@@ -29,7 +29,10 @@ class ReportWindow:
 
 
 def next_report_window(
-    last_end: datetime | None, now: datetime, interval: timedelta
+    last_end: datetime | None,
+    now: datetime,
+    interval: timedelta,
+    finalization_grace: timedelta = timedelta(minutes=5),
 ) -> ReportWindow | None:
     """Return the next closed interval without skipping persisted checkpoints."""
     seconds = int(interval.total_seconds())
@@ -38,7 +41,7 @@ def next_report_window(
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("current time must be timezone-aware")
     closed_end = datetime.fromtimestamp(
-        int(now.timestamp()) // seconds * seconds, tz=UTC
+        int((now - finalization_grace).timestamp()) // seconds * seconds, tz=UTC
     )
     end = closed_end if last_end is None else last_end + interval
     if end > closed_end:
@@ -56,9 +59,20 @@ async def create_report(
     )
     discovered = await session.scalar(select(func.count(Page.id)).where(*range_filter))
     archived = await session.scalar(
-        select(func.count(distinct(Page.id))).where(
+        select(func.count(distinct(Capture.page_id))).where(
+            Capture.completed_at >= window.start,
+            Capture.completed_at < window.end,
+        )
+    )
+    outstanding = await session.scalar(
+        select(func.count(Page.id)).where(
             *range_filter,
-            exists(select(Capture.id).where(Capture.page_id == Page.id)),
+            ~exists(
+                select(Capture.id).where(
+                    Capture.page_id == Page.id,
+                    Capture.completed_at < window.end,
+                )
+            ),
         )
     )
     first_archives = await session.scalar(
@@ -81,7 +95,7 @@ async def create_report(
             generated_at=generated_at,
             discovered_count=discovered_count,
             archived_count=archived_count,
-            outstanding_count=discovered_count - archived_count,
+            outstanding_count=outstanding or 0,
             first_archive_count=first_archives or 0,
             active_domain_count=active_domains or 0,
             state=ReportState.PENDING,

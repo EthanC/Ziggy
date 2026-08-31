@@ -11,6 +11,8 @@ from ziggy.urls import (
     extract_sitemap,
     normalize_host,
     normalize_url,
+    query_base_url,
+    sensitive_query_key,
     url_in_scope,
 )
 
@@ -50,6 +52,46 @@ def test_normalize_host(value, expected):
 def test_normalize_host_rejects_invalid_hosts(value):
     with pytest.raises(UrlError):
         normalize_host(value)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://example.com/path", None),
+        ("https://example.com/path?a=1", "https://example.com/path"),
+        ("https://example.com:8443/path?a=1", "https://example.com:8443/path"),
+    ],
+)
+def test_query_base_url(url, expected):
+    assert query_base_url(url) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/?loginToken=secret",
+        "https://example.com/?ACCESS_TOKEN=secret",
+        "https://example.com/?access%5Ftoken=secret",
+        "https://example.com/?recaptcha=",
+        "https://example.com/?client_secret=secret",
+        "https://example.com/?x-amz-signature=secret",
+        "https://example.com/?x-goog-credential=secret",
+    ],
+)
+def test_sensitive_query_key_detects_credentials(url):
+    assert sensitive_query_key(url) is not None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/",
+        "https://example.com/?page=1&sort=token",
+        "https://example.com/?state=Ohio&monkey=1",
+    ],
+)
+def test_sensitive_query_key_allows_navigation_parameters(url):
+    assert sensitive_query_key(url) is None
 
 
 @pytest.mark.parametrize(

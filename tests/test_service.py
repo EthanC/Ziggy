@@ -1078,7 +1078,11 @@ async def test_archive_poll_scheduler_covers_idle_and_work(monkeypatch):
 
 async def test_report_scheduler_creates_claims_and_delivers(monkeypatch):
     state = make_state(secrets=make_secrets(reporting_webhook_url="discord"))
-    state.started_at = datetime.now(UTC) - state.config.reporting.interval
+    state.started_at = (
+        datetime.now(UTC)
+        - state.config.reporting.interval
+        - state.config.reporting.finalization_grace
+    )
     stop = asyncio.Event()
     session = MagicMock(scalar=AsyncMock(return_value=None))
     window = SimpleNamespace()

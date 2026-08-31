@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock
 
@@ -480,6 +481,40 @@ async def test_poll_pending_schedules_remote_retry(
         assert job.completed_at is None
 
 
+async def test_poll_pending_timeout_fails_and_reschedules_immediately(
+    database: Database,
+):
+    client = FakeArchiveClient(status_result=PendingStatus("remote-1", None))
+    settings = replace(SETTINGS, pending_timeout=timedelta(hours=1))
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-1",
+        )
+        job.submitted_at = NOW - timedelta(hours=1)
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=client,
+            settings=settings,
+            now=NOW,
+        )
+
+        assert job.state is ArchiveJobState.FAILED
+        assert job.error == "remote job exceeded pending timeout"
+        assert job.service_code == "pending_timeout"
+        assert job.completed_at == NOW
+        assert page.next_archive_at == NOW
+        assert job.lease_owner is None
+
+
 async def test_poll_terminal_failure_records_service_code(database: Database):
     client = FakeArchiveClient(status_result=FailedStatus("remote-1", "robots-denied"))
     async with database.sessions() as session:
@@ -648,6 +683,10 @@ async def test_outlinks_use_exact_subdomain_scope_and_persist_child_captures(
         success("child-parent", "https://example.com/parent-host"),
         success("child-sibling", "https://shop.example.com/sibling"),
         success("child-nested", "https://deep.news.example.com/nested"),
+        success(
+            "child-sensitive",
+            "https://news.example.com/login?loginToken=secret",
+        ),
         success("child-invalid", "mailto:test@example.com"),
     )
     client = FakeArchiveClient(status_result=success(), outlink_results=children)
@@ -818,16 +857,16 @@ async def test_available_submission_slots_count_only_unfinished_direct_jobs(
 
         assert await archive.available_archive_submission_slots(session, 2) == 2
 
-        job = await add_job(
-            session,
-            page,
-            state=ArchiveJobState.PENDING,
-            external_job_id="remote-pending",
-        )
+        job = await add_job(session, page, state=ArchiveJobState.INTENT)
         await session.commit()
 
         assert await archive.available_archive_submission_slots(session, 2) == 1
         assert await archive.available_archive_submission_slots(session, 1) == 0
+
+        job.state = ArchiveJobState.UNCERTAIN
+        await session.commit()
+
+        assert await archive.available_archive_submission_slots(session, 2) == 1
 
         job.state = ArchiveJobState.SUCCEEDED
         await session.commit()
@@ -1814,9 +1853,14 @@ class OutlinkSession:
         self.scalar_results = scalar_results
         self.execute_calls = 0
 
-    async def execute(self, statement: Any) -> None:
+    async def execute(self, statement: Any) -> Any:
         del statement
         self.execute_calls += 1
+        return SimpleNamespace(scalars=lambda: iter(()))
+
+    async def scalars(self, statement: Any) -> Any:
+        del statement
+        return ()
 
     async def scalar(self, statement: Any) -> Any:
         del statement

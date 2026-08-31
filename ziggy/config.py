@@ -13,7 +13,12 @@ from urllib.parse import urlsplit
 from environs import Env
 from loguru import logger
 
-from ziggy.urls import normalize_host, normalize_url
+from ziggy.urls import (
+    DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+    normalize_host,
+    normalize_url,
+    sensitive_query_key,
+)
 
 _DURATION_RE = re.compile(r"^(?P<amount>[1-9][0-9]*)(?P<unit>s|m|h|d)$")
 _INTERNET_ARCHIVE_EMAIL_ENV = "ZIGGY_INTERNET_ARCHIVE_EMAIL"
@@ -40,6 +45,12 @@ def parse_duration(value: object) -> timedelta:
 def _positive_int(value: object, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(f"{name} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"{name} must be a nonnegative integer")
     return value
 
 
@@ -88,6 +99,7 @@ class CrawlSettings:
     max_response_bytes: int = 10_485_760
     max_redirects: int = 10
     max_attempts: int = 5
+    max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +113,7 @@ class ArchiveSettings:
     server_error_recovery_period: timedelta = timedelta(minutes=15)
     dedupe_window: timedelta = timedelta(hours=24)
     max_attempts: int = 5
+    pending_timeout: timedelta = timedelta(hours=24)
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +121,7 @@ class ReportingSettings:
     """Periodic report settings."""
 
     interval: timedelta = timedelta(hours=24)
+    finalization_grace: timedelta = timedelta(minutes=5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +216,13 @@ def _parse_crawl(data: dict[str, Any]) -> CrawlSettings:
             data.get("max_redirects", 10), "crawl.max_redirects"
         ),
         max_attempts=_positive_int(data.get("max_attempts", 5), "crawl.max_attempts"),
+        max_query_variants_per_base=_nonnegative_int(
+            data.get(
+                "max_query_variants_per_base",
+                DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+            ),
+            "crawl.max_query_variants_per_base",
+        ),
     )
 
 
@@ -224,13 +245,17 @@ def _parse_archive(
         server_error_recovery_period=server_error_recovery_period,
         dedupe_window=parse_duration(data.get("dedupe_window", "24h")),
         max_attempts=_positive_int(data.get("max_attempts", 5), "archive.max_attempts"),
+        pending_timeout=parse_duration(data.get("pending_timeout", "24h")),
     )
 
 
 def _parse_reporting(data: dict[str, Any]) -> ReportingSettings:
     names = {field.name for field in fields(ReportingSettings)}
     _only(data, names, "reporting")
-    return ReportingSettings(interval=parse_duration(data.get("interval", "24h")))
+    return ReportingSettings(
+        interval=parse_duration(data.get("interval", "24h")),
+        finalization_grace=parse_duration(data.get("finalization_grace", "5m")),
+    )
 
 
 def _parse_logging(data: dict[str, Any]) -> LoggingSettings:
@@ -258,7 +283,7 @@ def _log_level(value: str, name: str) -> str:
         raise ConfigError(f"{name} is not a registered Loguru level") from error
 
 
-def _parse_domain(value: object, index: int) -> DomainSettings:
+def _parse_domain(value: object, index: int) -> DomainSettings:  # noqa: C901
     data = _table(value, f"domains[{index}]")
     _only(data, {"host", "scheme", "include_subdomains", "seeds"}, f"domains[{index}]")
     host_value = data.get("host")
@@ -284,6 +309,10 @@ def _parse_domain(value: object, index: int) -> DomainSettings:
     )
     try:
         for seed in domain.seed_urls:
+            if sensitive_query_key(seed) is not None:
+                raise ConfigError(
+                    f"domains[{index}] seed contains a sensitive query parameter"
+                )
             seed_host = normalize_host(cast("str", urlsplit(seed).hostname))
             if not _host_in_scope(seed_host, domain):
                 raise ConfigError(f"domains[{index}] seed is outside its host scope")

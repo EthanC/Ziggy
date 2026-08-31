@@ -88,6 +88,25 @@ def test_next_report_window_preserves_checkpoint_and_waits_for_open_window():
     assert reporting.next_report_window(checkpoint, NOW, interval) == ReportWindow(
         checkpoint, datetime(2026, 8, 28, 10, tzinfo=UTC)
     )
+
+
+def test_next_report_window_waits_for_finalization_grace():
+    interval = timedelta(hours=1)
+    grace = timedelta(minutes=5)
+    boundary = datetime(2026, 8, 28, 12, tzinfo=UTC)
+
+    assert reporting.next_report_window(
+        None, boundary + grace - timedelta(microseconds=1), interval, grace
+    ) == ReportWindow(
+        datetime(2026, 8, 28, 10, tzinfo=UTC),
+        datetime(2026, 8, 28, 11, tzinfo=UTC),
+    )
+    assert reporting.next_report_window(
+        None, boundary + grace, interval, grace
+    ) == ReportWindow(
+        datetime(2026, 8, 28, 11, tzinfo=UTC),
+        boundary,
+    )
     assert (
         reporting.next_report_window(
             datetime(2026, 8, 28, 12, tzinfo=UTC), NOW, interval
@@ -218,7 +237,7 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
             report.outstanding_count,
             report.first_archive_count,
             report.active_domain_count,
-        ) == (2, 1, 1, 1, 1)
+        ) == (2, 2, 2, 1, 1)
         assert report.state is ReportState.PENDING
         assert report.next_attempt_at == generated
 
@@ -232,9 +251,78 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
         assert len((await session.scalars(select(Report))).all()) == 1
 
 
+async def test_create_report_counts_late_capture_in_completion_window(sessions):
+    start = datetime(2026, 8, 27, tzinfo=UTC)
+    boundary = start + timedelta(days=1)
+    end = boundary + timedelta(days=1)
+    async with sessions() as session:
+        domain = Domain(
+            host="late.example",
+            scheme="https",
+            include_subdomains=False,
+            active=True,
+            created_at=start,
+            configured_at=start,
+        )
+        session.add(domain)
+        await session.flush()
+        page = Page(
+            domain_id=domain.id,
+            url="https://late.example/page",
+            discovered_at=start,
+            next_crawl_at=start,
+            next_archive_at=start,
+        )
+        session.add(page)
+        await session.flush()
+        job = ArchiveJob(
+            page_id=page.id,
+            kind=ArchiveJobKind.DIRECT,
+            state=ArchiveJobState.SUCCEEDED,
+            cycle_key="late-capture-cycle",
+            intent_at=start,
+            next_attempt_at=start,
+        )
+        session.add(job)
+        await session.flush()
+        session.add(
+            Capture(
+                page_id=page.id,
+                archive_job_id=job.id,
+                captured_at=boundary + timedelta(hours=1),
+                wayback_url="https://web.archive.invalid/late",
+                first_archive=True,
+                completed_at=boundary + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+        first = await reporting.create_report(
+            session, ReportWindow(start, boundary), end
+        )
+        second = await reporting.create_report(
+            session, ReportWindow(boundary, end), end
+        )
+
+        assert (
+            first.discovered_count,
+            first.archived_count,
+            first.outstanding_count,
+        ) == (
+            1,
+            0,
+            1,
+        )
+        assert (
+            second.discovered_count,
+            second.archived_count,
+            second.outstanding_count,
+        ) == (0, 1, 0)
+
+
 async def test_create_report_raises_if_insert_cannot_be_read():
     session = MagicMock()
-    session.scalar = AsyncMock(side_effect=[None, None, None, None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, None, None, None, None])
     session.execute = AsyncMock()
     session.commit = AsyncMock()
 

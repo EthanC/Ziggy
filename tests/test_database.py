@@ -9,12 +9,14 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.exc import StatementError
 
+from ziggy import database as database_module
 from ziggy.config import DomainSettings
 from ziggy.database import (
     claim_due_page,
     create_engine,
     database_url,
     insert_discovered_pages,
+    insert_page_candidates,
     reconcile_domains,
     release_leases,
     run_migrations,
@@ -65,6 +67,117 @@ async def _add_page(sessions, now, *, active=True, suffix=""):
         session.add(page)
         await session.commit()
         return page
+
+
+def test_database_revision_handles_database_without_migration_table(tmp_path):
+    path = tmp_path / "unmigrated.sqlite3"
+    path.touch()
+
+    assert database_module._database_revision(path) is None  # noqa: SLF001
+
+
+async def test_insert_page_candidates_rejects_sensitive_and_caps_query_variants(
+    database,
+):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    async with sessions() as session:
+        domain = Domain(
+            host="example.com",
+            scheme="https",
+            include_subdomains=False,
+            created_at=now,
+            configured_at=now,
+        )
+        session.add(domain)
+        await session.flush()
+        values = [
+            {
+                "domain_id": domain.id,
+                "url": url,
+                "discovered_at": now,
+                "next_crawl_at": now,
+                "next_archive_at": now,
+            }
+            for url in (
+                "https://example.com/page?a=1",
+                "https://example.com/page?a=2",
+                "https://example.com/page?a=3",
+                "https://example.com/page?loginToken=secret",
+                "https://example.com/other?a=1",
+            )
+        ]
+
+        inserted = await insert_page_candidates(session, values, 2)
+        await session.commit()
+
+        assert inserted == (
+            "https://example.com/page?a=1",
+            "https://example.com/page?a=2",
+            "https://example.com/other?a=1",
+        )
+        pages = (await session.scalars(select(Page).order_by(Page.url))).all()
+        assert [page.url for page in pages] == sorted(inserted)
+        assert {(page.query_base_url, page.query_variant_slot) for page in pages} == {
+            ("https://example.com/page", 1),
+            ("https://example.com/page", 2),
+            ("https://example.com/other", 1),
+        }
+
+        overflow = dict(values[2])
+        overflow["url"] = "https://example.com/page?a=4"
+        assert await insert_page_candidates(session, [overflow], 2) == ()
+        sensitive = dict(values[0])
+        sensitive["url"] = "https://example.com/?token=secret"
+        assert await insert_page_candidates(session, [sensitive], 2) == ()
+        assert await insert_page_candidates(session, [values[0]], 2) == ()
+
+        pages[0].blocked_reason = "query_variant_cap"
+        pages[0].in_scope = False
+        await session.commit()
+        assert await insert_page_candidates(session, [values[4]], 2) == ()
+        assert pages[0].in_scope is False
+
+    config = SimpleNamespace(
+        domains=(DomainSettings("example.com"),),
+        crawl=SimpleNamespace(max_query_variants_per_base=2),
+    )
+    async with sessions() as session:
+        await reconcile_domains(session, config, now)
+        blocked = await session.scalar(
+            select(Page).where(Page.blocked_reason.is_not(None))
+        )
+        assert blocked is not None
+        assert blocked.in_scope is False
+
+
+async def test_insert_page_candidates_zero_cap_still_allows_queryless_pages(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    async with sessions() as session:
+        domain = Domain(
+            host="example.com",
+            scheme="https",
+            include_subdomains=False,
+            created_at=now,
+            configured_at=now,
+        )
+        session.add(domain)
+        await session.flush()
+        candidates = [
+            {
+                "domain_id": domain.id,
+                "url": url,
+                "discovered_at": now,
+                "next_crawl_at": now,
+                "next_archive_at": now,
+            }
+            for url in ("https://example.com/page", "https://example.com/page?a=1")
+        ]
+
+        assert await insert_page_candidates(session, candidates, 0) == (
+            "https://example.com/page",
+        )
 
 
 def test_utc_datetime_converts_bind_and_result_values_to_utc():

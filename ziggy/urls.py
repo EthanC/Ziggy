@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from contextlib import suppress
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, parse_qsl, urljoin, urlsplit, urlunsplit
 
 _HTTP_SCHEMES = {"http", "https"}
 _LINK_SPLIT_RE = re.compile(r",(?=\s*<)")
@@ -16,6 +16,32 @@ _MAX_DNS_NAME = 253
 _MAX_DNS_LABEL = 63
 _MAX_PORT = 65_535
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+DEFAULT_MAX_QUERY_VARIANTS_PER_BASE = 20
+_SENSITIVE_QUERY_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "code",
+    "credential",
+    "csrf",
+    "error_key",
+    "errorkey",
+    "id_token",
+    "jwt",
+    "password",
+    "recaptcha",
+    "refresh_token",
+    "session",
+    "session_id",
+    "sessionid",
+    "sig",
+    "signature",
+    "token",
+}
+_SENSITIVE_QUERY_PREFIXES = ("x-amz-", "x-goog-")
+_SENSITIVE_QUERY_SUFFIXES = ("secret", "signature", "token")
 
 
 class UrlError(ValueError):
@@ -93,6 +119,27 @@ def normalize_url(value: str, *, base: str | None = None) -> str:
         fragment="",
     )
     return urlunsplit(normalized)
+
+
+def query_base_url(url: str) -> str | None:
+    """Return a normalized URL without its query, or None when queryless."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def sensitive_query_key(url: str) -> str | None:
+    """Return the first credential-like or ephemeral query key in a URL."""
+    for key, _value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+        normalized = key.casefold()
+        if (
+            normalized in _SENSITIVE_QUERY_KEYS
+            or normalized.startswith(_SENSITIVE_QUERY_PREFIXES)
+            or normalized.endswith(_SENSITIVE_QUERY_SUFFIXES)
+        ):
+            return key
+    return None
 
 
 def _normalize_url_host(value: str) -> str:
