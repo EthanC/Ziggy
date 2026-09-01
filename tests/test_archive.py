@@ -1123,9 +1123,11 @@ async def test_adapter_submit_builds_required_options_without_network():
     adapter._client = native  # noqa: SLF001
     adapter._request_lock = asyncio.Lock()  # noqa: SLF001
     adapter._request_delay = 0  # noqa: SLF001
+    adapter._adaptive_request_delay = 0  # noqa: SLF001
     adapter._server_error_recovery_period = timedelta(minutes=15)  # noqa: SLF001
     adapter._last_request_at = None  # noqa: SLF001
     adapter._rate_limit_until = None  # noqa: SLF001
+    adapter._rate_limit_recovery_started_at = None  # noqa: SLF001
     adapter._server_error_failures = 0  # noqa: SLF001
     adapter._last_server_error_at = None  # noqa: SLF001
     adapter._server_error_until = None  # noqa: SLF001
@@ -1210,9 +1212,11 @@ def adapter_with(native: NativeClient) -> archive.ArchivistClient:
     adapter._client = native  # noqa: SLF001
     adapter._request_lock = asyncio.Lock()  # noqa: SLF001
     adapter._request_delay = 0  # noqa: SLF001
+    adapter._adaptive_request_delay = 0  # noqa: SLF001
     adapter._server_error_recovery_period = timedelta(minutes=15)  # noqa: SLF001
     adapter._last_request_at = None  # noqa: SLF001
     adapter._rate_limit_until = None  # noqa: SLF001
+    adapter._rate_limit_recovery_started_at = None  # noqa: SLF001
     adapter._server_error_failures = 0  # noqa: SLF001
     adapter._last_server_error_at = None  # noqa: SLF001
     adapter._server_error_until = None  # noqa: SLF001
@@ -1432,6 +1436,53 @@ async def test_adapter_rate_limit_without_retry_metadata_uses_one_minute_fallbac
     assert caught.value.retry_at <= datetime.now(UTC) + timedelta(minutes=1)
 
 
+async def test_adapter_repeated_rate_limits_increase_request_spacing(monkeypatch):
+    native = NativeClient()
+    adapter = adapter_with(native)
+    adapter._request_delay = 1.0  # noqa: SLF001
+    adapter._adaptive_request_delay = 1.0  # noqa: SLF001
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+
+    native.submit_result = RateLimitError("slow down", retry_after=NOW)
+    with pytest.raises(ArchiveRateLimitError):
+        await adapter.submit("https://example.com/first", timedelta(hours=1))
+
+    assert adapter._adaptive_request_delay == 2.0  # noqa: SLF001
+
+    native.submit_result = NativeJob("accepted")
+    await adapter.submit("https://example.com/second", timedelta(hours=1))
+
+    assert adapter._adaptive_request_delay == 2.0  # noqa: SLF001
+    assert adapter._rate_limit_recovery_started_at is not None  # noqa: SLF001
+
+    await adapter.status("accepted")
+
+    assert adapter._adaptive_request_delay == 2.0  # noqa: SLF001
+
+    native.submit_result = RateLimitError("still too fast", retry_after=NOW)
+    with pytest.raises(ArchiveRateLimitError):
+        await adapter.submit("https://example.com/third", timedelta(hours=1))
+
+    assert adapter._adaptive_request_delay == 4.0  # noqa: SLF001
+    assert adapter._rate_limit_recovery_started_at is None  # noqa: SLF001
+
+
+async def test_adapter_cautiously_reduces_spacing_after_sustained_success():
+    native = NativeClient()
+    adapter = adapter_with(native)
+    adapter._request_delay = 1.0  # noqa: SLF001
+    adapter._adaptive_request_delay = 4.0  # noqa: SLF001
+    adapter._rate_limit_recovery_started_at = datetime.now(UTC) - timedelta(  # noqa: SLF001
+        minutes=16
+    )
+
+    await adapter.status("native-job")
+
+    assert adapter._adaptive_request_delay == 3.0  # noqa: SLF001
+    assert adapter._rate_limit_recovery_started_at is not None  # noqa: SLF001
+
+
 async def test_adapter_does_not_sleep_for_expired_rate_limit(monkeypatch):
     native = NativeClient()
     adapter = adapter_with(native)
@@ -1533,6 +1584,7 @@ async def test_adapter_spaces_consecutive_requests(monkeypatch):
     native = NativeClient()
     adapter = adapter_with(native)
     adapter._request_delay = 2.0  # noqa: SLF001
+    adapter._adaptive_request_delay = 2.0  # noqa: SLF001
     sleep = AsyncMock()
     monkeypatch.setattr(archive.asyncio, "sleep", sleep)
 

@@ -45,6 +45,8 @@ from ziggy.urls import (
 _SERVER_ERROR_MIN = 500
 _SERVER_ERROR_MAX = 599
 _DEFAULT_SERVER_ERROR_RECOVERY_PERIOD = timedelta(minutes=15)
+_MIN_ADAPTIVE_REQUEST_DELAY = 1.0
+_MAX_ADAPTIVE_REQUEST_DELAY = 60.0
 _RETRYABLE_SERVICE_CODES = frozenset({"error:no-captures", "error:not-found"})
 
 if TYPE_CHECKING:
@@ -152,9 +154,11 @@ class ArchivistClient:
         self._client = AsyncInternetArchiveClient(account=account, timeout=timeout)
         self._request_lock = asyncio.Lock()
         self._request_delay = request_delay
+        self._adaptive_request_delay = request_delay
         self._server_error_recovery_period = server_error_recovery_period
         self._last_request_at: float | None = None
         self._rate_limit_until: datetime | None = None
+        self._rate_limit_recovery_started_at: datetime | None = None
         self._server_error_failures = 0
         self._last_server_error_at: datetime | None = None
         self._server_error_until: datetime | None = None
@@ -310,7 +314,7 @@ class ArchivistClient:
             if self._last_request_at is not None:
                 delay = max(
                     delay,
-                    self._request_delay
+                    self._adaptive_request_delay
                     - (asyncio.get_running_loop().time() - self._last_request_at),
                 )
             if delay > 0:
@@ -321,10 +325,19 @@ class ArchivistClient:
             try:
                 result = await request()
             except RateLimitError as error:
-                retry_at = _retry_at(error.retry_after) or datetime.now(
-                    UTC
-                ) + timedelta(minutes=1)
+                occurred_at = datetime.now(UTC)
+                retry_at = _retry_at(error.retry_after) or occurred_at + timedelta(
+                    minutes=1
+                )
                 self._rate_limit_until = retry_at
+                self._adaptive_request_delay = min(
+                    _MAX_ADAPTIVE_REQUEST_DELAY,
+                    max(
+                        _MIN_ADAPTIVE_REQUEST_DELAY,
+                        self._adaptive_request_delay * 2,
+                    ),
+                )
+                self._rate_limit_recovery_started_at = None
                 raise ArchiveRateLimitError(retry_at) from error
             except ServiceError as error:
                 if error.status_code is not None and (
@@ -338,14 +351,35 @@ class ArchivistClient:
                     self._server_error_until = occurred_at + timedelta(minutes=minutes)
                 raise
             else:
-                if self._last_server_error_at is None or (
-                    datetime.now(UTC) - self._last_server_error_at
-                    >= self._server_error_recovery_period
-                ):
-                    self._server_error_failures = 0
-                    self._last_server_error_at = None
-                self._server_error_until = None
+                self._recover_request_pacing(datetime.now(UTC))
                 return result
+
+    def _recover_request_pacing(self, succeeded_at: datetime) -> None:
+        """Cautiously restore configured pacing after sustained success."""
+        if self._last_server_error_at is None or (
+            succeeded_at - self._last_server_error_at
+            >= self._server_error_recovery_period
+        ):
+            self._server_error_failures = 0
+            self._last_server_error_at = None
+        self._server_error_until = None
+        if self._adaptive_request_delay <= self._request_delay:
+            self._rate_limit_recovery_started_at = None
+            return
+        if self._rate_limit_recovery_started_at is None:
+            self._rate_limit_recovery_started_at = succeeded_at
+            return
+        if (
+            succeeded_at - self._rate_limit_recovery_started_at
+            < self._server_error_recovery_period
+        ):
+            return
+        self._adaptive_request_delay = max(
+            self._request_delay,
+            self._adaptive_request_delay
+            - max(_MIN_ADAPTIVE_REQUEST_DELAY, self._request_delay),
+        )
+        self._rate_limit_recovery_started_at = succeeded_at
 
     async def close(self) -> None:
         """Close Archivist's owned Niquests session."""
