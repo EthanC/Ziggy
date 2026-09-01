@@ -255,6 +255,7 @@ async def test_submit_success_persists_remote_acceptance(database: Database):
         _, page = await add_page(session)
         job = await add_job(session, page, attempts=2)
         job.error = "old error"
+        job.service_code = "error:no-captures"
         await session.commit()
 
         await submit_archive_job(
@@ -266,8 +267,9 @@ async def test_submit_success_persists_remote_acceptance(database: Database):
         assert job.state is ArchiveJobState.SUBMITTED
         assert job.submitted_at == NOW
         assert job.next_attempt_at == NOW
-        assert job.attempts == 0
+        assert job.attempts == 2
         assert job.error is None
+        assert job.service_code is None
         assert job.lease_owner is None
         assert job.lease_expires_at is None
 
@@ -543,6 +545,76 @@ async def test_poll_terminal_failure_records_service_code(database: Database):
         assert page.next_archive_at == NOW + SETTINGS.interval
         assert job.lease_owner is None
         assert await session.scalar(select(Capture)) is None
+
+
+@pytest.mark.parametrize("service_code", ["error:no-captures", "error:not-found"])
+async def test_poll_retryable_service_failure_enters_recovery(
+    database: Database, service_code: str
+):
+    client = FakeArchiveClient(status_result=FailedStatus("remote-1", service_code))
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-1",
+        )
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=client,
+            settings=SETTINGS,
+            now=NOW,
+        )
+
+        assert job.state is ArchiveJobState.UNCERTAIN
+        assert job.external_job_id is None
+        assert job.service_code == service_code
+        assert job.error == service_code
+        assert job.attempts == 1
+        assert job.next_attempt_at == NOW + timedelta(seconds=2)
+        assert job.completed_at is None
+        assert page.next_archive_at == NOW
+        assert job.lease_owner is None
+
+
+async def test_poll_retryable_service_failure_stops_at_attempt_limit(
+    database: Database,
+):
+    service_code = "error:no-captures"
+    client = FakeArchiveClient(status_result=FailedStatus("remote-1", service_code))
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-1",
+            attempts=SETTINGS.max_attempts - 1,
+        )
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=client,
+            settings=SETTINGS,
+            now=NOW,
+        )
+
+        assert job.state is ArchiveJobState.FAILED
+        assert job.external_job_id == "remote-1"
+        assert job.service_code == service_code
+        assert job.attempts == SETTINGS.max_attempts
+        assert job.completed_at == NOW
+        assert page.next_archive_at == NOW + SETTINGS.interval
 
 
 async def test_poll_success_persists_capture_and_finishes_post_processing(

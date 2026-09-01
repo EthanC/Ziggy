@@ -45,6 +45,7 @@ from ziggy.urls import (
 _SERVER_ERROR_MIN = 500
 _SERVER_ERROR_MAX = 599
 _DEFAULT_SERVER_ERROR_RECOVERY_PERIOD = timedelta(minutes=15)
+_RETRYABLE_SERVICE_CODES = frozenset({"error:no-captures", "error:not-found"})
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -458,8 +459,8 @@ async def submit_archive_job(  # noqa: PLR0913
     job.state = ArchiveJobState.SUBMITTED
     job.submitted_at = now
     job.next_attempt_at = now
-    job.attempts = 0
     job.error = None
+    job.service_code = None
     job.lease_owner = None
     job.lease_expires_at = None
     await session.commit()
@@ -575,17 +576,7 @@ async def poll_archive_job(  # noqa: PLR0913
         await session.commit()
         return
     if isinstance(status, FailedStatus):
-        job.state = ArchiveJobState.FAILED
-        job.service_code = status.service_code
-        job.completed_at = now
-        page.next_archive_at = now + settings.interval
-        _release_job(job)
-        await session.commit()
-        logger.warning(
-            "Archive job {} failed with service code {}",
-            job.id,
-            status.service_code or "unknown",
-        )
+        await _record_failure(session, job, page, status, settings, now)
         return
     await _record_success(session, job, page, status, settings, now)
     await _post_process(
@@ -598,6 +589,36 @@ async def poll_archive_job(  # noqa: PLR0913
         now,
         max_query_variants_per_base,
     )
+
+
+async def _record_failure(  # noqa: PLR0913, PLR0917
+    session: AsyncSession,
+    job: ArchiveJob,
+    page: Page,
+    status: FailedStatus,
+    settings: ArchiveSettings,
+    now: datetime,
+) -> None:
+    retryable = status.service_code in _RETRYABLE_SERVICE_CODES
+    if retryable:
+        job.attempts += 1
+    job.service_code = status.service_code
+    if retryable and job.attempts < settings.max_attempts:
+        job.state = ArchiveJobState.UNCERTAIN
+        job.external_job_id = None
+        job.error = status.service_code
+        job.next_attempt_at = now + timedelta(seconds=min(3600, 2**job.attempts))
+        log = logger.info
+        message = "Archive job {} will retry after service code {}"
+    else:
+        job.state = ArchiveJobState.FAILED
+        job.completed_at = now
+        page.next_archive_at = now + settings.interval
+        log = logger.warning
+        message = "Archive job {} failed with service code {}"
+    _release_job(job)
+    await session.commit()
+    log(message, job.id, status.service_code or "unknown")
 
 
 async def _record_success(  # noqa: PLR0913, PLR0917
