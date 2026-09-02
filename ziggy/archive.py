@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol, Self
 from uuid import uuid4
 
@@ -47,6 +48,8 @@ _SERVER_ERROR_MAX = 599
 _DEFAULT_SERVER_ERROR_RECOVERY_PERIOD = timedelta(minutes=15)
 _MIN_ADAPTIVE_REQUEST_DELAY = 1.0
 _MAX_ADAPTIVE_REQUEST_DELAY = 60.0
+_INITIAL_STATUS_DELAY = timedelta(seconds=2)
+_SERVICE_FAILURE_RECOVERY_DELAY = timedelta(minutes=15)
 _RETRYABLE_SERVICE_CODES = frozenset({"error:no-captures", "error:not-found"})
 
 if TYPE_CHECKING:
@@ -72,6 +75,10 @@ class ArchiveRateLimitError(ArchiveError):
         """Store the Internet Archive's parsed retry time when available."""
         super().__init__("Internet Archive rate limit")
         self.retry_at = retry_at
+
+
+class ArchiveJobNotFoundError(ArchiveError):
+    """A submitted job is not yet available from the status endpoint."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +232,12 @@ class ArchivistClient:
             status = await self._request(lambda: self._client.status(job_id))
         except AuthenticationError as error:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
+        except ServiceError as error:
+            if error.status_code == HTTPStatus.NOT_FOUND:
+                raise ArchiveJobNotFoundError(
+                    "Internet Archive job not found"
+                ) from error
+            raise ArchiveError(type(error).__name__) from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
         return _status(status)
@@ -492,7 +505,7 @@ async def submit_archive_job(  # noqa: PLR0913
     job.external_job_id = external_job_id
     job.state = ArchiveJobState.SUBMITTED
     job.submitted_at = now
-    job.next_attempt_at = now
+    job.next_attempt_at = now + _INITIAL_STATUS_DELAY
     job.error = None
     job.service_code = None
     job.lease_owner = None
@@ -544,7 +557,7 @@ async def _recover_uncertain(  # noqa: PLR0913
     return True
 
 
-async def poll_archive_job(  # noqa: PLR0913
+async def poll_archive_job(  # noqa: PLR0911, PLR0913
     session: AsyncSession,
     job: ArchiveJob,
     *,
@@ -582,6 +595,11 @@ async def poll_archive_job(  # noqa: PLR0913
         _rate_limit(job, now, error.retry_at)
         await session.commit()
         logger.warning("Archive polling rate limited for job {}", job.id)
+        return
+    except ArchiveJobNotFoundError as error:
+        _retry_missing_job(job, now, error)
+        await session.commit()
+        logger.info("Archive job {} is not yet available for polling", job.id)
         return
     except ArchiveError as error:
         _retry_job(job, page, settings, now, error)
@@ -641,7 +659,7 @@ async def _record_failure(  # noqa: PLR0913, PLR0917
         job.state = ArchiveJobState.UNCERTAIN
         job.external_job_id = None
         job.error = status.service_code
-        job.next_attempt_at = now + timedelta(seconds=min(3600, 2**job.attempts))
+        job.next_attempt_at = now + _service_failure_recovery_delay(job.attempts)
         log = logger.info
         message = "Archive job {} will retry after service code {}"
     else:
@@ -904,6 +922,24 @@ def _rate_limit(job: ArchiveJob, now: datetime, retry_at: datetime | None) -> No
     job.error = "Internet Archive rate limit"
     job.attempts += 1
     _release_job(job)
+
+
+def _retry_missing_job(
+    job: ArchiveJob, now: datetime, error: ArchiveJobNotFoundError
+) -> None:
+    """Delay CDX recovery so a newly accepted capture has time to become visible."""
+    job.state = ArchiveJobState.UNCERTAIN
+    job.external_job_id = None
+    job.attempts += 1
+    job.error = type(error).__name__
+    job.service_code = "error:not-found"
+    job.next_attempt_at = now + _service_failure_recovery_delay(job.attempts)
+    _release_job(job)
+
+
+def _service_failure_recovery_delay(attempts: int) -> timedelta:
+    exponent = min(max(0, attempts - 1), 2)
+    return _SERVICE_FAILURE_RECOVERY_DELAY * (2**exponent)
 
 
 def _retry_job(

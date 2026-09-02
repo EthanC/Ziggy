@@ -24,6 +24,7 @@ from ziggy import archive
 from ziggy.archive import (
     ArchiveAuthenticationError,
     ArchiveError,
+    ArchiveJobNotFoundError,
     ArchiveRateLimitError,
     ArchiveStatus,
     FailedStatus,
@@ -266,7 +267,7 @@ async def test_submit_success_persists_remote_acceptance(database: Database):
         assert job.external_job_id == "accepted-42"
         assert job.state is ArchiveJobState.SUBMITTED
         assert job.submitted_at == NOW
-        assert job.next_attempt_at == NOW
+        assert job.next_attempt_at == NOW + timedelta(seconds=2)
         assert job.attempts == 2
         assert job.error is None
         assert job.service_code is None
@@ -577,7 +578,7 @@ async def test_poll_retryable_service_failure_enters_recovery(
         assert job.service_code == service_code
         assert job.error == service_code
         assert job.attempts == 1
-        assert job.next_attempt_at == NOW + timedelta(seconds=2)
+        assert job.next_attempt_at == NOW + timedelta(minutes=15)
         assert job.completed_at is None
         assert page.next_archive_at == NOW
         assert job.lease_owner is None
@@ -615,6 +616,38 @@ async def test_poll_retryable_service_failure_stops_at_attempt_limit(
         assert job.attempts == SETTINGS.max_attempts
         assert job.completed_at == NOW
         assert page.next_archive_at == NOW + SETTINGS.interval
+
+
+async def test_poll_http_not_found_delays_history_recovery(database: Database):
+    client = FakeArchiveClient(status_error=ArchiveJobNotFoundError("job not visible"))
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.SUBMITTED,
+            external_job_id="remote-1",
+        )
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=client,
+            settings=SETTINGS,
+            now=NOW,
+        )
+
+        assert job.state is ArchiveJobState.UNCERTAIN
+        assert job.external_job_id is None
+        assert job.service_code == "error:not-found"
+        assert job.error == "ArchiveJobNotFoundError"
+        assert job.attempts == 1
+        assert job.next_attempt_at == NOW + timedelta(minutes=15)
+        assert job.completed_at is None
+        assert job.lease_owner is None
 
 
 async def test_poll_success_persists_capture_and_finishes_post_processing(
@@ -1564,7 +1597,7 @@ async def test_adapter_server_error_backoff_caps_at_one_hour(monkeypatch):
     assert timedelta(minutes=59, seconds=59) < remaining <= timedelta(hours=1)
 
 
-async def test_adapter_does_not_back_off_non_server_errors():
+async def test_adapter_translates_status_http_not_found_without_server_backoff():
     native = NativeClient()
     native.status_result = InvalidServiceResponseError(
         "Internet Archive returned HTTP 404",
@@ -1573,7 +1606,7 @@ async def test_adapter_does_not_back_off_non_server_errors():
     )
     adapter = adapter_with(native)
 
-    with pytest.raises(ArchiveError):
+    with pytest.raises(ArchiveJobNotFoundError):
         await adapter.status("native-job")
 
     assert adapter._server_error_failures == 0  # noqa: SLF001
