@@ -11,8 +11,8 @@ dependencies = [
     "aiosqlite",
     "alembic",
     "archivist-py",
-    "discord-clyde>=1.0.1",
-    "environs>=15.1.0",
+    "discord-clyde>=1.1.0",
+    "environs>=15.2.0",
     "loguru",
     "loguru-discord",
     "niquests",
@@ -30,7 +30,7 @@ dev = [
 ]
 
 [tool.uv]
-required-version = ">=0.12.5"
+required-version = ">=0.12.10"
 package = false
 
 [tool.ruff]
