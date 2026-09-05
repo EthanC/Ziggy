@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from ziggy.models import ArchiveJob, ArchiveJobState, Domain, Page
+from ziggy.models import ArchiveJob, ArchiveJobState, Capture, Domain, Page
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
     query_base_url,
@@ -330,7 +330,9 @@ async def claim_due_page(
         due_column <= now,
         or_(expires_column.is_(None), expires_column <= now),
     ]
+    order_by = [due_column, Page.id]
     if kind == "archive":
+        has_capture = exists(select(Capture.id).where(Capture.page_id == Page.id))
         conditions.append(
             ~exists(
                 select(ArchiveJob.id).where(
@@ -347,11 +349,12 @@ async def claim_due_page(
                 )
             )
         )
+        order_by.insert(0, has_capture)
     candidate = (
         select(Page.id)
         .join(Domain, Page.domain_id == Domain.id)
         .where(*conditions)
-        .order_by(due_column, Page.id)
+        .order_by(*order_by)
         .limit(1)
         .scalar_subquery()
     )

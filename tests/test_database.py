@@ -27,6 +27,7 @@ from ziggy.models import (
     ArchiveJob,
     ArchiveJobKind,
     ArchiveJobState,
+    Capture,
     Domain,
     Page,
     UtcDateTime,
@@ -572,6 +573,56 @@ async def test_archive_claim_is_blocked_by_every_active_direct_job_state(databas
         )
         assert claimed is not None
         assert claimed.id == page.id
+
+
+async def test_archive_claim_prioritizes_pages_without_captures(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    recurring = await _add_page(sessions, now - timedelta(days=30))
+
+    async with sessions() as session:
+        recurring = await session.get(Page, recurring.id)
+        unarchived = Page(
+            domain_id=recurring.domain_id,
+            url="https://example.com/new",
+            discovered_at=now,
+            next_crawl_at=now,
+            next_archive_at=now,
+        )
+        session.add(unarchived)
+        job = ArchiveJob(
+            id="completed-job",
+            page_id=recurring.id,
+            kind=ArchiveJobKind.DIRECT,
+            state=ArchiveJobState.SUCCEEDED,
+            cycle_key="completed-cycle",
+            intent_at=now - timedelta(days=30),
+            next_attempt_at=now - timedelta(days=30),
+        )
+        session.add(job)
+        await session.flush()
+        session.add(
+            Capture(
+                page_id=recurring.id,
+                archive_job_id=job.id,
+                captured_at=now - timedelta(days=30),
+                wayback_url="https://web.archive.org/capture",
+                completed_at=now - timedelta(days=30),
+            )
+        )
+        await session.commit()
+
+        first = await claim_due_page(
+            session, "archive", "worker", now, timedelta(minutes=10)
+        )
+        second = await claim_due_page(
+            session, "archive", "worker", now, timedelta(minutes=10)
+        )
+
+        assert first is not None
+        assert first.id == unarchived.id
+        assert second is not None
+        assert second.id == recurring.id
 
 
 async def test_release_leases_only_releases_leases_owned_by_the_instance(database):
