@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "a7426f0d1c3b"
+HEAD_REVISION = "b81f4d2a6e90"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -145,6 +145,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     assert migrations.joinpath(
         "versions", "a7426f0d1c3b_add_page_active_state.py"
     ).is_file()
+    assert migrations.joinpath(
+        "versions", "b81f4d2a6e90_add_report_deactivated_count.py"
+    ).is_file()
 
 
 async def test_scope_migration_preserves_existing_pages_and_defaults_them_in_scope(
@@ -221,6 +224,61 @@ async def test_active_migration_preserves_existing_pages_and_defaults_them_activ
     try:
         async with engine.connect() as connection:
             assert await connection.scalar(text("SELECT active FROM pages")) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_deactivation_report_migration_backfills_existing_rows(tmp_path):
+    path = tmp_path / "deactivation-report-upgrade.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "a7426f0d1c3b")
+    engine = create_engine(path)
+    timestamp = "2026-08-28T09:00:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) "
+                    "VALUES ('example.com', 'https', 0, 1, :now, :now)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(domain_id, url, active, in_scope, discovered_at, "
+                    "last_crawled_at, next_crawl_at, next_archive_at, sitemap_depth, "
+                    "crawl_attempts) VALUES "
+                    "(1, 'https://example.com/', 0, 1, :now, :now, :now, :now, 0, 0)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reports "
+                    "(window_start, window_end, generated_at, discovered_count, "
+                    "archived_count, outstanding_count, first_archive_count, "
+                    "active_domain_count, state, attempts, next_attempt_at) VALUES "
+                    "(:now, :now, :now, 1, 0, 1, 0, 1, 'PENDING', 0, :now)"
+                ),
+                {"now": timestamp},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(text("SELECT deactivated_at FROM pages"))
+                == timestamp
+            )
+            assert (
+                await connection.scalar(text("SELECT deactivated_count FROM reports"))
+                == 0
+            )
     finally:
         await engine.dispose()
 

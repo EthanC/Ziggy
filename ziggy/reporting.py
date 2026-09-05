@@ -82,6 +82,12 @@ async def create_report(
             Capture.first_archive.is_(True),
         )
     )
+    deactivated = await session.scalar(
+        select(func.count(Page.id)).where(
+            Page.deactivated_at >= window.start,
+            Page.deactivated_at < window.end,
+        )
+    )
     active_domains = await session.scalar(
         select(func.count(Domain.id)).where(Domain.active.is_(True))
     )
@@ -97,6 +103,7 @@ async def create_report(
             archived_count=archived_count,
             outstanding_count=outstanding or 0,
             first_archive_count=first_archives or 0,
+            deactivated_count=deactivated or 0,
             active_domain_count=active_domains or 0,
             state=ReportState.PENDING,
             next_attempt_at=generated_at,
@@ -131,6 +138,9 @@ def build_report_webhook(
     previous_first_archives = (
         previous_report.first_archive_count if previous_report is not None else 0
     )
+    previous_deactivated = (
+        previous_report.deactivated_count if previous_report is not None else 0
+    )
     previous_outstanding = (
         previous_report.outstanding_count if previous_report is not None else 0
     )
@@ -163,6 +173,10 @@ def build_report_webhook(
                 ),
                 "indent": 1,
             },
+            (
+                f"Deactivated: {Markdown.bold(f'{report.deactivated_count:,}')} "
+                f"{_change_stat(report.deactivated_count, previous_deactivated)}"
+            ),
             (
                 f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')} "
                 f"{_change_stat(report.outstanding_count, previous_outstanding)}"
@@ -211,6 +225,7 @@ async def deliver_report(
             report.archived_count,
             report.outstanding_count,
             report.first_archive_count,
+            report.deactivated_count,
         )
     ):
         logger.info(
@@ -226,12 +241,13 @@ async def deliver_report(
     if webhook_url is None:
         logger.info(
             "Archive report {} to {}: {} discovered, {} archived, "
-            "{} first archives, {} outstanding",
+            "{} first archives, {} deactivated, {} outstanding",
             report.window_start,
             report.window_end,
             report.discovered_count,
             report.archived_count,
             report.first_archive_count,
+            report.deactivated_count,
             report.outstanding_count,
         )
         report.state = ReportState.LOGGED

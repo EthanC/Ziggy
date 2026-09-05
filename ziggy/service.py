@@ -431,6 +431,7 @@ async def _submit_one(
             page.first_crawled_at = page.first_crawled_at or now
             if not _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
                 page.active = False
+                page.deactivated_at = now
                 page.error = f"HTTP {result.status_code}"
                 page.archive_lease_owner = None
                 page.archive_lease_expires_at = None

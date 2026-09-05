@@ -739,6 +739,7 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
         id=1,
         domain_id=2,
         active=True,
+        deactivated_at=None,
         in_scope=True,
         url="https://example.test/",
         archive_lease_owner="owner",
@@ -824,9 +825,12 @@ async def test_submit_one_marks_recurring_page_inactive_on_http_error(
     create_intent = AsyncMock()
     monkeypatch.setattr(service, "create_archive_intent", create_intent)
 
+    before = datetime.now(UTC)
     await service._submit_one(state, Sessions(session), page.id)
+    after = datetime.now(UTC)
 
     assert page.active is False
+    assert before <= page.deactivated_at <= after
     assert page.status_code == status_code
     assert page.error == f"HTTP {status_code}"
     assert page.archive_lease_owner is None

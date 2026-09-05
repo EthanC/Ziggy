@@ -41,6 +41,7 @@ def make_report(**overrides: object) -> Report:
         "archived_count": 3,
         "outstanding_count": 2,
         "first_archive_count": 1,
+        "deactivated_count": 1,
         "active_domain_count": 4,
         "state": ReportState.PENDING,
         "attempts": 0,
@@ -166,7 +167,26 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
             next_crawl_at=start,
             next_archive_at=start,
         )
-        session.add_all([archived, outstanding, before, boundary])
+        deactivated_pages = [
+            Page(
+                domain_id=active.id,
+                url=f"https://active.example/deactivated-{index}",
+                active=False,
+                deactivated_at=deactivated_at,
+                discovered_at=start - timedelta(days=1),
+                next_crawl_at=start,
+                next_archive_at=start,
+            )
+            for index, deactivated_at in enumerate(
+                (
+                    start - timedelta(microseconds=1),
+                    start,
+                    end - timedelta(microseconds=1),
+                    end,
+                )
+            )
+        ]
+        session.add_all([archived, outstanding, before, boundary, *deactivated_pages])
         await session.flush()
         job = ArchiveJob(
             page_id=archived.id,
@@ -236,8 +256,9 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
             report.archived_count,
             report.outstanding_count,
             report.first_archive_count,
+            report.deactivated_count,
             report.active_domain_count,
-        ) == (2, 2, 2, 1, 1)
+        ) == (2, 2, 2, 1, 2, 1)
         assert report.state is ReportState.PENDING
         assert report.next_attempt_at == generated
 
@@ -322,7 +343,7 @@ async def test_create_report_counts_late_capture_in_completion_window(sessions):
 
 async def test_create_report_raises_if_insert_cannot_be_read():
     session = MagicMock()
-    session.scalar = AsyncMock(side_effect=[None, None, None, None, None, None])
+    session.scalar = AsyncMock(side_effect=[None, None, None, None, None, None, None])
     session.execute = AsyncMock()
     session.commit = AsyncMock()
 
@@ -338,6 +359,7 @@ def test_build_report_webhook_uses_archival_report_layout():
         archived_count=1_000,
         outstanding_count=234,
         first_archive_count=123,
+        deactivated_count=12,
         active_domain_count=2_345,
     )
     previous_report = make_report(
@@ -345,6 +367,7 @@ def test_build_report_webhook_uses_archival_report_layout():
         archived_count=1_010,
         outstanding_count=234,
         first_archive_count=100,
+        deactivated_count=10,
         active_domain_count=2_300,
     )
 
@@ -377,6 +400,7 @@ def test_build_report_webhook_uses_archival_report_layout():
         "- Discovered: **1,234** (+16)\n"
         "- Archived: **1,000** (-10)\n"
         "  - First Archives: **123** (+23)\n"
+        "- Deactivated: **12** (+2)\n"
         "- Pending: **234** (+0)"
     )
     assert container.components[2].divider is True
@@ -415,6 +439,7 @@ def test_build_report_webhook_uses_zero_baseline_for_first_report():
         "- Discovered: **5** (+5)\n"
         "- Archived: **3** (+3)\n"
         "  - First Archives: **1** (+1)\n"
+        "- Deactivated: **1** (+1)\n"
         "- Pending: **2** (+2)"
     )
 
@@ -436,12 +461,13 @@ async def test_deliver_report_without_webhook_logs_and_releases_lease(monkeypatc
     info.assert_called_once()
     info.assert_called_once_with(
         "Archive report {} to {}: {} discovered, {} archived, "
-        "{} first archives, {} outstanding",
+        "{} first archives, {} deactivated, {} outstanding",
         report.window_start,
         report.window_end,
         report.discovered_count,
         report.archived_count,
         report.first_archive_count,
+        report.deactivated_count,
         report.outstanding_count,
     )
 
@@ -452,6 +478,7 @@ async def test_deliver_report_with_no_changes_logs_without_discord(monkeypatch):
         archived_count=0,
         outstanding_count=0,
         first_archive_count=0,
+        deactivated_count=0,
     )
     session = MagicMock()
     session.commit = AsyncMock()

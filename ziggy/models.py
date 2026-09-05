@@ -119,6 +119,7 @@ class Page(Base):
     domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id", ondelete="CASCADE"))
     url: Mapped[str] = mapped_column(Text, unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    deactivated_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     in_scope: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     discovered_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now)
     discovered_from_id: Mapped[int | None] = mapped_column(
@@ -249,6 +250,9 @@ class Report(Base):
     archived_count: Mapped[int] = mapped_column(Integer)
     outstanding_count: Mapped[int] = mapped_column(Integer)
     first_archive_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    deactivated_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0"
     )
     active_domain_count: Mapped[int] = mapped_column(Integer)
