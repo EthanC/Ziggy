@@ -152,6 +152,8 @@ def make_page(**changes):
         "id": 11,
         "domain_id": 4,
         "url": "https://example.com/start",
+        "active": True,
+        "deactivated_at": None,
         "discovered_at": NOW - timedelta(days=1),
         "discovered_from_id": None,
         "first_crawled_at": None,
@@ -814,6 +816,46 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
         ("Page found: {}", "https://example.com/header"),
     ]
     assert "ON CONFLICT DO NOTHING" in str(statement)
+
+
+@pytest.mark.parametrize("status_code", [200, 204])
+async def test_crawl_page_reactivates_inactive_page_after_success(
+    status_code,
+):
+    deactivated_at = NOW - timedelta(days=2)
+    page = make_page(active=False, deactivated_at=deactivated_at)
+
+    session, client, _ = await run_crawl(
+        page,
+        make_result(status_code=status_code, body=b"", headers={}),
+    )
+
+    assert client.calls == [
+        (
+            (page.url, "example.com"),
+            {
+                "include_subdomains": False,
+                "etag": None,
+                "last_modified": None,
+            },
+        )
+    ]
+    assert page.active is True
+    assert page.deactivated_at == deactivated_at
+    assert page.next_crawl_at == NOW + make_settings().interval
+    assert session.commits == 1
+
+
+async def test_crawl_page_keeps_inactive_page_inactive_after_failed_recheck():
+    deactivated_at = NOW - timedelta(days=2)
+    page = make_page(active=False, deactivated_at=deactivated_at)
+
+    session, _, _ = await run_crawl(page, make_result(status_code=404, body=b""))
+
+    assert page.active is False
+    assert page.deactivated_at == deactivated_at
+    assert page.next_crawl_at == NOW + make_settings().interval
+    assert session.commits == 1
 
 
 async def test_crawl_page_logs_only_urls_inserted_by_database(monkeypatch):

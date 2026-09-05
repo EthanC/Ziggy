@@ -435,8 +435,8 @@ async def crawl_page(  # noqa: PLR0913
             page.url,
             configured_host,
             include_subdomains=include_subdomains,
-            etag=page.etag,
-            last_modified=page.last_modified,
+            etag=page.etag if page.active else None,
+            last_modified=page.last_modified if page.active else None,
         )
     except FetchError as error:
         page.error = str(error)
@@ -452,8 +452,7 @@ async def crawl_page(  # noqa: PLR0913
         await session.commit()
         return
 
-    page.status_code = result.status_code
-    page.final_url = result.final_url
+    page.status_code, page.final_url = result.status_code, result.final_url
     page.content_type = _content_type(result.headers)
     page.last_crawled_at = now
     page.first_crawled_at = page.first_crawled_at or now
@@ -485,6 +484,7 @@ async def crawl_page(  # noqa: PLR0913
     found: tuple[str, ...] = ()
     is_sitemap = False
     if _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
+        page.active = True
         try:
             found, is_sitemap = discoveries(result, page.sitemap_depth)
         except UrlError as error:

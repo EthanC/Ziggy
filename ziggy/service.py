@@ -296,7 +296,7 @@ async def _crawl_one(
         if page is None:
             return
         domain = await session.get(Domain, page.domain_id)
-        if domain is None or not domain.active or not page.active or not page.in_scope:
+        if domain is None or not domain.active or not page.in_scope:
             page.crawl_lease_owner = None
             page.crawl_lease_expires_at = None
             await session.commit()

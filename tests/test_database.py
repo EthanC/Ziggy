@@ -515,8 +515,7 @@ async def test_claim_due_page_skips_pages_from_inactive_domains(database, kind):
         )
 
 
-@pytest.mark.parametrize("kind", ["crawl", "archive"])
-async def test_claim_due_page_skips_inactive_pages(database, kind):
+async def test_archive_claim_skips_inactive_pages(database):
     _, sessions = database
     now = datetime(2026, 8, 28, 9, tzinfo=UTC)
     page = await _add_page(sessions, now)
@@ -527,9 +526,53 @@ async def test_claim_due_page_skips_inactive_pages(database, kind):
         await session.commit()
 
         assert (
-            await claim_due_page(session, kind, "worker", now, timedelta(minutes=10))
+            await claim_due_page(
+                session, "archive", "worker", now, timedelta(minutes=10)
+            )
             is None
         )
+
+
+async def test_crawl_claims_inactive_page_only_after_due_active_work_finishes(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    inactive = await _add_page(sessions, now - timedelta(days=30))
+
+    async with sessions() as session:
+        inactive = await session.get(Page, inactive.id)
+        inactive.active = False
+        inactive.deactivated_at = now - timedelta(days=30)
+        active = Page(
+            domain_id=inactive.domain_id,
+            url="https://example.com/active",
+            discovered_at=now,
+            next_crawl_at=now,
+            next_archive_at=now,
+        )
+        session.add(active)
+        await session.commit()
+
+        first = await claim_due_page(
+            session, "crawl", "worker", now, timedelta(minutes=10)
+        )
+        blocked_fallback = await claim_due_page(
+            session, "crawl", "worker", now, timedelta(minutes=10)
+        )
+
+        assert first is not None
+        assert first.id == active.id
+        assert blocked_fallback is None
+
+        active.next_crawl_at = now + timedelta(hours=1)
+        active.crawl_lease_owner = None
+        active.crawl_lease_expires_at = None
+        await session.commit()
+
+        fallback = await claim_due_page(
+            session, "crawl", "worker", now, timedelta(minutes=10)
+        )
+        assert fallback is not None
+        assert fallback.id == inactive.id
 
 
 async def test_archive_claim_is_blocked_by_every_active_direct_job_state(database):

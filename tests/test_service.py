@@ -707,6 +707,17 @@ async def test_crawl_one_handles_missing_and_inactive_records(monkeypatch):
     session.commit.assert_awaited_once_with()
     crawl.assert_not_awaited()
 
+    page.active = False
+    page.in_scope = True
+    session.get = AsyncMock(
+        side_effect=[
+            page,
+            SimpleNamespace(active=True, host="example.test", include_subdomains=False),
+        ]
+    )
+    await service._crawl_one(state, Sessions(session), 1)
+    crawl.assert_awaited_once()
+
 
 async def test_crawl_one_runs_worker_and_isolates_failure(monkeypatch):
     state = make_state()

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import aliased
 
 from ziggy.models import ArchiveJob, ArchiveJobState, Capture, Domain, Page
 from ziggy.urls import (
@@ -324,7 +325,6 @@ async def claim_due_page(
     )
     conditions = [
         Domain.active.is_(True),
-        Page.active.is_(True),
         Page.in_scope.is_(True),
         Page.blocked_reason.is_(None),
         due_column <= now,
@@ -332,6 +332,7 @@ async def claim_due_page(
     ]
     order_by = [due_column, Page.id]
     if kind == "archive":
+        conditions.append(Page.active.is_(True))
         has_capture = exists(select(Capture.id).where(Capture.page_id == Page.id))
         conditions.append(
             ~exists(
@@ -350,6 +351,22 @@ async def claim_due_page(
             )
         )
         order_by.insert(0, has_capture)
+    else:
+        active_page = aliased(Page)
+        active_domain = aliased(Domain)
+        due_active_page = exists(
+            select(active_page.id)
+            .join(active_domain, active_page.domain_id == active_domain.id)
+            .where(
+                active_domain.active.is_(True),
+                active_page.active.is_(True),
+                active_page.in_scope.is_(True),
+                active_page.blocked_reason.is_(None),
+                active_page.next_crawl_at <= now,
+            )
+        )
+        conditions.append(or_(Page.active.is_(True), ~due_active_page))
+        order_by.insert(0, Page.active.desc())
     candidate = (
         select(Page.id)
         .join(Domain, Page.domain_id == Domain.id)
