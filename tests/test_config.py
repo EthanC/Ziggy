@@ -59,7 +59,7 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.crawl.max_redirects == 10
     assert config.crawl.max_attempts == 5
     assert config.crawl.max_query_variants_per_base == 20
-    assert config.archive.interval == timedelta(days=30)
+    assert config.archive.interval == timedelta(days=365)
     assert config.archive.concurrency == 1
     assert config.archive.max_pending_jobs == 2
     assert config.archive.request_delay == 1.0

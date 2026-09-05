@@ -14,7 +14,7 @@ max_attempts = 5
 max_query_variants_per_base = 20
 
 [archive]
-interval = "30d"
+interval = "365d"
 concurrency = 1
 max_pending_jobs = 2
 request_delay = 1.0

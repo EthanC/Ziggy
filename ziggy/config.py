@@ -106,7 +106,7 @@ class CrawlSettings:
 class ArchiveSettings:
     """Internet Archive scheduling and authentication settings."""
 
-    interval: timedelta = timedelta(days=30)
+    interval: timedelta = timedelta(days=365)
     concurrency: int = 1
     max_pending_jobs: int = 2
     request_delay: float = 1.0
@@ -234,7 +234,7 @@ def _parse_archive(
     }
     _only(data, names, "archive")
     return ArchiveSettings(
-        interval=parse_duration(data.get("interval", "30d")),
+        interval=parse_duration(data.get("interval", "365d")),
         concurrency=_positive_int(data.get("concurrency", 1), "archive.concurrency"),
         max_pending_jobs=_positive_int(
             data.get("max_pending_jobs", 2), "archive.max_pending_jobs"
