@@ -118,6 +118,7 @@ class Page(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id", ondelete="CASCADE"))
     url: Mapped[str] = mapped_column(Text, unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     in_scope: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     discovered_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now)
     discovered_from_id: Mapped[int | None] = mapped_column(

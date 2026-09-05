@@ -324,6 +324,7 @@ async def claim_due_page(
     )
     conditions = [
         Domain.active.is_(True),
+        Page.active.is_(True),
         Page.in_scope.is_(True),
         Page.blocked_reason.is_(None),
         due_column <= now,

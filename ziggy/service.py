@@ -35,7 +35,7 @@ from ziggy.config import (
     load_config,
     resolve_secrets,
 )
-from ziggy.crawler import CrawlerClient, crawl_page
+from ziggy.crawler import CrawlerClient, FetchError, crawl_page
 from ziggy.database import (
     claim_due_page,
     create_engine,
@@ -46,7 +46,7 @@ from ziggy.database import (
     session_factory,
 )
 from ziggy.logging import LoggingController
-from ziggy.models import ArchiveJob, Domain, Page, Report, ServiceState
+from ziggy.models import ArchiveJob, Capture, Domain, Page, Report, ServiceState
 from ziggy.reporting import (
     claim_report,
     create_report,
@@ -65,6 +65,8 @@ _LEASE_DURATION = timedelta(minutes=5)
 _HEARTBEAT_INTERVAL = 30.0
 _HEALTH_MAX_AGE = timedelta(seconds=90)
 _ARCHIVE_CAPACITY_RECHECK_DELAY = 30.0
+_SUCCESS_MIN = 200
+_SUCCESS_MAX = 299
 
 
 @dataclass(slots=True)
@@ -294,7 +296,7 @@ async def _crawl_one(
         if page is None:
             return
         domain = await session.get(Domain, page.domain_id)
-        if domain is None or not domain.active or not page.in_scope:
+        if domain is None or not domain.active or not page.active or not page.in_scope:
             page.crawl_lease_owner = None
             page.crawl_lease_expires_at = None
             await session.commit()
@@ -399,11 +401,47 @@ async def _submit_one(
         if page is None:
             return
         domain = await session.get(Domain, page.domain_id)
-        if domain is None or not domain.active or not page.in_scope:
+        if domain is None or not domain.active or not page.active or not page.in_scope:
             page.archive_lease_owner = None
             page.archive_lease_expires_at = None
             await session.commit()
             return
+        previous_capture = await session.scalar(
+            select(Capture.id).where(Capture.page_id == page.id).limit(1)
+        )
+        if previous_capture is not None:
+            now = datetime.now(UTC)
+            try:
+                result = await state.crawler.fetch(
+                    page.url,
+                    domain.host,
+                    include_subdomains=domain.include_subdomains,
+                )
+            except FetchError as error:
+                page.error = str(error)
+                page.next_archive_at = now + timedelta(minutes=1)
+                page.archive_lease_owner = None
+                page.archive_lease_expires_at = None
+                await session.commit()
+                logger.warning("Archive preflight failed for {}: {}", page.url, error)
+                return
+            page.status_code = result.status_code
+            page.final_url = result.final_url
+            page.last_crawled_at = now
+            page.first_crawled_at = page.first_crawled_at or now
+            if not _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
+                page.active = False
+                page.error = f"HTTP {result.status_code}"
+                page.archive_lease_owner = None
+                page.archive_lease_expires_at = None
+                await session.commit()
+                logger.info(
+                    "Page marked inactive after archive preflight returned HTTP {}: {}",
+                    result.status_code,
+                    page.url,
+                )
+                return
+            page.error = None
         job = await create_archive_intent(session, page, datetime.now(UTC))
         try:
             await submit_archive_job(
@@ -487,7 +525,7 @@ async def _poll_one(
                     client=state.archive_client,
                     settings=state.config.archive,
                     now=datetime.now(UTC),
-                    allow_submission=domain.active and page.in_scope,
+                    allow_submission=domain.active and page.active and page.in_scope,
                 )
             else:
                 await poll_archive_job(

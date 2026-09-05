@@ -514,6 +514,23 @@ async def test_claim_due_page_skips_pages_from_inactive_domains(database, kind):
         )
 
 
+@pytest.mark.parametrize("kind", ["crawl", "archive"])
+async def test_claim_due_page_skips_inactive_pages(database, kind):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    page = await _add_page(sessions, now)
+
+    async with sessions() as session:
+        persisted = await session.get(Page, page.id)
+        persisted.active = False
+        await session.commit()
+
+        assert (
+            await claim_due_page(session, kind, "worker", now, timedelta(minutes=10))
+            is None
+        )
+
+
 async def test_archive_claim_is_blocked_by_every_active_direct_job_state(database):
     _, sessions = database
     now = datetime(2026, 8, 28, 9, tzinfo=UTC)

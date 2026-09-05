@@ -31,6 +31,7 @@ from ziggy.config import (
     Secrets,
     ZiggySettings,
 )
+from ziggy.crawler import FetchError, FetchResult
 from ziggy.models import Base, ServiceState
 
 # This suite deliberately covers module-private orchestration boundaries.
@@ -104,7 +105,7 @@ def make_state(config: Config | None = None, secrets: Secrets | None = None):
         SimpleNamespace(
             close=AsyncMock(), submission_capacity=AsyncMock(return_value=None)
         ),
-        SimpleNamespace(close=AsyncMock()),
+        SimpleNamespace(close=AsyncMock(), fetch=AsyncMock()),
         SimpleNamespace(configure=MagicMock()),
     )
 
@@ -683,6 +684,7 @@ async def test_crawl_one_handles_missing_and_inactive_records(monkeypatch):
 
     page = SimpleNamespace(
         domain_id=2,
+        active=True,
         in_scope=True,
         crawl_lease_owner="owner",
         crawl_lease_expires_at=NOW,
@@ -708,7 +710,7 @@ async def test_crawl_one_handles_missing_and_inactive_records(monkeypatch):
 
 async def test_crawl_one_runs_worker_and_isolates_failure(monkeypatch):
     state = make_state()
-    page = SimpleNamespace(domain_id=2, in_scope=True)
+    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
     domain = SimpleNamespace(active=True, host="example.test", include_subdomains=True)
     session = MagicMock(get=AsyncMock(side_effect=[page, domain]))
     crawl = AsyncMock()
@@ -734,13 +736,17 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
     )
 
     page = SimpleNamespace(
+        id=1,
         domain_id=2,
+        active=True,
         in_scope=True,
+        url="https://example.test/",
         archive_lease_owner="owner",
         archive_lease_expires_at=NOW,
     )
     session = MagicMock(
         get=AsyncMock(side_effect=[page, SimpleNamespace(active=False)]),
+        scalar=AsyncMock(return_value=None),
         commit=AsyncMock(),
     )
     await service._submit_one(state, Sessions(session), 1)
@@ -763,6 +769,7 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
     session.get = AsyncMock(side_effect=[page, active])
     await service._submit_one(state, Sessions(session), 1)
     submit.assert_awaited_once()
+    state.crawler.fetch.assert_not_called()
 
     session.get = AsyncMock(side_effect=[page, active])
     submit.reset_mock(side_effect=True)
@@ -779,6 +786,139 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
     failure.assert_awaited_once_with(session, job, submit.side_effect)
 
 
+@pytest.mark.parametrize("status_code", [400, 404, 500, 503])
+async def test_submit_one_marks_recurring_page_inactive_on_http_error(
+    monkeypatch, status_code
+):
+    state = make_state()
+    page = SimpleNamespace(
+        id=1,
+        domain_id=2,
+        active=True,
+        in_scope=True,
+        url="https://example.test/old",
+        first_crawled_at=NOW,
+        last_crawled_at=NOW,
+        status_code=200,
+        final_url="https://example.test/old",
+        error=None,
+        archive_lease_owner="worker",
+        archive_lease_expires_at=NOW,
+    )
+    domain = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
+    session = MagicMock(
+        get=AsyncMock(side_effect=[page, domain]),
+        scalar=AsyncMock(return_value=1),
+        commit=AsyncMock(),
+    )
+    state.crawler.fetch = AsyncMock(
+        return_value=FetchResult(
+            status_code,
+            page.url,
+            {},
+            b"",
+            None,
+            (),
+        )
+    )
+    create_intent = AsyncMock()
+    monkeypatch.setattr(service, "create_archive_intent", create_intent)
+
+    await service._submit_one(state, Sessions(session), page.id)
+
+    assert page.active is False
+    assert page.status_code == status_code
+    assert page.error == f"HTTP {status_code}"
+    assert page.archive_lease_owner is None
+    assert page.archive_lease_expires_at is None
+    session.commit.assert_awaited_once_with()
+    create_intent.assert_not_awaited()
+
+
+async def test_submit_one_preflights_recurring_page_before_creating_intent(monkeypatch):
+    state = make_state()
+    page = SimpleNamespace(
+        id=1,
+        domain_id=2,
+        active=True,
+        in_scope=True,
+        url="https://example.test/current",
+        first_crawled_at=None,
+        last_crawled_at=None,
+        status_code=None,
+        final_url=None,
+        error="old error",
+        archive_lease_owner="worker",
+        archive_lease_expires_at=NOW,
+    )
+    domain = SimpleNamespace(active=True, host="example.test", include_subdomains=True)
+    session = MagicMock(
+        get=AsyncMock(side_effect=[page, domain]),
+        scalar=AsyncMock(return_value=1),
+    )
+    state.crawler.fetch = AsyncMock(
+        return_value=FetchResult(204, page.url, {}, b"", None, ())
+    )
+    job = SimpleNamespace()
+    create_intent = AsyncMock(return_value=job)
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "create_archive_intent", create_intent)
+    monkeypatch.setattr(service, "submit_archive_job", submit)
+
+    await service._submit_one(state, Sessions(session), page.id)
+
+    state.crawler.fetch.assert_awaited_once_with(
+        page.url,
+        domain.host,
+        include_subdomains=True,
+    )
+    assert page.status_code == 204
+    assert page.first_crawled_at is not None
+    assert page.last_crawled_at == page.first_crawled_at
+    assert page.error is None
+    create_intent.assert_awaited_once()
+    submit.assert_awaited_once()
+
+
+async def test_submit_one_retries_recurring_page_after_preflight_fetch_error(
+    monkeypatch,
+):
+    state = make_state()
+    page = SimpleNamespace(
+        id=1,
+        domain_id=2,
+        active=True,
+        in_scope=True,
+        url="https://example.test/unreachable",
+        error=None,
+        next_archive_at=NOW,
+        archive_lease_owner="worker",
+        archive_lease_expires_at=NOW,
+    )
+    domain = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
+    session = MagicMock(
+        get=AsyncMock(side_effect=[page, domain]),
+        scalar=AsyncMock(return_value=1),
+        commit=AsyncMock(),
+    )
+    state.crawler.fetch = AsyncMock(
+        side_effect=FetchError("connection failed", transient=True)
+    )
+    create_intent = AsyncMock()
+    monkeypatch.setattr(service, "create_archive_intent", create_intent)
+
+    before = datetime.now(UTC) + timedelta(minutes=1)
+    await service._submit_one(state, Sessions(session), page.id)
+    after = datetime.now(UTC) + timedelta(minutes=1)
+
+    assert page.active is True
+    assert page.error == "connection failed"
+    assert before <= page.next_archive_at <= after
+    assert page.archive_lease_owner is None
+    session.commit.assert_awaited_once_with()
+    create_intent.assert_not_awaited()
+
+
 async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     state = make_state()
     missing = MagicMock(get=AsyncMock(return_value=None))
@@ -788,7 +928,7 @@ async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     no_page = MagicMock(get=AsyncMock(side_effect=[job, None]))
     await service._poll_one(state, Sessions(no_page), "job")
 
-    page = SimpleNamespace(domain_id=2, in_scope=True)
+    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
     no_domain = MagicMock(get=AsyncMock(side_effect=[job, page, None]))
     await service._poll_one(state, Sessions(no_domain), "job")
 
@@ -818,7 +958,7 @@ async def test_poll_one_pauses_on_auth_and_isolates_other_failures(monkeypatch):
     job = SimpleNamespace(
         page_id=1, state=ArchiveJobState.RATE_LIMITED, external_job_id=None
     )
-    page = SimpleNamespace(domain_id=2, in_scope=True)
+    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
     domain = SimpleNamespace(active=True)
     session = MagicMock(
         get=AsyncMock(side_effect=[job, page, domain]), commit=AsyncMock()
@@ -849,7 +989,7 @@ async def test_poll_one_delays_no_id_work_while_archive_is_paused(monkeypatch):
         lease_expires_at=NOW,
         next_attempt_at=NOW,
     )
-    page = SimpleNamespace(domain_id=2, in_scope=True)
+    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
     domain = SimpleNamespace(active=True)
     session = MagicMock(
         get=AsyncMock(side_effect=[job, page, domain]), commit=AsyncMock()

@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "2f4a8c1d9e70"
+HEAD_REVISION = "a7426f0d1c3b"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -142,6 +142,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     assert migrations.joinpath(
         "versions", "2f4a8c1d9e70_secure_query_frontier.py"
     ).is_file()
+    assert migrations.joinpath(
+        "versions", "a7426f0d1c3b_add_page_active_state.py"
+    ).is_file()
 
 
 async def test_scope_migration_preserves_existing_pages_and_defaults_them_in_scope(
@@ -179,6 +182,45 @@ async def test_scope_migration_preserves_existing_pages_and_defaults_them_in_sco
     try:
         async with engine.connect() as connection:
             assert await connection.scalar(text("SELECT in_scope FROM pages")) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_active_migration_preserves_existing_pages_and_defaults_them_active(
+    tmp_path,
+):
+    path = tmp_path / "active-upgrade.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "2f4a8c1d9e70")
+    engine = create_engine(path)
+    timestamp = "2026-08-28T09:00:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) "
+                    "VALUES ('example.com', 'https', 0, 1, :now, :now)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(domain_id, url, in_scope, discovered_at, next_crawl_at, "
+                    "next_archive_at, sitemap_depth, crawl_attempts) "
+                    "VALUES (1, 'https://example.com/', 1, :now, :now, :now, 0, 0)"
+                ),
+                {"now": timestamp},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT active FROM pages")) == 1
     finally:
         await engine.dispose()
 
