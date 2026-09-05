@@ -551,9 +551,7 @@ async def _recover_uncertain(  # noqa: PLR0913
     except ArchiveRateLimitError as error:
         _retry_uncertain(job, now, error, retry_at=error.retry_at)
         await session.commit()
-        logger.warning(
-            "Archive recovery rate limited for job {}: {}", job.id, page.url
-        )
+        logger.warning("Archive recovery rate limited for job {}: {}", job.id, page.url)
         return False
     except ArchiveError as error:
         _retry_uncertain(job, now, error)
