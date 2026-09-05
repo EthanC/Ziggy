@@ -103,10 +103,15 @@ def make_state(config: Config | None = None, secrets: Secrets | None = None):
         config or make_config(),
         secrets or make_secrets(),
         SimpleNamespace(
-            close=AsyncMock(), submission_capacity=AsyncMock(return_value=None)
+            close=AsyncMock(),
+            submission_capacity=AsyncMock(return_value=None),
+            my_web_archive_url=AsyncMock(
+                return_value="https://archive.org/details/@ziggy/web-archive"
+            ),
         ),
         SimpleNamespace(close=AsyncMock(), fetch=AsyncMock()),
         SimpleNamespace(configure=MagicMock()),
+        web_archive_url="https://archive.org/details/@ziggy/web-archive",
     )
 
 
@@ -245,7 +250,13 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
     config = make_config(tmp_path / "data" / "ziggy.sqlite3")
     secrets = make_secrets()
     logging_controller = SimpleNamespace(configure=MagicMock(), close=AsyncMock())
-    archive_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+    archive_client = SimpleNamespace(
+        login=AsyncMock(),
+        my_web_archive_url=AsyncMock(
+            return_value="https://archive.org/details/@ziggy/web-archive"
+        ),
+        close=AsyncMock(),
+    )
     crawler = SimpleNamespace(close=AsyncMock())
     engine = SimpleNamespace(dispose=AsyncMock())
     session = MagicMock(add=MagicMock(), commit=AsyncMock(), execute=AsyncMock())
@@ -287,6 +298,7 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
 
     logging_controller.configure.assert_called_once_with(config.logging, secrets)
     archive_client.login.assert_awaited_once_with()
+    archive_client.my_web_archive_url.assert_awaited_once_with()
     assert session.add.call_args.args[0].instance_id == "fixed-instance"
     for worker in worker_mocks.values():
         worker.assert_awaited_once()
@@ -302,7 +314,11 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
 async def test_run_service_logs_runtime_exception_group(monkeypatch, tmp_path):
     config = make_config(tmp_path / "ziggy.sqlite3")
     logging_controller = SimpleNamespace(configure=MagicMock(), close=AsyncMock())
-    archive_client = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+    archive_client = SimpleNamespace(
+        login=AsyncMock(),
+        my_web_archive_url=AsyncMock(return_value=None),
+        close=AsyncMock(),
+    )
     crawler = SimpleNamespace(close=AsyncMock())
     engine = SimpleNamespace(dispose=AsyncMock())
     session = MagicMock(add=MagicMock(), commit=AsyncMock(), execute=AsyncMock())
@@ -560,7 +576,13 @@ async def test_config_watcher_swaps_changed_boundaries_and_applies_reload(monkey
         logging=replace(state.config.logging, level="DEBUG"),
     )
     replacement_secrets = replace(state.secrets, archive_password="new-password")
-    candidate = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+    candidate = SimpleNamespace(
+        login=AsyncMock(),
+        my_web_archive_url=AsyncMock(
+            return_value="https://archive.org/details/@replacement/web-archive"
+        ),
+        close=AsyncMock(),
+    )
     crawler = SimpleNamespace(close=AsyncMock())
     session = MagicMock()
     reconcile = AsyncMock()
@@ -586,6 +608,7 @@ async def test_config_watcher_swaps_changed_boundaries_and_applies_reload(monkey
         server_error_recovery_period=timedelta(minutes=15),
     )
     candidate.login.assert_awaited_once_with()
+    candidate.my_web_archive_url.assert_awaited_once_with()
     assert state.archive_client is candidate
     assert state.retired_archive_clients == [old_archive]
     assert state.crawler is crawler
@@ -597,6 +620,9 @@ async def test_config_watcher_swaps_changed_boundaries_and_applies_reload(monkey
     assert state.config == replacement
     assert state.secrets == replacement_secrets
     assert state.archive_paused is False
+    assert state.web_archive_url == (
+        "https://archive.org/details/@replacement/web-archive"
+    )
 
 
 async def test_config_watcher_applies_logging_only_change_without_client_swap(
@@ -652,7 +678,13 @@ async def test_config_watcher_replaces_archive_client_for_network_settings(
     monkeypatch, replacement
 ):
     state = make_state()
-    candidate = SimpleNamespace(login=AsyncMock(), close=AsyncMock())
+    candidate = SimpleNamespace(
+        login=AsyncMock(),
+        my_web_archive_url=AsyncMock(
+            return_value="https://archive.org/details/@replacement/web-archive"
+        ),
+        close=AsyncMock(),
+    )
     stop = SequencedStop(False, False, True)
     monkeypatch.setattr(service, "_wait", AsyncMock())
     monkeypatch.setattr(service, "load_config", MagicMock(return_value=replacement))
@@ -1259,6 +1291,7 @@ async def test_report_scheduler_creates_claims_and_delivers(monkeypatch):
     create.assert_awaited_once()
     deliver.assert_awaited_once()
     assert deliver.call_args.args[2] == "discord"
+    assert deliver.call_args.args[4] == state.web_archive_url
 
 
 async def test_report_scheduler_waits_one_interval_before_first_report(monkeypatch):

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import msgspec
 import pytest
-from clyde.components import Container, Seperator, TextDisplay
+from clyde.components import ActionRow, Container, LinkButton, Seperator, TextDisplay
 from clyde.webhook import MessageFlags
 from niquests.exceptions import RequestException
 from sqlalchemy import select
@@ -387,13 +387,14 @@ def test_build_report_webhook_uses_archival_report_layout():
         report,
         "https://discord.invalid/api/webhooks/id/token",
         previous_report,
+        "https://archive.org/details/@ziggy/web-archive",
     )
 
     assert webhook.get_flag(MessageFlags.IS_COMPONENTS_V2)
     assert webhook._query_params == {"wait": "True"}
     assert webhook.allowed_mentions.parse == []
     assert webhook.allowed_mentions.replied_user is False
-    assert len(webhook.components) == 1
+    assert len(webhook.components) == 2
     container = webhook.components[0]
     assert isinstance(container, Container)
     assert container.accent_color == 0xDA3E44
@@ -418,6 +419,13 @@ def test_build_report_webhook_uses_archival_report_layout():
         "-# Report for <t:1787834096:d> to <t:1787920496:d> "
         "(Generated <t:1787920496:R>)"
     )
+    action_row = webhook.components[1]
+    assert isinstance(action_row, ActionRow)
+    assert len(action_row.components) == 1
+    button = action_row.components[0]
+    assert isinstance(button, LinkButton)
+    assert button.label == "View Archive"
+    assert button.url == "https://archive.org/details/@ziggy/web-archive"
     assert webhook.content is msgspec.UNSET
     assert webhook.embeds is msgspec.UNSET
     assert webhook.poll is msgspec.UNSET
@@ -448,6 +456,8 @@ def test_build_report_webhook_uses_zero_baseline_for_first_report():
         "- Deactivated: **1** (+1) | **1** Lifetime\n"
         "- Pending: **2** (+2)"
     )
+    assert len(webhook.components[0].components) == 4
+    assert len(webhook.components) == 1
 
 
 async def test_deliver_report_without_webhook_logs_and_releases_lease(monkeypatch):
@@ -559,10 +569,19 @@ async def test_deliver_report_builds_webhook_with_previous_report(
         session.add_all([previous_report, report])
         await session.commit()
 
-        await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
+        await reporting.deliver_report(
+            session,
+            report,
+            "https://discord.invalid",
+            NOW,
+            "https://archive.org/details/@ziggy/web-archive",
+        )
 
     build_webhook.assert_called_once_with(
-        report, "https://discord.invalid", previous_report
+        report,
+        "https://discord.invalid",
+        previous_report,
+        "https://archive.org/details/@ziggy/web-archive",
     )
 
 

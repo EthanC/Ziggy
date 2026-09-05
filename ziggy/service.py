@@ -80,6 +80,7 @@ class RuntimeState:
     logging: LoggingController
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     archive_paused: bool = False
+    web_archive_url: str | None = None
     retired_archive_clients: list[ArchivistClient] = field(default_factory=list)
     retired_crawlers: list[CrawlerClient] = field(default_factory=list)
 
@@ -115,6 +116,7 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
             server_error_recovery_period=config.archive.server_error_recovery_period,
         )
         await archive_client.login()
+        web_archive_url = await archive_client.my_web_archive_url()
     except BaseException:
         if archive_client is not None:
             with suppress(Exception):
@@ -127,7 +129,14 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
         raise
     sessions = session_factory(engine)
     crawler = CrawlerClient(config.crawl)
-    state = RuntimeState(config, secrets, archive_client, crawler, logging_controller)
+    state = RuntimeState(
+        config,
+        secrets,
+        archive_client,
+        crawler,
+        logging_controller,
+        web_archive_url=web_archive_url,
+    )
     instance_id = str(uuid4())
     stop = asyncio.Event()
     remove_signals = _install_signal_handlers(stop)
@@ -232,6 +241,7 @@ async def _config_watcher(
             candidate_ready = False
             try:
                 await candidate.login()
+                web_archive_url = await candidate.my_web_archive_url()
                 candidate_ready = True
             except ArchiveError as error:
                 logger.error(
@@ -247,6 +257,7 @@ async def _config_watcher(
             state.retired_archive_clients.append(state.archive_client)
             state.archive_client = candidate
             state.archive_paused = False
+            state.web_archive_url = web_archive_url
         if replacement.crawl != state.config.crawl:
             state.retired_crawlers.append(state.crawler)
             state.crawler = CrawlerClient(replacement.crawl)
@@ -578,7 +589,11 @@ async def _report_scheduler(
             report = await claim_report(session, instance_id, now, _LEASE_DURATION)
             if report is not None:
                 await deliver_report(
-                    session, report, state.secrets.reporting_webhook_url, now
+                    session,
+                    report,
+                    state.secrets.reporting_webhook_url,
+                    now,
+                    state.web_archive_url,
                 )
         await _wait(stop, _IDLE_DELAY)
 

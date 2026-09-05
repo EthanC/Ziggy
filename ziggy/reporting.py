@@ -7,7 +7,14 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from clyde import AllowedMentions, Markdown, Timestamp, Webhook
-from clyde.components import Container, Seperator, SeperatorSpacing, TextDisplay
+from clyde.components import (
+    ActionRow,
+    Container,
+    LinkButton,
+    Seperator,
+    SeperatorSpacing,
+    TextDisplay,
+)
 from clyde.webhook import MessageFlags
 from loguru import logger
 from niquests import exceptions as niquests_exceptions
@@ -144,7 +151,10 @@ async def create_report(
 
 
 def build_report_webhook(
-    report: Report, webhook_url: str, previous_report: Report | None = None
+    report: Report,
+    webhook_url: str,
+    previous_report: Report | None = None,
+    web_archive_url: str | None = None,
 ) -> Webhook:
     """Construct the required Components v2 message without legacy fields."""
     previous_discovered = (
@@ -219,6 +229,12 @@ def build_report_webhook(
     )
     webhook.set_wait(True)
     webhook.add_component(container)
+    if web_archive_url is not None:
+        webhook.add_component(
+            ActionRow(
+                components=[LinkButton(label="View Archive", url=web_archive_url)]
+            )
+        )
     if not webhook.get_flag(MessageFlags.IS_COMPONENTS_V2):
         raise RuntimeError("Components v2 flag was not set")
     return webhook
@@ -229,6 +245,7 @@ async def deliver_report(
     report: Report,
     webhook_url: str | None,
     now: datetime,
+    web_archive_url: str | None = None,
 ) -> None:
     """Deliver, log, or reschedule one persisted report row."""
     if not any(
@@ -275,7 +292,7 @@ async def deliver_report(
     )
     try:
         response = await build_report_webhook(
-            report, webhook_url, previous_report
+            report, webhook_url, previous_report, web_archive_url
         ).execute_async()
         payload = response.json()
     except (niquests_exceptions.RequestException, ValueError, TypeError) as error:

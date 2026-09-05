@@ -1188,6 +1188,9 @@ class NativeClient:
         self.user_status_result: Any = InternetArchiveUserStatus(
             available=2, processing=0
         )
+        self.web_archive_url_result: Any = (
+            "https://archive.org/details/@ziggy/web-archive"
+        )
         self.submit_calls: list[tuple[str, Any]] = []
         self.status_calls: list[str] = []
         self.search_calls: list[tuple[str, dict[str, Any]]] = []
@@ -1227,6 +1230,11 @@ class NativeClient:
         if isinstance(self.user_status_result, BaseException):
             raise self.user_status_result
         return self.user_status_result
+
+    async def my_web_archive_url(self) -> str:
+        if isinstance(self.web_archive_url_result, BaseException):
+            raise self.web_archive_url_result
+        return self.web_archive_url_result
 
     async def search(self, url: str, **kwargs: Any) -> Any:
         self.search_calls.append((url, kwargs))
@@ -1337,6 +1345,7 @@ async def test_anonymous_adapter_skips_login_and_authenticated_options(
     adapter = archive.ArchivistClient()
 
     await adapter.login()
+    assert await adapter.my_web_archive_url() is None
     result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
     await adapter.add_to_my_archive(result)
 
@@ -1357,6 +1366,31 @@ async def test_adapter_reads_authenticated_submission_capacity():
 
     native.user_status_result = InternetArchiveUserStatus(available=-1, processing=1)
     assert await adapter_with(native).submission_capacity() == 0
+
+
+async def test_adapter_reads_authenticated_web_archive_url():
+    native = NativeClient()
+
+    assert await adapter_with(native).my_web_archive_url() == (
+        "https://archive.org/details/@ziggy/web-archive"
+    )
+
+
+@pytest.mark.parametrize(
+    ("native_error", "local_error"),
+    [
+        (AuthenticationError("denied"), ArchiveAuthenticationError),
+        (ArchivistError("offline"), ArchiveError),
+    ],
+)
+async def test_adapter_web_archive_url_translates_errors(
+    native_error: Exception, local_error: type[ArchiveError]
+):
+    native = NativeClient()
+    native.web_archive_url_result = native_error
+
+    with pytest.raises(local_error):
+        await adapter_with(native).my_web_archive_url()
 
 
 async def test_anonymous_adapter_has_no_submission_capacity_endpoint():

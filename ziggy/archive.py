@@ -127,6 +127,9 @@ class ArchiveClient(Protocol):
     async def add_to_my_archive(self, job_id: str) -> None:
         """Add one successful capture to My Web Archive."""
 
+    async def my_web_archive_url(self) -> str | None:
+        """Return the authenticated account's My Web Archive URL."""
+
     async def captures_since(
         self, url: str, since: datetime
     ) -> Sequence[SuccessStatus]:
@@ -209,6 +212,17 @@ class ArchivistClient:
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
         return max(0, status.available)
+
+    async def my_web_archive_url(self) -> str | None:
+        """Return My Web Archive URL when account authentication is active."""
+        if not self._has_account:
+            return None
+        try:
+            return await self._request(self._client.my_web_archive_url)
+        except AuthenticationError as error:
+            raise ArchiveAuthenticationError("Internet Archive login failed") from error
+        except ArchivistError as error:
+            raise ArchiveError(type(error).__name__) from error
 
     async def submit(self, url: str, dedupe_window: timedelta) -> str:
         """Submit with account-only options when credentials are configured."""
