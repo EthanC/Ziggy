@@ -466,9 +466,11 @@ async def _submit_one(
             )
         except ArchiveAuthenticationError:
             state.archive_paused = True
-            logger.error("Internet Archive authentication paused new submissions")
+            logger.error(
+                "Internet Archive authentication paused new submissions: {}", page.url
+            )
         except Exception as error:  # noqa: BLE001 - preserve scheduler liveness.
-            await _archive_worker_failure(session, job, error)
+            await _archive_worker_failure(session, job, page, error)
 
 
 async def _archive_poll_scheduler(
@@ -554,9 +556,12 @@ async def _poll_one(
                 )
         except ArchiveAuthenticationError:
             state.archive_paused = True
-            logger.error("Internet Archive authentication failed during persisted work")
+            logger.error(
+                "Internet Archive authentication failed during persisted work: {}",
+                page.url,
+            )
         except Exception as error:  # noqa: BLE001 - preserve scheduler liveness.
-            await _archive_worker_failure(session, job, error)
+            await _archive_worker_failure(session, job, page, error)
 
 
 async def _report_scheduler(
@@ -655,11 +660,11 @@ async def _worker_failure(
     page.crawl_lease_expires_at = None
     page.next_crawl_at = datetime.now(UTC) + timedelta(minutes=1)
     await session.commit()
-    logger.exception("Unexpected {} worker failure", kind)
+    logger.exception("Unexpected {} worker failure: {}", kind, page.url)
 
 
 async def _archive_worker_failure(
-    session: AsyncSession, job: ArchiveJob, error: Exception
+    session: AsyncSession, job: ArchiveJob, page: Page, error: Exception
 ) -> None:
     await session.rollback()
     job.error = type(error).__name__
@@ -667,7 +672,7 @@ async def _archive_worker_failure(
     job.lease_expires_at = None
     job.next_attempt_at = datetime.now(UTC) + timedelta(minutes=1)
     await session.commit()
-    logger.exception("Unexpected archive worker failure")
+    logger.exception("Unexpected archive worker failure: {}", page.url)
 
 
 async def _wait(stop: asyncio.Event, seconds: float) -> None:

@@ -505,14 +505,17 @@ async def submit_archive_job(  # noqa: PLR0913
     except ArchiveRateLimitError as error:
         _retry_uncertain(job, now, error, retry_at=error.retry_at)
         await session.commit()
-        logger.warning("Archive submission rate limited for job {}", job.id)
+        logger.warning(
+            "Archive submission rate limited for job {}: {}", job.id, page.url
+        )
         return
     except ArchiveError as error:
         _retry_uncertain(job, now, error)
         await session.commit()
         logger.warning(
-            "Archive submission failed for job {}: {}",
+            "Archive submission failed for job {} ({}): {}",
             job.id,
+            page.url,
             type(error).__name__,
         )
         return
@@ -548,14 +551,17 @@ async def _recover_uncertain(  # noqa: PLR0913
     except ArchiveRateLimitError as error:
         _retry_uncertain(job, now, error, retry_at=error.retry_at)
         await session.commit()
-        logger.warning("Archive recovery rate limited for job {}", job.id)
+        logger.warning(
+            "Archive recovery rate limited for job {}: {}", job.id, page.url
+        )
         return False
     except ArchiveError as error:
         _retry_uncertain(job, now, error)
         await session.commit()
         logger.warning(
-            "Archive recovery failed for job {}: {}",
+            "Archive recovery failed for job {} ({}): {}",
             job.id,
+            page.url,
             type(error).__name__,
         )
         return False
@@ -608,19 +614,22 @@ async def poll_archive_job(  # noqa: PLR0911, PLR0913
     except ArchiveRateLimitError as error:
         _rate_limit(job, now, error.retry_at)
         await session.commit()
-        logger.warning("Archive polling rate limited for job {}", job.id)
+        logger.warning("Archive polling rate limited for job {}: {}", job.id, page.url)
         return
     except ArchiveJobNotFoundError as error:
         _retry_missing_job(job, now, error)
         await session.commit()
-        logger.info("Archive job {} is not yet available for polling", job.id)
+        logger.info(
+            "Archive job {} is not yet available for polling: {}", job.id, page.url
+        )
         return
     except ArchiveError as error:
         _retry_job(job, page, settings, now, error)
         await session.commit()
         logger.warning(
-            "Archive polling failed for job {}: {}",
+            "Archive polling failed for job {} ({}): {}",
             job.id,
+            page.url,
             type(error).__name__,
         )
         return
@@ -633,7 +642,9 @@ async def poll_archive_job(  # noqa: PLR0911, PLR0913
             page.next_archive_at = now
             _release_job(job)
             await session.commit()
-            logger.warning("Archive job {} exceeded pending timeout", job.id)
+            logger.warning(
+                "Archive job {} exceeded pending timeout: {}", job.id, page.url
+            )
             return
         job.state = ArchiveJobState.PENDING
         job.next_attempt_at = status.retry_at or now + timedelta(seconds=2)
@@ -675,16 +686,16 @@ async def _record_failure(  # noqa: PLR0913, PLR0917
         job.error = status.service_code
         job.next_attempt_at = now + _service_failure_recovery_delay(job.attempts)
         log = logger.info
-        message = "Archive job {} will retry after service code {}"
+        message = "Archive job {} will retry after service code {}: {}"
     else:
         job.state = ArchiveJobState.FAILED
         job.completed_at = now
         page.next_archive_at = now + settings.interval
         log = logger.warning
-        message = "Archive job {} failed with service code {}"
+        message = "Archive job {} failed with service code {}: {}"
     _release_job(job)
     await session.commit()
-    log(message, job.id, status.service_code or "unknown")
+    log(message, job.id, status.service_code or "unknown", page.url)
 
 
 async def _record_success(  # noqa: PLR0913, PLR0917

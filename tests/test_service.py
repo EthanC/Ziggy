@@ -753,7 +753,9 @@ async def test_crawl_one_handles_missing_and_inactive_records(monkeypatch):
 
 async def test_crawl_one_runs_worker_and_isolates_failure(monkeypatch):
     state = make_state()
-    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
+    page = SimpleNamespace(
+        domain_id=2, active=True, in_scope=True, url="https://example.test/"
+    )
     domain = SimpleNamespace(active=True, host="example.test", include_subdomains=True)
     session = MagicMock(get=AsyncMock(side_effect=[page, domain]))
     crawl = AsyncMock()
@@ -827,7 +829,7 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
     failure = AsyncMock()
     monkeypatch.setattr(service, "_archive_worker_failure", failure)
     await service._submit_one(state, Sessions(session), 1)
-    failure.assert_awaited_once_with(session, job, submit.side_effect)
+    failure.assert_awaited_once_with(session, job, page, submit.side_effect)
 
 
 @pytest.mark.parametrize("status_code", [400, 404, 500, 503])
@@ -975,7 +977,9 @@ async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     no_page = MagicMock(get=AsyncMock(side_effect=[job, None]))
     await service._poll_one(state, Sessions(no_page), "job")
 
-    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
+    page = SimpleNamespace(
+        domain_id=2, active=True, in_scope=True, url="https://example.test/"
+    )
     no_domain = MagicMock(get=AsyncMock(side_effect=[job, page, None]))
     await service._poll_one(state, Sessions(no_domain), "job")
 
@@ -1005,7 +1009,9 @@ async def test_poll_one_pauses_on_auth_and_isolates_other_failures(monkeypatch):
     job = SimpleNamespace(
         page_id=1, state=ArchiveJobState.RATE_LIMITED, external_job_id=None
     )
-    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
+    page = SimpleNamespace(
+        domain_id=2, active=True, in_scope=True, url="https://example.test/"
+    )
     domain = SimpleNamespace(active=True)
     session = MagicMock(
         get=AsyncMock(side_effect=[job, page, domain]), commit=AsyncMock()
@@ -1022,7 +1028,7 @@ async def test_poll_one_pauses_on_auth_and_isolates_other_failures(monkeypatch):
     failure = AsyncMock()
     monkeypatch.setattr(service, "_archive_worker_failure", failure)
     await service._poll_one(state, Sessions(session), "job")
-    failure.assert_awaited_once_with(session, job, error)
+    failure.assert_awaited_once_with(session, job, page, error)
 
 
 async def test_poll_one_delays_no_id_work_while_archive_is_paused(monkeypatch):
@@ -1058,6 +1064,7 @@ async def test_worker_failure_helpers_release_and_delay_work():
     session = MagicMock(commit=AsyncMock(), rollback=AsyncMock())
     page = SimpleNamespace(
         error=None,
+        url="https://example.test/",
         crawl_lease_owner="worker",
         crawl_lease_expires_at=NOW,
         next_crawl_at=NOW,
@@ -1073,7 +1080,7 @@ async def test_worker_failure_helpers_release_and_delay_work():
         error=None, lease_owner="worker", lease_expires_at=NOW, next_attempt_at=NOW
     )
     before = datetime.now(UTC) + timedelta(minutes=1)
-    await service._archive_worker_failure(session, job, ValueError("failure"))
+    await service._archive_worker_failure(session, job, page, ValueError("failure"))
     after = datetime.now(UTC) + timedelta(minutes=1)
     assert job.error == "ValueError"
     assert job.lease_owner is None

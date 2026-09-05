@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from archivist import (
@@ -340,14 +340,17 @@ async def test_submit_authentication_failure_is_persisted_and_raised(
         ),
     ],
 )
-async def test_submit_retryable_failures_preserve_uncertainty(
+async def test_submit_retryable_failures_preserve_uncertainty(  # noqa: PLR0913, PLR0917
     database: Database,
+    monkeypatch,
     error: ArchiveError,
     expected_state: ArchiveJobState,
     expected_retry: datetime,
     expected_error: str,
 ):
     client = FakeArchiveClient(submit_error=error)
+    warning = MagicMock()
+    monkeypatch.setattr(archive.logger, "warning", warning)
     async with database.sessions() as session:
         _, page = await add_page(session)
         job = await add_job(session, page)
@@ -363,6 +366,7 @@ async def test_submit_retryable_failures_preserve_uncertainty(
         assert job.error == expected_error
         assert job.external_job_id is None
         assert job.lease_owner is None
+        assert page.url in warning.call_args.args
 
 
 async def test_uncertain_intent_recovers_from_cdx_without_resubmitting(
@@ -518,8 +522,13 @@ async def test_poll_pending_timeout_fails_and_reschedules_immediately(
         assert job.lease_owner is None
 
 
-async def test_poll_terminal_failure_records_service_code(database: Database):
-    client = FakeArchiveClient(status_result=FailedStatus("remote-1", "robots-denied"))
+@pytest.mark.parametrize("service_code", ["robots-denied", "error:service-unavailable"])
+async def test_poll_terminal_failure_records_service_code(
+    database: Database, monkeypatch, service_code: str
+):
+    client = FakeArchiveClient(status_result=FailedStatus("remote-1", service_code))
+    warning = MagicMock()
+    monkeypatch.setattr(archive.logger, "warning", warning)
     async with database.sessions() as session:
         domain, page = await add_page(session)
         job = await add_job(
@@ -541,11 +550,12 @@ async def test_poll_terminal_failure_records_service_code(database: Database):
         )
 
         assert job.state is ArchiveJobState.FAILED
-        assert job.service_code == "robots-denied"
+        assert job.service_code == service_code
         assert job.completed_at == NOW
         assert page.next_archive_at == NOW + SETTINGS.interval
         assert job.lease_owner is None
         assert await session.scalar(select(Capture)) is None
+        assert warning.call_args.args[-1] == page.url
 
 
 @pytest.mark.parametrize("service_code", ["error:no-captures", "error:not-found"])
@@ -584,11 +594,13 @@ async def test_poll_retryable_service_failure_enters_recovery(
         assert job.lease_owner is None
 
 
+@pytest.mark.parametrize("service_code", ["error:no-captures", "error:not-found"])
 async def test_poll_retryable_service_failure_stops_at_attempt_limit(
-    database: Database,
+    database: Database, monkeypatch, service_code: str
 ):
-    service_code = "error:no-captures"
     client = FakeArchiveClient(status_result=FailedStatus("remote-1", service_code))
+    warning = MagicMock()
+    monkeypatch.setattr(archive.logger, "warning", warning)
     async with database.sessions() as session:
         domain, page = await add_page(session)
         job = await add_job(
@@ -616,6 +628,7 @@ async def test_poll_retryable_service_failure_stops_at_attempt_limit(
         assert job.attempts == SETTINGS.max_attempts
         assert job.completed_at == NOW
         assert page.next_archive_at == NOW + SETTINGS.interval
+        assert warning.call_args.args[-1] == page.url
 
 
 async def test_poll_http_not_found_delays_history_recovery(database: Database):
