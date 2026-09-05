@@ -40,8 +40,12 @@ def make_report(**overrides: object) -> Report:
         "discovered_count": 5,
         "archived_count": 3,
         "outstanding_count": 2,
+        "lifetime_discovered_count": 5,
+        "lifetime_archived_count": 3,
         "first_archive_count": 1,
+        "lifetime_first_archive_count": 1,
         "deactivated_count": 1,
+        "lifetime_deactivated_count": 1,
         "active_domain_count": 4,
         "state": ReportState.PENDING,
         "attempts": 0,
@@ -258,7 +262,11 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
             report.first_archive_count,
             report.deactivated_count,
             report.active_domain_count,
-        ) == (2, 2, 2, 1, 2, 1)
+            report.lifetime_discovered_count,
+            report.lifetime_archived_count,
+            report.lifetime_first_archive_count,
+            report.lifetime_deactivated_count,
+        ) == (2, 2, 2, 1, 2, 1, 7, 2, 1, 3)
         assert report.state is ReportState.PENDING
         assert report.next_attempt_at == generated
 
@@ -343,7 +351,7 @@ async def test_create_report_counts_late_capture_in_completion_window(sessions):
 
 async def test_create_report_raises_if_insert_cannot_be_read():
     session = MagicMock()
-    session.scalar = AsyncMock(side_effect=[None, None, None, None, None, None, None])
+    session.scalar = AsyncMock(side_effect=[None] * 11)
     session.execute = AsyncMock()
     session.commit = AsyncMock()
 
@@ -359,7 +367,11 @@ def test_build_report_webhook_uses_archival_report_layout():
         archived_count=1_000,
         outstanding_count=234,
         first_archive_count=123,
+        lifetime_discovered_count=12_345,
+        lifetime_archived_count=10_000,
+        lifetime_first_archive_count=1_234,
         deactivated_count=12,
+        lifetime_deactivated_count=123,
         active_domain_count=2_345,
     )
     previous_report = make_report(
@@ -394,14 +406,11 @@ def test_build_report_webhook_uses_archival_report_layout():
     ]
     assert container.components[0].content == "## Archival Report"
     assert container.components[1].content == (
-        "### Domains\n"
-        "- Crawled: **2,345** (+45)\n"
-        "### Pages\n"
-        "- Discovered: **1,234** (+16)\n"
-        "- Archived: **1,000** (-10)\n"
-        "  - First Archives: **123** (+23)\n"
-        "- Deactivated: **12** (+2)\n"
-        "- Pending: **234** (+0)"
+        "- Discovered: **1,234** (+16) | **12,345** Lifetime\n"
+        "- Archived: **1,000** (-10) | **10,000** Lifetime\n"
+        "  - First Archives: **123** (+23) | **1,234** Lifetime\n"
+        "- Deactivated: **12** (+2) | **123** Lifetime\n"
+        "- Pending: **234**"
     )
     assert container.components[2].divider is True
     assert container.components[2].spacing == 1
@@ -433,13 +442,10 @@ def test_build_report_webhook_uses_zero_baseline_for_first_report():
     )
 
     assert webhook.components[0].components[1].content == (
-        "### Domains\n"
-        "- Crawled: **4** (+4)\n"
-        "### Pages\n"
-        "- Discovered: **5** (+5)\n"
-        "- Archived: **3** (+3)\n"
-        "  - First Archives: **1** (+1)\n"
-        "- Deactivated: **1** (+1)\n"
+        "- Discovered: **5** (+5) | **5** Lifetime\n"
+        "- Archived: **3** (+3) | **3** Lifetime\n"
+        "  - First Archives: **1** (+1) | **1** Lifetime\n"
+        "- Deactivated: **1** (+1) | **1** Lifetime\n"
         "- Pending: **2** (+2)"
     )
 

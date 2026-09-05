@@ -249,10 +249,22 @@ class Report(Base):
     discovered_count: Mapped[int] = mapped_column(Integer)
     archived_count: Mapped[int] = mapped_column(Integer)
     outstanding_count: Mapped[int] = mapped_column(Integer)
+    lifetime_discovered_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    lifetime_archived_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
     first_archive_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0"
     )
+    lifetime_first_archive_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
     deactivated_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0"
+    )
+    lifetime_deactivated_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0"
     )
     active_domain_count: Mapped[int] = mapped_column(Integer)

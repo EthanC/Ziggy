@@ -91,6 +91,23 @@ async def create_report(
     active_domains = await session.scalar(
         select(func.count(Domain.id)).where(Domain.active.is_(True))
     )
+    lifetime_discovered = await session.scalar(
+        select(func.count(Page.id)).where(Page.discovered_at < window.end)
+    )
+    lifetime_archived = await session.scalar(
+        select(func.count(distinct(Capture.page_id))).where(
+            Capture.completed_at < window.end
+        )
+    )
+    lifetime_first_archives = await session.scalar(
+        select(func.count(Capture.id)).where(
+            Capture.completed_at < window.end,
+            Capture.first_archive.is_(True),
+        )
+    )
+    lifetime_deactivated = await session.scalar(
+        select(func.count(Page.id)).where(Page.deactivated_at < window.end)
+    )
     discovered_count = discovered or 0
     archived_count = archived or 0
     await session.execute(
@@ -102,8 +119,12 @@ async def create_report(
             discovered_count=discovered_count,
             archived_count=archived_count,
             outstanding_count=outstanding or 0,
+            lifetime_discovered_count=lifetime_discovered or 0,
+            lifetime_archived_count=lifetime_archived or 0,
             first_archive_count=first_archives or 0,
+            lifetime_first_archive_count=lifetime_first_archives or 0,
             deactivated_count=deactivated or 0,
+            lifetime_deactivated_count=lifetime_deactivated or 0,
             active_domain_count=active_domains or 0,
             state=ReportState.PENDING,
             next_attempt_at=generated_at,
@@ -126,9 +147,6 @@ def build_report_webhook(
     report: Report, webhook_url: str, previous_report: Report | None = None
 ) -> Webhook:
     """Construct the required Components v2 message without legacy fields."""
-    previous_active_domains = (
-        previous_report.active_domain_count if previous_report is not None else 0
-    )
     previous_discovered = (
         previous_report.discovered_count if previous_report is not None else 0
     )
@@ -147,46 +165,40 @@ def build_report_webhook(
     first_archive_change = _change_stat(
         report.first_archive_count, previous_first_archives
     )
-    domain_stats = Markdown.bulleted_list(
-        [
-            (
-                f"Crawled: {Markdown.bold(f'{report.active_domain_count:,}')} "
-                f"{_change_stat(report.active_domain_count, previous_active_domains)}"
-            )
-        ]
-    )
     page_stats = Markdown.bulleted_list(
         [
             (
-                f"Discovered: {Markdown.bold(f'{report.discovered_count:,}')} "
-                f"{_change_stat(report.discovered_count, previous_discovered)}"
+                f"Discovered: {Markdown.bold(f'{report.discovered_count:,}')}"
+                f"{_change_stat(report.discovered_count, previous_discovered)} | "
+                f"{Markdown.bold(f'{report.lifetime_discovered_count:,}')} Lifetime"
             ),
             (
-                f"Archived: {Markdown.bold(f'{report.archived_count:,}')} "
-                f"{_change_stat(report.archived_count, previous_archived)}"
+                f"Archived: {Markdown.bold(f'{report.archived_count:,}')}"
+                f"{_change_stat(report.archived_count, previous_archived)} | "
+                f"{Markdown.bold(f'{report.lifetime_archived_count:,}')} Lifetime"
             ),
             {
                 "value": (
                     "First Archives: "
-                    f"{Markdown.bold(f'{report.first_archive_count:,}')} "
-                    f"{first_archive_change}"
+                    f"{Markdown.bold(f'{report.first_archive_count:,}')}"
+                    f"{first_archive_change} | "
+                    f"{Markdown.bold(f'{report.lifetime_first_archive_count:,}')} "
+                    "Lifetime"
                 ),
                 "indent": 1,
             },
             (
-                f"Deactivated: {Markdown.bold(f'{report.deactivated_count:,}')} "
-                f"{_change_stat(report.deactivated_count, previous_deactivated)}"
+                f"Deactivated: {Markdown.bold(f'{report.deactivated_count:,}')}"
+                f"{_change_stat(report.deactivated_count, previous_deactivated)} | "
+                f"{Markdown.bold(f'{report.lifetime_deactivated_count:,}')} Lifetime"
             ),
             (
-                f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')} "
+                f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')}"
                 f"{_change_stat(report.outstanding_count, previous_outstanding)}"
             ),
         ]
     )
-    counts = (
-        f"{Markdown.header_3('Domains')}\n{domain_stats}\n"
-        f"{Markdown.header_3('Pages')}\n{page_stats}"
-    )
+    counts = page_stats
     context = Markdown.subtext(
         f"Report for {Timestamp.short_date(report.window_start)} to "
         f"{Timestamp.short_date(report.window_end)} "
@@ -324,7 +336,8 @@ def _release_report(report: Report) -> None:
 
 
 def _change_stat(current: int, previous: int) -> str:
-    return f"({current - previous:+,})"
+    change = current - previous
+    return "" if change == 0 else f" ({change:+,})"
 
 
 def _message_metadata(payload: object) -> tuple[str, str, str | None] | None:

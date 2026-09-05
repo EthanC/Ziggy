@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "b81f4d2a6e90"
+HEAD_REVISION = "d92e7a4c1f63"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -147,6 +147,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     ).is_file()
     assert migrations.joinpath(
         "versions", "b81f4d2a6e90_add_report_deactivated_count.py"
+    ).is_file()
+    assert migrations.joinpath(
+        "versions", "d92e7a4c1f63_add_report_lifetime_counts.py"
     ).is_file()
 
 
@@ -279,6 +282,91 @@ async def test_deactivation_report_migration_backfills_existing_rows(tmp_path):
                 await connection.scalar(text("SELECT deactivated_count FROM reports"))
                 == 0
             )
+    finally:
+        await engine.dispose()
+
+
+async def test_lifetime_report_migration_backfills_existing_rows(tmp_path):
+    path = tmp_path / "lifetime-report-upgrade.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "b81f4d2a6e90")
+    engine = create_engine(path)
+    before = "2026-08-27T09:00:00.000000+00:00"
+    end = "2026-08-28T09:00:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(id, host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) VALUES "
+                    "(1, 'example.com', 'https', 0, 1, :before, :before)"
+                ),
+                {"before": before},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(id, domain_id, url, active, in_scope, discovered_at, "
+                    "deactivated_at, next_crawl_at, next_archive_at, sitemap_depth, "
+                    "crawl_attempts) VALUES "
+                    "(1, 1, 'https://example.com/archived', 0, 1, :before, "
+                    ":before, :before, :before, 0, 0), "
+                    "(2, 1, 'https://example.com/pending', 1, 1, :before, "
+                    "NULL, :before, :before, 0, 0), "
+                    "(3, 1, 'https://example.com/boundary', 0, 1, :end, "
+                    ":end, :end, :end, 0, 0)"
+                ),
+                {"before": before, "end": end},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, intent_at, "
+                    "next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed) VALUES "
+                    "('job', 1, 'DIRECT', 'SUCCEEDED', 'cycle', :before, "
+                    ":before, 0, 1, 1)"
+                ),
+                {"before": before},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO captures "
+                    "(page_id, archive_job_id, captured_at, wayback_url, "
+                    "completed_at, first_archive) VALUES "
+                    "(1, 'job', :before, 'https://web.archive.org/capture', "
+                    ":before, 1)"
+                ),
+                {"before": before},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reports "
+                    "(window_start, window_end, generated_at, discovered_count, "
+                    "archived_count, outstanding_count, first_archive_count, "
+                    "deactivated_count, active_domain_count, state, attempts, "
+                    "next_attempt_at) VALUES "
+                    "(:before, :end, :end, 2, 1, 1, 1, 1, 1, 'PENDING', 0, :end)"
+                ),
+                {"before": before, "end": end},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.connect() as connection:
+            result = (
+                await connection.execute(
+                    text(
+                        "SELECT lifetime_discovered_count, "
+                        "lifetime_archived_count, lifetime_first_archive_count, "
+                        "lifetime_deactivated_count FROM reports"
+                    )
+                )
+            ).one()
+            assert result == (2, 1, 1, 1)
     finally:
         await engine.dispose()
 
