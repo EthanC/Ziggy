@@ -299,7 +299,9 @@ async def test_heartbeat_updates_and_commits_once(monkeypatch):
     session.commit.assert_awaited_once_with()
 
 
-async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path):
+async def test_run_service_owns_startup_tasks_and_cleanup(  # noqa: PLR0915
+    monkeypatch, tmp_path
+):
     config = make_config(tmp_path / "data" / "ziggy.sqlite3")
     secrets = make_secrets()
     logging_controller = SimpleNamespace(configure=MagicMock(), close=AsyncMock())
@@ -315,6 +317,7 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
     session = MagicMock(add=MagicMock(), commit=AsyncMock(), execute=AsyncMock())
     sessions = Sessions(session)
     remove_signals = MagicMock()
+    heartbeat_started = asyncio.Event()
     monkeypatch.setattr(service, "load_config", MagicMock(return_value=config))
     monkeypatch.setattr(service, "resolve_secrets", MagicMock(return_value=secrets))
     monkeypatch.setattr(
@@ -331,7 +334,13 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
     monkeypatch.setattr(
         service, "_install_signal_handlers", MagicMock(return_value=remove_signals)
     )
-    monkeypatch.setattr(service, "reconcile_domains", AsyncMock())
+
+    async def reconcile(*_args):
+        await asyncio.sleep(0)
+        assert session.add.called
+        assert heartbeat_started.is_set()
+
+    monkeypatch.setattr(service, "reconcile_domains", AsyncMock(side_effect=reconcile))
     release = AsyncMock()
     monkeypatch.setattr(service, "release_leases", release)
     workers = [
@@ -340,12 +349,19 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
         "_archive_submission_scheduler",
         "_archive_poll_scheduler",
         "_report_scheduler",
-        "_heartbeat",
     ]
     worker_mocks = {}
     for name in workers:
         worker_mocks[name] = AsyncMock()
         monkeypatch.setattr(service, name, worker_mocks[name])
+    worker_mocks["_config_watcher"].side_effect = [database_lock(), None]
+
+    async def heartbeat(*_args):
+        heartbeat_started.set()
+
+    heartbeat_mock = AsyncMock(side_effect=heartbeat)
+    monkeypatch.setattr(service, "_heartbeat", heartbeat_mock)
+    monkeypatch.setattr(service, "_wait", AsyncMock())
 
     await service.run_service(tmp_path / "ziggy.toml")
 
@@ -353,8 +369,12 @@ async def test_run_service_owns_startup_tasks_and_cleanup(monkeypatch, tmp_path)
     archive_client.login.assert_awaited_once_with()
     archive_client.my_web_archive_url.assert_awaited_once_with()
     assert session.add.call_args.args[0].instance_id == "fixed-instance"
-    for worker in worker_mocks.values():
+    for name, worker in worker_mocks.items():
+        if name == "_config_watcher":
+            assert worker.await_count == 2
+            continue
         worker.assert_awaited_once()
+    heartbeat_mock.assert_awaited_once()
     remove_signals.assert_called_once_with()
     release.assert_awaited_once_with(session, "fixed-instance")
     assert session.execute.await_count == 2

@@ -145,15 +145,28 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
         now = datetime.now(UTC)
         state.started_at = now
         async with sessions() as session:
-            await reconcile_domains(session, config, now)
             session.add(
                 ServiceState(instance_id=instance_id, started_at=now, heartbeat_at=now)
             )
             await session.commit()
-        logger.info("Ziggy service started")
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(
-                _config_watcher(config_path, state, sessions, stop),
+                _run_resilient_worker(
+                    "heartbeat",
+                    lambda: _heartbeat(sessions, instance_id, stop),
+                    stop,
+                ),
+                name="heartbeat",
+            )
+            async with sessions() as session:
+                await reconcile_domains(session, config, now)
+            logger.info("Ziggy service started")
+            tasks.create_task(
+                _run_resilient_worker(
+                    "configuration watcher",
+                    lambda: _config_watcher(config_path, state, sessions, stop),
+                    stop,
+                ),
                 name="config-watcher",
             )
             tasks.create_task(
@@ -189,14 +202,6 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
                     stop,
                 ),
                 name="report-scheduler",
-            )
-            tasks.create_task(
-                _run_resilient_worker(
-                    "heartbeat",
-                    lambda: _heartbeat(sessions, instance_id, stop),
-                    stop,
-                ),
-                name="heartbeat",
             )
     except Exception:
         logger.exception("Ziggy service failed")
