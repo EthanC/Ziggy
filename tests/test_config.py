@@ -51,7 +51,7 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.ziggy.database == (tmp_path / "ziggy.db").resolve()
     assert config.ziggy.config_reload_interval == timedelta(seconds=30)
     assert config.crawl.interval == timedelta(hours=24)
-    assert config.crawl.concurrency == 8
+    assert config.crawl.concurrency == 2
     assert config.crawl.per_host_concurrency == 2
     assert config.crawl.request_delay == 1.0
     assert config.crawl.request_timeout == 30.0

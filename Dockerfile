@@ -31,6 +31,6 @@ COPY --from=builder /app /app
 COPY ziggy ./ziggy
 ENV PATH="/app/.venv/bin:${PATH}" PYTHONUNBUFFERED=1
 USER 10001:10001
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10m --retries=3 \
     CMD ["python", "-m", "ziggy", "healthcheck", "--config", "/ziggy/ziggy.toml"]
 CMD ["python", "-m", "ziggy", "run", "--config", "/ziggy/ziggy.toml"]

@@ -4,7 +4,7 @@ config_reload_interval = "30s"
 
 [crawl]
 interval = "24h"
-concurrency = 8
+concurrency = 2
 per_host_concurrency = 2
 request_delay = 1.0
 request_timeout = 30.0

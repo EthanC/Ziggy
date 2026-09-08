@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ziggy.archive import (
@@ -55,7 +56,7 @@ from ziggy.reporting import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -156,22 +157,47 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
                 name="config-watcher",
             )
             tasks.create_task(
-                _crawl_scheduler(state, sessions, instance_id, stop),
+                _run_resilient_worker(
+                    "crawl scheduler",
+                    lambda: _crawl_scheduler(state, sessions, instance_id, stop),
+                    stop,
+                ),
                 name="crawl-scheduler",
             )
             tasks.create_task(
-                _archive_submission_scheduler(state, sessions, instance_id, stop),
+                _run_resilient_worker(
+                    "archive submission scheduler",
+                    lambda: _archive_submission_scheduler(
+                        state, sessions, instance_id, stop
+                    ),
+                    stop,
+                ),
                 name="archive-submission-scheduler",
             )
             tasks.create_task(
-                _archive_poll_scheduler(state, sessions, instance_id, stop),
+                _run_resilient_worker(
+                    "archive polling scheduler",
+                    lambda: _archive_poll_scheduler(state, sessions, instance_id, stop),
+                    stop,
+                ),
                 name="archive-poll-scheduler",
             )
             tasks.create_task(
-                _report_scheduler(state, sessions, instance_id, stop),
+                _run_resilient_worker(
+                    "report scheduler",
+                    lambda: _report_scheduler(state, sessions, instance_id, stop),
+                    stop,
+                ),
                 name="report-scheduler",
             )
-            tasks.create_task(_heartbeat(sessions, instance_id, stop), name="heartbeat")
+            tasks.create_task(
+                _run_resilient_worker(
+                    "heartbeat",
+                    lambda: _heartbeat(sessions, instance_id, stop),
+                    stop,
+                ),
+                name="heartbeat",
+            )
     except Exception:
         logger.exception("Ziggy service failed")
         raise
@@ -193,6 +219,33 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
         await engine.dispose()
         logger.info("Ziggy service stopped")
         await logging_controller.close()
+
+
+async def _run_resilient_worker(
+    name: str,
+    worker: Callable[[], Awaitable[None]],
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        try:
+            await worker()
+        except Exception as error:
+            if not _is_database_lock(error):
+                raise
+            logger.warning("Transient SQLite lock in {}; retrying", name)
+            await _wait(stop, _IDLE_DELAY)
+        else:
+            return
+
+
+def _is_database_lock(error: BaseException) -> bool:
+    if isinstance(error, BaseExceptionGroup):
+        return all(_is_database_lock(nested) for nested in error.exceptions)
+    return (
+        isinstance(error, OperationalError)
+        and isinstance(error.orig, sqlite3.OperationalError)
+        and "locked" in str(error.orig).casefold()
+    )
 
 
 async def _config_watcher(

@@ -352,8 +352,11 @@ async def test_reconcile_domains_adds_removes_readds_and_deduplicates_seeds(data
         }
 
 
-async def test_reconcile_domains_transfers_and_deactivates_retained_pages(database):
+async def test_reconcile_domains_transfers_and_deactivates_retained_pages(
+    database, monkeypatch
+):
     _, sessions = database
+    monkeypatch.setattr(database_module, "_RECONCILE_BATCH_SIZE", 1)
     now = datetime(2026, 8, 28, 9, tzinfo=UTC)
     broad = SimpleNamespace(
         domains=(DomainSettings("example.com", include_subdomains=True),)

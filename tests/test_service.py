@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sqlite3
 from contextlib import AbstractAsyncContextManager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ziggy import service
@@ -39,6 +40,10 @@ from ziggy.models import Base, ServiceState
 
 
 NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
+
+
+def database_lock(message: str = "database is locked") -> OperationalError:
+    return OperationalError("UPDATE example", {}, sqlite3.OperationalError(message))
 
 
 def make_config(database: Path = Path("ziggy.sqlite3"), **changes: object) -> Config:
@@ -138,6 +143,54 @@ async def test_wait_returns_when_event_is_set_and_when_timeout_expires():
     running = asyncio.Event()
     await service._wait(running, 0)
     assert not running.is_set()
+
+
+async def test_resilient_worker_retries_database_lock(monkeypatch):
+    worker = AsyncMock(side_effect=[database_lock(), None])
+    stop = asyncio.Event()
+    wait = AsyncMock()
+    warning = MagicMock()
+    monkeypatch.setattr(service, "_wait", wait)
+    monkeypatch.setattr(service.logger, "warning", warning)
+
+    await service._run_resilient_worker("worker", worker, stop)
+
+    assert worker.await_count == 2
+    wait.assert_awaited_once_with(stop, service._IDLE_DELAY)
+    warning.assert_called_once_with("Transient SQLite lock in {}; retrying", "worker")
+
+
+async def test_resilient_worker_stops_after_nested_database_lock(monkeypatch):
+    lock = ExceptionGroup("worker failed", [database_lock("database table is locked")])
+    worker = AsyncMock(side_effect=lock)
+    stop = asyncio.Event()
+
+    async def stop_wait(event, seconds):
+        assert event is stop
+        assert seconds == service._IDLE_DELAY
+        event.set()
+
+    monkeypatch.setattr(service, "_wait", stop_wait)
+
+    await service._run_resilient_worker("worker", worker, stop)
+
+    worker.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("failure"),
+        OperationalError("SELECT 1", {}, sqlite3.OperationalError("disk I/O error")),
+        OperationalError("SELECT 1", {}, RuntimeError("database is locked")),
+        ExceptionGroup("mixed", [database_lock(), RuntimeError("failure")]),
+    ],
+)
+async def test_resilient_worker_preserves_non_lock_errors(error):
+    with pytest.raises(type(error)):
+        await service._run_resilient_worker(
+            "worker", AsyncMock(side_effect=error), asyncio.Event()
+        )
 
 
 def test_signal_handlers_set_stop_and_are_removed(monkeypatch):

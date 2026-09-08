@@ -7,6 +7,7 @@ import sqlite3
 from contextlib import closing
 from importlib import resources
 from typing import TYPE_CHECKING, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
@@ -25,7 +26,6 @@ from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
     query_base_url,
     sensitive_query_key,
-    url_in_scope,
 )
 
 if TYPE_CHECKING:
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ziggy.config import Config, DomainSettings
 
 WorkKind = Literal["crawl", "archive"]
+_RECONCILE_BATCH_SIZE = 1_000
 _PRE_QUERY_FRONTIER_REVISIONS = {
     None,
     "6b519c405276",
@@ -199,14 +200,14 @@ def _database_revision(path: Path) -> str | None:
         return None if row is None else str(row[0])
 
 
-async def reconcile_domains(
+async def reconcile_domains(  # noqa: C901
     session: AsyncSession, config: Config, now: datetime
 ) -> None:
-    """Apply a complete domain replacement and reconcile retained pages."""
+    """Apply a complete domain replacement and reconcile retained pages in batches."""
     await session.execute(text("BEGIN IMMEDIATE"))
     configured_hosts = {domain.host for domain in config.domains}
     existing = {domain.host: domain for domain in await session.scalars(select(Domain))}
-    configured: list[tuple[DomainSettings, Domain]] = []
+    configured: list[tuple[DomainSettings, int]] = []
     for settings in config.domains:
         domain = existing.get(settings.host)
         if domain is None:
@@ -226,34 +227,52 @@ async def reconcile_domains(
             domain.active = True
             domain.configured_at = now
             domain.deactivated_at = None
-        configured.append((settings, domain))
+        configured.append((settings, domain.id))
     for host, domain in existing.items():
         if host not in configured_hosts and domain.active:
             domain.active = False
             domain.deactivated_at = now
+    await session.commit()
 
-    for page in await session.scalars(select(Page)):
-        if page.blocked_reason is not None or sensitive_query_key(page.url) is not None:
-            page.blocked_reason = page.blocked_reason or "sensitive_query"
-            page.in_scope = False
-            continue
-        owner = next(
-            (
-                domain
-                for settings, domain in configured
-                if url_in_scope(
-                    page.url,
-                    settings.host,
-                    include_subdomains=settings.include_subdomains,
-                )
-            ),
-            None,
+    configured_by_host = {
+        settings.host: (settings.include_subdomains, domain_id)
+        for settings, domain_id in configured
+    }
+    last_page_id = 0
+    while pages := (
+        await session.scalars(
+            select(Page)
+            .where(Page.id > last_page_id)
+            .order_by(Page.id)
+            .limit(_RECONCILE_BATCH_SIZE)
         )
-        page.in_scope = owner is not None
-        if owner is not None:
-            page.domain_id = owner.id
+    ).all():
+        for page in pages:
+            if (
+                page.blocked_reason is not None
+                or sensitive_query_key(page.url) is not None
+            ):
+                page.blocked_reason = page.blocked_reason or "sensitive_query"
+                page.in_scope = False
+                continue
+            page_host = urlsplit(page.url).hostname
+            owner = configured_by_host.get(page_host or "")
+            if owner is None and page_host is not None:
+                owner = next(
+                    (
+                        candidate
+                        for host, candidate in configured_by_host.items()
+                        if candidate[0] and page_host.endswith(f".{host}")
+                    ),
+                    None,
+                )
+            page.in_scope = owner is not None
+            if owner is not None:
+                page.domain_id = owner[1]
+        last_page_id = pages[-1].id
+        await session.commit()
 
-    for settings, domain in configured:
+    for settings, domain_id in configured:
         query_variant_cap = getattr(
             getattr(config, "crawl", None),
             "max_query_variants_per_base",
@@ -263,7 +282,7 @@ async def reconcile_domains(
             session,
             [
                 {
-                    "domain_id": domain.id,
+                    "domain_id": domain_id,
                     "url": url,
                     "in_scope": True,
                     "discovered_at": now,
