@@ -23,6 +23,11 @@ Ziggy crawls and preserves the websites you care about.
 
 Create `/path/to/ziggy`, copy `ziggy.example.toml` to `/path/to/ziggy/ziggy.toml`, and configure the domains to crawl. Copy `.env.example` to `.env` and create `compose.yaml` beside it. Internet Archive credentials are optional; set `ZIGGY_INTERNET_ARCHIVE_EMAIL` to the account email address and `ZIGGY_INTERNET_ARCHIVE_PASSWORD` to its password. Authenticated captures also request screenshots and add captures to My Web Archive.
 
+| Environment variable | Description | Required | Default |
+| --- | --- | :---: | --- |
+| `PUID` | UID used by the Docker container process and files under `/ziggy` | No | `1000` |
+| `PGID` | GID used by the Docker container process and files under `/ziggy` | No | `1000` |
+
 ```yaml
 services:
   ziggy:
@@ -34,7 +39,7 @@ services:
     restart: unless-stopped
 ```
 
-On Linux, `/path/to/ziggy` must be writable by UID/GID `10001` so Ziggy can create `ziggy.db` and its sidecar files.
+At startup, the container recursively assigns `/ziggy` to `PUID:PGID`, then runs Ziggy with those IDs. Use a dedicated directory for this mount. When Docker starts the container with `--user`, the container cannot change ownership or apply different `PUID` and `PGID` values.
 
 Start Ziggy:
 

@@ -37,7 +37,7 @@ jobs:
             coverage.xml
             htmlcov/
       - name: Build image
-        run: docker build --build-arg REVISION=${{ github.sha }} -t ziggy:test .
+        run: docker build --pull --build-arg REVISION=${{ github.sha }} -t ziggy:test .
       - name: Smoke-test image
         run: >-
           docker run --rm
