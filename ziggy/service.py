@@ -23,6 +23,7 @@ from ziggy.archive import (
     ArchiveRateLimitError,
     ArchivistClient,
     available_archive_submission_slots,
+    check_archive_history,
     claim_archive_job,
     create_archive_intent,
     poll_archive_job,
@@ -38,6 +39,7 @@ from ziggy.config import (
 )
 from ziggy.crawler import CrawlerClient, FetchError, crawl_page
 from ziggy.database import (
+    claim_due_archive_history_check,
     claim_due_page,
     create_engine,
     database_url,
@@ -176,6 +178,16 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
                     stop,
                 ),
                 name="crawl-scheduler",
+            )
+            tasks.create_task(
+                _run_resilient_worker(
+                    "archive history scheduler",
+                    lambda: _archive_history_scheduler(
+                        state, sessions, instance_id, stop
+                    ),
+                    stop,
+                ),
+                name="archive-history-scheduler",
             )
             tasks.create_task(
                 _run_resilient_worker(
@@ -401,7 +413,12 @@ async def _archive_submission_scheduler(
         for _ in range(available_slots):
             async with sessions() as session:
                 page = await claim_due_page(
-                    session, "archive", instance_id, datetime.now(UTC), _LEASE_DURATION
+                    session,
+                    "archive",
+                    instance_id,
+                    datetime.now(UTC),
+                    _LEASE_DURATION,
+                    archive_interval=state.config.archive.interval,
                 )
             if page is None:
                 break
@@ -415,6 +432,54 @@ async def _archive_submission_scheduler(
                     _submit_one(state, sessions, page_id),
                     name=f"archive-submit-{page_id}",
                 )
+
+
+async def _archive_history_scheduler(
+    state: RuntimeState,
+    sessions: async_sessionmaker[AsyncSession],
+    instance_id: str,
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        async with sessions() as session:
+            page = await claim_due_archive_history_check(
+                session, instance_id, datetime.now(UTC), _LEASE_DURATION
+            )
+        if page is None:
+            await _wait(stop, _IDLE_DELAY)
+            continue
+        await _check_archive_history_one(state, sessions, page.id)
+
+
+async def _check_archive_history_one(
+    state: RuntimeState,
+    sessions: async_sessionmaker[AsyncSession],
+    page_id: int,
+) -> None:
+    async with sessions() as session:
+        page = await session.get(Page, page_id)
+        if page is None:
+            return
+        if (
+            not page.active
+            or not page.in_scope
+            or page.blocked_reason is not None
+            or page.status_code is None
+            or not _SUCCESS_MIN <= page.status_code <= _SUCCESS_MAX
+            or page.error is not None
+        ):
+            page.archive_history_lease_owner = None
+            page.archive_history_lease_expires_at = None
+            await session.commit()
+            return
+        # Do not retain a SQLite read snapshot while querying Internet Archive.
+        await session.commit()
+        try:
+            await check_archive_history(
+                session, page, state.archive_client, datetime.now(UTC)
+            )
+        except Exception as error:  # noqa: BLE001 - isolate one leased page.
+            await _archive_history_worker_failure(session, page, error)
 
 
 async def _archive_submission_slots(
@@ -761,6 +826,19 @@ async def _archive_worker_failure(
     job.next_attempt_at = datetime.now(UTC) + timedelta(minutes=1)
     await session.commit()
     logger.exception("Unexpected archive worker failure: {}", page.url)
+
+
+async def _archive_history_worker_failure(
+    session: AsyncSession, page: Page, error: Exception
+) -> None:
+    await session.rollback()
+    page.archive_history_check_attempts += 1
+    page.archive_history_check_error = type(error).__name__
+    page.next_archive_history_check_at = datetime.now(UTC) + timedelta(minutes=1)
+    page.archive_history_lease_owner = None
+    page.archive_history_lease_expires_at = None
+    await session.commit()
+    logger.exception("Unexpected archive history worker failure: {}", page.url)
 
 
 async def _wait(stop: asyncio.Event, seconds: float) -> None:

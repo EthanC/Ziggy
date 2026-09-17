@@ -141,6 +141,17 @@ class Page(Base):
     crawl_lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     archive_lease_owner: Mapped[str | None] = mapped_column(String(36))
     archive_lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    archive_history_checked_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    latest_archive_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    next_archive_history_check_at: Mapped[datetime | None] = mapped_column(
+        UtcDateTime(), default=utc_now
+    )
+    archive_history_check_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    archive_history_check_error: Mapped[str | None] = mapped_column(Text)
+    archive_history_lease_owner: Mapped[str | None] = mapped_column(String(36))
+    archive_history_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        UtcDateTime()
+    )
     query_base_url: Mapped[str | None] = mapped_column(Text)
     query_variant_slot: Mapped[int | None] = mapped_column(Integer)
     blocked_reason: Mapped[str | None] = mapped_column(String(32))
@@ -148,6 +159,11 @@ class Page(Base):
     __table_args__ = (
         Index("ix_pages_due_crawl", "next_crawl_at", "crawl_lease_expires_at"),
         Index("ix_pages_due_archive", "next_archive_at", "archive_lease_expires_at"),
+        Index(
+            "ix_pages_due_archive_history",
+            "next_archive_history_check_at",
+            "archive_history_lease_expires_at",
+        ),
         Index("ix_pages_domain", "domain_id"),
         Index(
             "uq_pages_query_variant_slot",

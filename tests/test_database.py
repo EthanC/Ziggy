@@ -12,6 +12,7 @@ from sqlalchemy.exc import StatementError
 from ziggy import database as database_module
 from ziggy.config import DomainSettings
 from ziggy.database import (
+    claim_due_archive_history_check,
     claim_due_page,
     create_engine,
     database_url,
@@ -425,7 +426,14 @@ async def test_claim_due_page_skips_out_of_scope_pages(database, kind):
         await session.commit()
 
         assert (
-            await claim_due_page(session, kind, "worker", now, timedelta(minutes=10))
+            await claim_due_page(
+                session,
+                kind,
+                "worker",
+                now,
+                timedelta(minutes=10),
+                archive_interval=(timedelta(days=365) if kind == "archive" else None),
+            )
             is None
         )
 
@@ -479,7 +487,14 @@ async def test_claim_due_page_is_atomic_and_respects_lease_expiry(database, kind
 
     async def claim(owner, claim_time):
         async with sessions() as session:
-            return await claim_due_page(session, kind, owner, claim_time, duration)
+            return await claim_due_page(
+                session,
+                kind,
+                owner,
+                claim_time,
+                duration,
+                archive_interval=(timedelta(days=365) if kind == "archive" else None),
+            )
 
     first_attempts = await asyncio.gather(
         claim("worker-a", now), claim("worker-b", now)
@@ -513,7 +528,14 @@ async def test_claim_due_page_skips_pages_from_inactive_domains(database, kind):
 
     async with sessions() as session:
         assert (
-            await claim_due_page(session, kind, "worker", now, timedelta(minutes=10))
+            await claim_due_page(
+                session,
+                kind,
+                "worker",
+                now,
+                timedelta(minutes=10),
+                archive_interval=(timedelta(days=365) if kind == "archive" else None),
+            )
             is None
         )
 
@@ -530,7 +552,12 @@ async def test_archive_claim_skips_inactive_pages(database):
 
         assert (
             await claim_due_page(
-                session, "archive", "worker", now, timedelta(minutes=10)
+                session,
+                "archive",
+                "worker",
+                now,
+                timedelta(minutes=10),
+                archive_interval=timedelta(days=365),
             )
             is None
         )
@@ -607,7 +634,12 @@ async def test_archive_claim_is_blocked_by_every_active_direct_job_state(databas
             await session.commit()
             assert (
                 await claim_due_page(
-                    session, "archive", "worker", now, timedelta(minutes=10)
+                    session,
+                    "archive",
+                    "worker",
+                    now,
+                    timedelta(minutes=10),
+                    archive_interval=timedelta(days=365),
                 )
                 is None
             )
@@ -615,27 +647,42 @@ async def test_archive_claim_is_blocked_by_every_active_direct_job_state(databas
         job.state = ArchiveJobState.SUCCEEDED
         await session.commit()
         claimed = await claim_due_page(
-            session, "archive", "worker", now, timedelta(minutes=10)
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=10),
+            archive_interval=timedelta(days=365),
         )
         assert claimed is not None
         assert claimed.id == page.id
 
 
-async def test_archive_claim_prioritizes_pages_without_captures(database):
+async def test_archive_claim_prioritizes_stale_then_unknown_then_recent(database):
     _, sessions = database
     now = datetime(2026, 8, 28, 9, tzinfo=UTC)
     recurring = await _add_page(sessions, now - timedelta(days=30))
 
     async with sessions() as session:
         recurring = await session.get(Page, recurring.id)
+        recurring.archive_history_checked_at = now
+        recurring.latest_archive_at = now - timedelta(days=30)
         unarchived = Page(
             domain_id=recurring.domain_id,
             url="https://example.com/new",
             discovered_at=now,
             next_crawl_at=now,
             next_archive_at=now,
+            archive_history_checked_at=now,
         )
-        session.add(unarchived)
+        unknown = Page(
+            domain_id=recurring.domain_id,
+            url="https://example.com/unknown",
+            discovered_at=now - timedelta(days=60),
+            next_crawl_at=now,
+            next_archive_at=now - timedelta(days=60),
+        )
+        session.add_all((unarchived, unknown))
         job = ArchiveJob(
             id="completed-job",
             page_id=recurring.id,
@@ -659,16 +706,137 @@ async def test_archive_claim_prioritizes_pages_without_captures(database):
         await session.commit()
 
         first = await claim_due_page(
-            session, "archive", "worker", now, timedelta(minutes=10)
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=10),
+            archive_interval=timedelta(days=365),
         )
         second = await claim_due_page(
-            session, "archive", "worker", now, timedelta(minutes=10)
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=10),
+            archive_interval=timedelta(days=365),
+        )
+        third = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=10),
+            archive_interval=timedelta(days=365),
         )
 
         assert first is not None
         assert first.id == unarchived.id
         assert second is not None
-        assert second.id == recurring.id
+        assert second.id == unknown.id
+        assert third is not None
+        assert third.id == recurring.id
+
+
+async def test_archive_claim_requires_priority_interval(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    await _add_page(sessions, now)
+
+    async with sessions() as session:
+        with pytest.raises(ValueError, match="archive_interval is required"):
+            await claim_due_page(
+                session, "archive", "worker", now, timedelta(minutes=10)
+            )
+
+
+async def test_archive_claim_treats_old_known_capture_as_top_priority(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    recent = await _add_page(sessions, now, suffix="-priority")
+
+    async with sessions() as session:
+        recent = await session.get(Page, recent.id)
+        recent.archive_history_checked_at = now
+        recent.latest_archive_at = now - timedelta(days=6)
+        stale = Page(
+            domain_id=recent.domain_id,
+            url="https://example-priority.com/stale",
+            discovered_at=now,
+            next_crawl_at=now,
+            next_archive_at=now,
+            archive_history_checked_at=now,
+            latest_archive_at=now - timedelta(days=7, microseconds=1),
+        )
+        session.add(stale)
+        await session.commit()
+
+        claimed = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=10),
+            archive_interval=timedelta(days=7),
+        )
+
+        assert claimed is not None
+        assert claimed.id == stale.id
+
+
+async def test_archive_history_claim_requires_valid_page_and_exclusive_lease(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    page = await _add_page(sessions, now, suffix="-history")
+    lease = timedelta(minutes=10)
+
+    async with sessions() as session:
+        page = await session.get(Page, page.id)
+        page.status_code = 200
+        page.error = None
+        page.next_archive_history_check_at = now
+        page.archive_lease_owner = "archive-worker"
+        page.archive_lease_expires_at = now + lease
+        await session.commit()
+
+        assert (
+            await claim_due_archive_history_check(session, "history-worker", now, lease)
+            is None
+        )
+
+        page.archive_lease_owner = None
+        page.archive_lease_expires_at = None
+        await session.commit()
+        claimed = await claim_due_archive_history_check(
+            session, "history-worker", now, lease
+        )
+        assert claimed is not None
+        assert claimed.id == page.id
+        assert claimed.archive_history_lease_owner == "history-worker"
+
+        assert (
+            await claim_due_archive_history_check(
+                session, "other-worker", now + lease - timedelta(microseconds=1), lease
+            )
+            is None
+        )
+        reclaimed = await claim_due_archive_history_check(
+            session, "other-worker", now + lease, lease
+        )
+        assert reclaimed is not None
+        assert reclaimed.archive_history_lease_owner == "other-worker"
+
+        assert (
+            await claim_due_page(
+                session,
+                "archive",
+                "archive-worker",
+                now + lease,
+                lease,
+                archive_interval=timedelta(days=30),
+            )
+            is None
+        )
 
 
 async def test_release_leases_only_releases_leases_owned_by_the_instance(database):
@@ -696,6 +864,8 @@ async def test_release_leases_only_releases_leases_owned_by_the_instance(databas
             crawl_lease_expires_at=expires,
             archive_lease_owner="other",
             archive_lease_expires_at=expires,
+            archive_history_lease_owner="target",
+            archive_history_lease_expires_at=expires,
         )
         archive_owned = Page(
             domain_id=domain.id,
@@ -752,6 +922,10 @@ async def test_release_leases_only_releases_leases_owned_by_the_instance(databas
             "other",
             expires,
         )
+        assert (
+            crawl_owned.archive_history_lease_owner,
+            crawl_owned.archive_history_lease_expires_at,
+        ) == (None, None)
         assert (
             archive_owned.archive_lease_owner,
             archive_owned.archive_lease_expires_at,

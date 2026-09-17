@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "d92e7a4c1f63"
+HEAD_REVISION = "e41c7a9d2b60"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -150,6 +150,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     ).is_file()
     assert migrations.joinpath(
         "versions", "d92e7a4c1f63_add_report_lifetime_counts.py"
+    ).is_file()
+    assert migrations.joinpath(
+        "versions", "e41c7a9d2b60_add_archive_history_priority.py"
     ).is_file()
 
 
@@ -459,6 +462,82 @@ async def test_remote_job_id_migration_preserves_and_allows_reused_ids(tmp_path)
                 await connection.scalar(text("SELECT first_archive_count FROM reports"))
                 == 0
             )
+    finally:
+        await engine.dispose()
+
+
+async def test_archive_history_migration_backfills_known_and_unknown_pages(tmp_path):
+    path = tmp_path / "archive-history.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "d92e7a4c1f63")
+    engine = create_engine(path)
+    discovered = "2026-08-01T09:00:00.000000+00:00"
+    captured = "2026-08-20T10:00:00.000000+00:00"
+    completed = "2026-08-20T10:01:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) VALUES "
+                    "('example.com', 'https', 0, 1, :discovered, :discovered)"
+                ),
+                {"discovered": discovered},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(id, domain_id, url, active, in_scope, discovered_at, "
+                    "next_crawl_at, next_archive_at, sitemap_depth, crawl_attempts) "
+                    "VALUES "
+                    "(1, 1, 'https://example.com/known', 1, 1, :discovered, "
+                    ":discovered, :discovered, 0, 0), "
+                    "(2, 1, 'https://example.com/unknown', 1, 1, :discovered, "
+                    ":discovered, :discovered, 0, 0)"
+                ),
+                {"discovered": discovered},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, intent_at, "
+                    "next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed) VALUES "
+                    "('job', 1, 'DIRECT', 'SUCCEEDED', 'cycle', :captured, "
+                    ":captured, 0, 1, 1)"
+                ),
+                {"captured": captured},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO captures "
+                    "(page_id, archive_job_id, captured_at, wayback_url, "
+                    "completed_at) VALUES "
+                    "(1, 'job', :captured, 'https://web.archive.org/capture', "
+                    ":completed)"
+                ),
+                {"captured": captured, "completed": completed},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT id, archive_history_checked_at, latest_archive_at, "
+                        "next_archive_history_check_at, archive_history_check_attempts "
+                        "FROM pages ORDER BY id"
+                    )
+                )
+            ).all()
+        assert rows == [
+            (1, completed, captured, None, 0),
+            (2, None, None, discovered, 0),
+        ]
     finally:
         await engine.dispose()
 

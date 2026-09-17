@@ -109,6 +109,7 @@ def make_state(config: Config | None = None, secrets: Secrets | None = None):
         secrets or make_secrets(),
         SimpleNamespace(
             close=AsyncMock(),
+            latest_capture_at=AsyncMock(return_value=None),
             submission_capacity=AsyncMock(return_value=None),
             my_web_archive_url=AsyncMock(
                 return_value="https://archive.org/details/@ziggy/web-archive"
@@ -346,6 +347,7 @@ async def test_run_service_owns_startup_tasks_and_cleanup(  # noqa: PLR0915
     workers = [
         "_config_watcher",
         "_crawl_scheduler",
+        "_archive_history_scheduler",
         "_archive_submission_scheduler",
         "_archive_poll_scheduler",
         "_report_scheduler",
@@ -425,6 +427,7 @@ async def test_run_service_logs_runtime_exception_group(monkeypatch, tmp_path):
     )
     for name in (
         "_crawl_scheduler",
+        "_archive_history_scheduler",
         "_archive_submission_scheduler",
         "_archive_poll_scheduler",
         "_report_scheduler",
@@ -1246,6 +1249,24 @@ async def test_worker_failure_helpers_release_and_delay_work():
     assert session.commit.await_count == 2
     assert session.rollback.await_count == 2
 
+    page.archive_history_check_attempts = 0
+    page.archive_history_check_error = None
+    page.next_archive_history_check_at = NOW
+    page.archive_history_lease_owner = "worker"
+    page.archive_history_lease_expires_at = NOW
+    before = datetime.now(UTC) + timedelta(minutes=1)
+    await service._archive_history_worker_failure(
+        session, page, RuntimeError("failure")
+    )
+    after = datetime.now(UTC) + timedelta(minutes=1)
+    assert page.archive_history_check_attempts == 1
+    assert page.archive_history_check_error == "RuntimeError"
+    assert before <= page.next_archive_history_check_at <= after
+    assert page.archive_history_lease_owner is None
+    assert page.archive_history_lease_expires_at is None
+    assert session.commit.await_count == 3
+    assert session.rollback.await_count == 3
+
 
 async def test_crawl_scheduler_claims_batch_and_waits_when_idle(monkeypatch):
     state = make_state()
@@ -1315,6 +1336,73 @@ async def test_archive_submission_scheduler_covers_pause_idle_and_work(monkeypat
     await service._archive_submission_scheduler(
         state, Sessions(MagicMock()), "instance", stop
     )
+
+
+async def test_archive_history_scheduler_covers_idle_and_work(monkeypatch):
+    state = make_state()
+    stop = asyncio.Event()
+    claim = AsyncMock(return_value=None)
+
+    async def stop_wait(event, _seconds):
+        event.set()
+
+    monkeypatch.setattr(service, "claim_due_archive_history_check", claim)
+    monkeypatch.setattr(service, "_wait", stop_wait)
+    await service._archive_history_scheduler(
+        state, Sessions(MagicMock()), "instance", stop
+    )
+
+    stop.clear()
+    claim.return_value = SimpleNamespace(id=8)
+
+    async def check_one(*_args):
+        stop.set()
+
+    monkeypatch.setattr(service, "_check_archive_history_one", check_one)
+    await service._archive_history_scheduler(
+        state, Sessions(MagicMock()), "instance", stop
+    )
+
+
+async def test_check_archive_history_one_handles_missing_invalid_and_failure(
+    monkeypatch,
+):
+    state = make_state()
+    check = AsyncMock()
+    failure = AsyncMock()
+    monkeypatch.setattr(service, "check_archive_history", check)
+    monkeypatch.setattr(service, "_archive_history_worker_failure", failure)
+
+    await service._check_archive_history_one(
+        state, Sessions(MagicMock(get=AsyncMock(return_value=None))), 1
+    )
+    check.assert_not_awaited()
+
+    page = SimpleNamespace(
+        active=False,
+        in_scope=True,
+        blocked_reason=None,
+        status_code=200,
+        error=None,
+        archive_history_lease_owner="worker",
+        archive_history_lease_expires_at=NOW,
+    )
+    session = MagicMock(get=AsyncMock(return_value=page), commit=AsyncMock())
+    await service._check_archive_history_one(state, Sessions(session), 1)
+    assert page.archive_history_lease_owner is None
+    assert page.archive_history_lease_expires_at is None
+    session.commit.assert_awaited_once_with()
+
+    page.active = True
+    page.url = "https://example.test/"
+    session.get = AsyncMock(return_value=page)
+    await service._check_archive_history_one(state, Sessions(session), 1)
+    check.assert_awaited_once()
+
+    check.side_effect = RuntimeError("failure")
+    session.get = AsyncMock(return_value=page)
+    await service._check_archive_history_one(state, Sessions(session), 1)
+    failure.assert_awaited_once_with(session, page, check.side_effect)
 
 
 async def test_archive_submission_scheduler_stops_after_admission_wait(monkeypatch):

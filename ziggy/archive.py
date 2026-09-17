@@ -137,6 +137,9 @@ class ArchiveClient(Protocol):
     ) -> Sequence[SuccessStatus]:
         """Return capture history at or after an uncertain intent."""
 
+    async def latest_capture_at(self, url: str) -> datetime | None:
+        """Return the latest available Wayback capture timestamp."""
+
     async def close(self) -> None:
         """Close network resources."""
 
@@ -324,6 +327,19 @@ class ArchivistClient:
             raise ArchiveAuthenticationError("Internet Archive login failed") from error
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
+
+    async def latest_capture_at(self, url: str) -> datetime | None:
+        """Return the latest available capture from the Availability API."""
+        try:
+            availability = await self._request(lambda: self._client.availability(url))
+        except AuthenticationError as error:
+            raise ArchiveAuthenticationError("Internet Archive login failed") from error
+        except ArchivistError as error:
+            raise ArchiveError(type(error).__name__) from error
+        snapshot = availability.closest
+        return (
+            snapshot.timestamp if snapshot is not None and snapshot.available else None
+        )
 
     async def _request[T](self, request: Callable[[], Awaitable[T]]) -> T:
         """Serialize requests and apply service cooldowns to later work."""
@@ -730,6 +746,7 @@ async def _record_success(  # noqa: PLR0913, PLR0917
         .on_conflict_do_nothing()
     )
     page.next_archive_at = status.captured_at + settings.interval
+    _record_archive_history(page, status.captured_at, now)
     await session.commit()
 
 
@@ -846,6 +863,7 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
         child_page.next_archive_at = max(
             child_page.next_archive_at, child.captured_at + settings.interval
         )
+        _record_archive_history(child_page, child.captured_at, now)
         child_job_id = str(uuid4())
         child_cycle_key = f"outlink:{parent.id}:{child.job_id}"
         await session.execute(
@@ -884,6 +902,74 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
                 )
                 .on_conflict_do_nothing()
             )
+
+
+async def check_archive_history(
+    session: AsyncSession,
+    page: Page,
+    client: ArchiveClient,
+    now: datetime,
+) -> None:
+    """Classify one validated page from its latest Wayback capture."""
+    claimed_lease = (
+        page.archive_history_lease_owner,
+        page.archive_history_lease_expires_at,
+    )
+    captured_at: datetime | None = None
+    error: ArchiveError | None = None
+    try:
+        captured_at = await client.latest_capture_at(page.url)
+    except ArchiveError as caught:
+        error = caught
+
+    await session.refresh(page)
+    current_lease = (
+        page.archive_history_lease_owner,
+        page.archive_history_lease_expires_at,
+    )
+    archive_lease_active = page.archive_lease_owner is not None and (
+        page.archive_lease_expires_at is None
+        or page.archive_lease_expires_at > datetime.now(UTC)
+    )
+    if current_lease != claimed_lease or archive_lease_active:
+        return
+
+    if isinstance(error, ArchiveRateLimitError):
+        page.archive_history_check_attempts += 1
+        page.archive_history_check_error = type(error).__name__
+        page.next_archive_history_check_at = error.retry_at or now + timedelta(
+            minutes=1
+        )
+    elif error is not None:
+        page.archive_history_check_attempts += 1
+        page.archive_history_check_error = type(error).__name__
+        page.next_archive_history_check_at = now + timedelta(
+            seconds=min(3600, 2**page.archive_history_check_attempts)
+        )
+    else:
+        page.archive_history_checked_at = now
+        page.latest_archive_at = captured_at
+        page.next_archive_history_check_at = None
+        page.archive_history_check_attempts = 0
+        page.archive_history_check_error = None
+    page.archive_history_lease_owner = None
+    page.archive_history_lease_expires_at = None
+    await session.commit()
+
+
+def _record_archive_history(
+    page: Page, captured_at: datetime, checked_at: datetime
+) -> None:
+    """Record capture knowledge without replacing a newer known timestamp."""
+    page.latest_archive_at = max(
+        value for value in (page.latest_archive_at, captured_at) if value is not None
+    )
+    page.archive_history_checked_at = checked_at
+    page.next_archive_history_check_at = None
+    page.archive_history_check_attempts = 0
+    page.archive_history_check_error = None
+    page.archive_history_lease_owner = None
+    page.archive_history_lease_expires_at = None
 
 
 async def claim_archive_job(

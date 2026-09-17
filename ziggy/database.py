@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from sqlalchemy import event, exists, or_, select, text, update
+from sqlalchemy import case, event, exists, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import aliased
 
-from ziggy.models import ArchiveJob, ArchiveJobState, Capture, Domain, Page
+from ziggy.models import ArchiveJob, ArchiveJobState, Domain, Page
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
     query_base_url,
@@ -325,12 +325,14 @@ async def insert_discovered_pages(  # noqa: PLR0913, PLR0917
     )
 
 
-async def claim_due_page(
+async def claim_due_page(  # noqa: PLR0913
     session: AsyncSession,
     kind: WorkKind,
     owner: str,
     now: datetime,
     lease_duration: timedelta,
+    *,
+    archive_interval: timedelta | None = None,
 ) -> Page | None:
     """Atomically claim the oldest due page belonging to an active domain."""
     due_column = Page.next_crawl_at if kind == "crawl" else Page.next_archive_at
@@ -351,8 +353,15 @@ async def claim_due_page(
     ]
     order_by = [due_column, Page.id]
     if kind == "archive":
+        if archive_interval is None:
+            raise ValueError("archive_interval is required for archive work")
         conditions.append(Page.active.is_(True))
-        has_capture = exists(select(Capture.id).where(Capture.page_id == Page.id))
+        conditions.append(
+            or_(
+                Page.archive_history_lease_expires_at.is_(None),
+                Page.archive_history_lease_expires_at <= now,
+            )
+        )
         conditions.append(
             ~exists(
                 select(ArchiveJob.id).where(
@@ -369,7 +378,20 @@ async def claim_due_page(
                 )
             )
         )
-        order_by.insert(0, has_capture)
+        cutoff = now - archive_interval
+        priority = case(
+            (
+                Page.archive_history_checked_at.is_not(None)
+                & or_(
+                    Page.latest_archive_at.is_(None),
+                    Page.latest_archive_at < cutoff,
+                ),
+                0,
+            ),
+            (Page.archive_history_checked_at.is_(None), 1),
+            else_=2,
+        )
+        order_by.insert(0, priority)
     else:
         active_page = aliased(Page)
         active_domain = aliased(Domain)
@@ -413,6 +435,78 @@ async def claim_due_page(
     return page
 
 
+async def claim_due_archive_history_check(
+    session: AsyncSession,
+    owner: str,
+    now: datetime,
+    lease_duration: timedelta,
+) -> Page | None:
+    """Atomically claim one validated page awaiting a Wayback history check."""
+    active_job = exists(
+        select(ArchiveJob.id).where(
+            ArchiveJob.page_id == Page.id,
+            ArchiveJob.state.in_(
+                (
+                    ArchiveJobState.INTENT,
+                    ArchiveJobState.UNCERTAIN,
+                    ArchiveJobState.SUBMITTED,
+                    ArchiveJobState.PENDING,
+                    ArchiveJobState.RATE_LIMITED,
+                )
+            ),
+        )
+    )
+    candidate = (
+        select(Page.id)
+        .join(Domain, Page.domain_id == Domain.id)
+        .where(
+            Domain.active.is_(True),
+            Page.active.is_(True),
+            Page.in_scope.is_(True),
+            Page.blocked_reason.is_(None),
+            Page.status_code.between(200, 299),
+            Page.error.is_(None),
+            Page.archive_history_checked_at.is_(None),
+            Page.next_archive_history_check_at.is_not(None),
+            Page.next_archive_history_check_at <= now,
+            or_(
+                Page.archive_history_lease_expires_at.is_(None),
+                Page.archive_history_lease_expires_at <= now,
+            ),
+            or_(
+                Page.archive_lease_expires_at.is_(None),
+                Page.archive_lease_expires_at <= now,
+            ),
+            ~active_job,
+        )
+        .order_by(Page.next_archive_history_check_at, Page.id)
+        .limit(1)
+        .scalar_subquery()
+    )
+    statement = (
+        update(Page)
+        .where(
+            Page.id == candidate,
+            or_(
+                Page.archive_history_lease_expires_at.is_(None),
+                Page.archive_history_lease_expires_at <= now,
+            ),
+            or_(
+                Page.archive_lease_expires_at.is_(None),
+                Page.archive_lease_expires_at <= now,
+            ),
+        )
+        .values(
+            archive_history_lease_owner=owner,
+            archive_history_lease_expires_at=now + lease_duration,
+        )
+        .returning(Page)
+    )
+    page = (await session.scalars(statement)).one_or_none()
+    await session.commit()
+    return page
+
+
 async def release_leases(session: AsyncSession, owner: str) -> None:
     """Release page and archive-job leases held by one service instance."""
     await session.execute(
@@ -421,6 +515,14 @@ async def release_leases(session: AsyncSession, owner: str) -> None:
         .values(
             crawl_lease_owner=None,
             crawl_lease_expires_at=None,
+        )
+    )
+    await session.execute(
+        update(Page)
+        .where(Page.archive_history_lease_owner == owner)
+        .values(
+            archive_history_lease_owner=None,
+            archive_history_lease_expires_at=None,
         )
     )
     await session.execute(

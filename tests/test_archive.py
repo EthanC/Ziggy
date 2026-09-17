@@ -31,6 +31,7 @@ from ziggy.archive import (
     FailedStatus,
     PendingStatus,
     SuccessStatus,
+    check_archive_history,
     claim_archive_job,
     create_archive_intent,
     poll_archive_job,
@@ -80,16 +81,19 @@ class FakeArchiveClient:
     )
     outlink_results: Sequence[SuccessStatus] = ()
     capture_results: Sequence[SuccessStatus] = ()
+    latest_capture_result: datetime | None = None
     submit_error: ArchiveError | None = None
     status_error: ArchiveError | None = None
     outlinks_error: ArchiveError | None = None
     add_error: ArchiveError | None = None
     captures_error: ArchiveError | None = None
+    latest_capture_error: ArchiveError | None = None
     submissions: list[tuple[str, timedelta]] = field(default_factory=list)
     status_calls: list[str] = field(default_factory=list)
     outlink_calls: list[str] = field(default_factory=list)
     add_calls: list[str] = field(default_factory=list)
     capture_calls: list[tuple[str, datetime]] = field(default_factory=list)
+    latest_capture_calls: list[str] = field(default_factory=list)
     close_calls: int = 0
 
     async def submit(self, url: str, dedupe_window: timedelta) -> str:
@@ -122,6 +126,12 @@ class FakeArchiveClient:
         if self.captures_error is not None:
             raise self.captures_error
         return self.capture_results
+
+    async def latest_capture_at(self, url: str) -> datetime | None:
+        self.latest_capture_calls.append(url)
+        if self.latest_capture_error is not None:
+            raise self.latest_capture_error
+        return self.latest_capture_result
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -1295,6 +1305,7 @@ class NativeClient:
         self.web_archive_url_result: Any = (
             "https://archive.org/details/@ziggy/web-archive"
         )
+        self.availability_result: Any = SimpleNamespace(closest=None)
         self.submit_calls: list[tuple[str, Any]] = []
         self.status_calls: list[str] = []
         self.search_calls: list[tuple[str, dict[str, Any]]] = []
@@ -1346,6 +1357,12 @@ class NativeClient:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    async def availability(self, url: str) -> Any:
+        del url
+        if isinstance(self.availability_result, BaseException):
+            raise self.availability_result
+        return self.availability_result
 
     async def close(self) -> None:
         self.closed = True
@@ -1926,6 +1943,40 @@ async def test_adapter_capture_history_paginates_and_translates_records():
     ]
 
 
+async def test_adapter_reads_latest_available_capture():
+    native = NativeClient()
+    native.availability_result = SimpleNamespace(
+        closest=SimpleNamespace(timestamp=CAPTURED_AT, available=True)
+    )
+
+    assert (
+        await adapter_with(native).latest_capture_at("https://example.com/")
+        == CAPTURED_AT
+    )
+
+    native.availability_result = SimpleNamespace(
+        closest=SimpleNamespace(timestamp=CAPTURED_AT, available=False)
+    )
+    assert await adapter_with(native).latest_capture_at("https://example.com/") is None
+
+
+@pytest.mark.parametrize(
+    ("native_error", "local_error"),
+    [
+        (AuthenticationError("denied"), ArchiveAuthenticationError),
+        (ArchivistError("offline"), ArchiveError),
+    ],
+)
+async def test_adapter_latest_capture_translates_errors(
+    native_error: Exception, local_error: type[ArchiveError]
+):
+    native = NativeClient()
+    native.availability_result = native_error
+
+    with pytest.raises(local_error):
+        await adapter_with(native).latest_capture_at("https://example.com/")
+
+
 @pytest.mark.parametrize(
     ("native_error", "local_error"),
     [
@@ -2141,6 +2192,118 @@ async def test_post_processing_authentication_failure_is_persisted_and_raised(
         assert job.state is ArchiveJobState.SUCCEEDED
         assert job.error == "authentication failed"
         assert job.next_attempt_at == NOW + timedelta(minutes=5)
+
+
+async def test_archive_history_check_records_latest_capture_and_missing_result():
+    page = SimpleNamespace(
+        url="https://example.com/",
+        archive_history_checked_at=None,
+        latest_archive_at=None,
+        next_archive_history_check_at=NOW,
+        archive_history_check_attempts=2,
+        archive_history_check_error="old error",
+        archive_history_lease_owner="worker",
+        archive_history_lease_expires_at=NOW + LEASE,
+        archive_lease_owner=None,
+        archive_lease_expires_at=None,
+    )
+    session = MagicMock(commit=AsyncMock(), refresh=AsyncMock())
+    client = FakeArchiveClient(latest_capture_result=CAPTURED_AT)
+
+    await check_archive_history(session, page, client, NOW)
+
+    assert client.latest_capture_calls == [page.url]
+    assert page.archive_history_checked_at == NOW
+    assert page.latest_archive_at == CAPTURED_AT
+    assert page.next_archive_history_check_at is None
+    assert page.archive_history_check_attempts == 0
+    assert page.archive_history_check_error is None
+    assert page.archive_history_lease_owner is None
+    assert page.archive_history_lease_expires_at is None
+
+    page.archive_history_checked_at = None
+    page.latest_archive_at = CAPTURED_AT
+    page.next_archive_history_check_at = NOW
+    page.archive_history_lease_owner = "worker"
+    client.latest_capture_result = None
+    await check_archive_history(session, page, client, NOW)
+    assert page.archive_history_checked_at == NOW
+    assert page.latest_archive_at is None
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_retry"),
+    [
+        (
+            ArchiveRateLimitError(NOW + timedelta(minutes=4)),
+            NOW + timedelta(minutes=4),
+        ),
+        (ArchiveRateLimitError(None), NOW + timedelta(minutes=1)),
+        (ArchiveError("offline"), NOW + timedelta(seconds=2)),
+    ],
+)
+async def test_archive_history_check_retries_archive_errors(error, expected_retry):
+    page = SimpleNamespace(
+        url="https://example.com/",
+        archive_history_checked_at=None,
+        latest_archive_at=None,
+        next_archive_history_check_at=NOW,
+        archive_history_check_attempts=0,
+        archive_history_check_error=None,
+        archive_history_lease_owner="worker",
+        archive_history_lease_expires_at=NOW + LEASE,
+        archive_lease_owner=None,
+        archive_lease_expires_at=None,
+    )
+    session = MagicMock(commit=AsyncMock(), refresh=AsyncMock())
+    client = FakeArchiveClient(latest_capture_error=error)
+
+    await check_archive_history(session, page, client, NOW)
+
+    assert page.archive_history_checked_at is None
+    assert page.archive_history_check_attempts == 1
+    assert page.archive_history_check_error == type(error).__name__
+    assert page.next_archive_history_check_at == expected_retry
+    assert page.archive_history_lease_owner is None
+    assert page.archive_history_lease_expires_at is None
+    session.commit.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("conflict", ["history", "archive"])
+async def test_archive_history_check_discards_result_after_lease_conflict(conflict):
+    page = SimpleNamespace(
+        url="https://example.com/",
+        archive_history_checked_at=None,
+        latest_archive_at=None,
+        next_archive_history_check_at=NOW,
+        archive_history_check_attempts=0,
+        archive_history_check_error=None,
+        archive_history_lease_owner="worker",
+        archive_history_lease_expires_at=NOW + LEASE,
+        archive_lease_owner=None,
+        archive_lease_expires_at=None,
+    )
+
+    async def introduce_conflict(_page):
+        if conflict == "history":
+            page.archive_history_lease_owner = "replacement"
+        else:
+            page.archive_lease_owner = "archive-worker"
+            page.archive_lease_expires_at = datetime.now(UTC) + LEASE
+
+    session = MagicMock(
+        commit=AsyncMock(), refresh=AsyncMock(side_effect=introduce_conflict)
+    )
+
+    await check_archive_history(
+        session,
+        page,
+        FakeArchiveClient(latest_capture_result=CAPTURED_AT),
+        NOW,
+    )
+
+    assert page.archive_history_checked_at is None
+    session.commit.assert_not_awaited()
 
 
 class OutlinkSession:
