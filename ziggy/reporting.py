@@ -156,32 +156,43 @@ def build_report_webhook(
     web_archive_url: str | None = None,
 ) -> Webhook:
     """Construct the required Components v2 message without legacy fields."""
-    page_stats = Markdown.bulleted_list(
-        [
-            (
-                f"Discovered: {Markdown.bold(f'{report.discovered_count:,}')}"
-                f" | {Markdown.bold(f'{report.lifetime_discovered_count:,}')} Lifetime"
+    stats: list[str | dict[str, str | int]] = [
+        (
+            f"Discovered: {Markdown.bold(f'{report.discovered_count:,}')}"
+            f" | {Markdown.bold(f'{report.lifetime_discovered_count:,}')} Lifetime"
+        ),
+        (
+            f"Archived: {Markdown.bold(f'{report.archived_count:,}')}"
+            f" | {Markdown.bold(f'{report.lifetime_archived_count:,}')} Lifetime"
+        ),
+        {
+            "value": (
+                "First Archives: "
+                f"{Markdown.bold(f'{report.first_archive_count:,}')}"
+                f" | {Markdown.bold(f'{report.lifetime_first_archive_count:,}')} "
+                "Lifetime"
             ),
-            (
-                f"Archived: {Markdown.bold(f'{report.archived_count:,}')}"
-                f" | {Markdown.bold(f'{report.lifetime_archived_count:,}')} Lifetime"
-            ),
+            "indent": 1,
+        },
+        (
+            f"Deactivated: {Markdown.bold(f'{report.deactivated_count:,}')}"
+            f" | {Markdown.bold(f'{report.lifetime_deactivated_count:,}')} Lifetime"
+        ),
+        f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')}",
+    ]
+    if report.archived_count > 0:
+        completion = report.generated_at + (
+            (report.window_end - report.window_start)
+            * report.outstanding_count
+            / report.archived_count
+        )
+        stats.append(
             {
-                "value": (
-                    "First Archives: "
-                    f"{Markdown.bold(f'{report.first_archive_count:,}')}"
-                    f" | {Markdown.bold(f'{report.lifetime_first_archive_count:,}')} "
-                    "Lifetime"
-                ),
+                "value": f"Estimated completion {Timestamp.relative_time(completion)}",
                 "indent": 1,
-            },
-            (
-                f"Deactivated: {Markdown.bold(f'{report.deactivated_count:,}')}"
-                f" | {Markdown.bold(f'{report.lifetime_deactivated_count:,}')} Lifetime"
-            ),
-            f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')}",
-        ]
-    )
+            }
+        )
+    page_stats = Markdown.bulleted_list(stats)
     counts = page_stats
     context = Markdown.subtext(
         f"Report for {Timestamp.short_date(report.window_start)} to "

@@ -401,7 +401,8 @@ def test_build_report_webhook_uses_archival_report_layout():
         "- Archived: **1,000** | **10,000** Lifetime\n"
         "  - First Archives: **123** | **1,234** Lifetime\n"
         "- Deactivated: **12** | **123** Lifetime\n"
-        "- Pending: **234**"
+        "- Pending: **234**\n"
+        "  - Estimated completion <t:1787940713:R>"
     )
     assert container.components[2].divider is True
     assert container.components[2].spacing == 1
@@ -444,10 +445,19 @@ def test_build_report_webhook_omits_change_stats():
         "- Archived: **3** | **3** Lifetime\n"
         "  - First Archives: **1** | **1** Lifetime\n"
         "- Deactivated: **1** | **1** Lifetime\n"
-        "- Pending: **2**"
+        "- Pending: **2**\n"
+        "  - Estimated completion <t:1787978096:R>"
     )
     assert len(webhook.components[0].components) == 4
     assert len(webhook.components) == 1
+
+
+def test_build_report_webhook_omits_completion_estimate_without_archive_rate():
+    webhook = reporting.build_report_webhook(
+        make_report(archived_count=0), "https://discord.invalid/hook"
+    )
+
+    assert webhook.components[0].components[1].content.endswith("- Pending: **2**")
 
 
 async def test_deliver_report_without_webhook_logs_and_releases_lease(monkeypatch):
