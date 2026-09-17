@@ -290,6 +290,8 @@ async def deliver_report(
         .order_by(Report.window_end.desc())
         .limit(1)
     )
+    # Release the SQLite read snapshot before waiting on Discord.
+    await session.commit()
     try:
         response = await build_report_webhook(
             report, webhook_url, previous_report, web_archive_url
@@ -322,22 +324,22 @@ async def claim_report(
     lease_duration: timedelta,
 ) -> Report | None:
     """Atomically claim the oldest report eligible for delivery retry."""
-    candidate = (
-        select(Report.id)
-        .where(
-            Report.state.in_((ReportState.PENDING, ReportState.FAILED)),
-            Report.next_attempt_at <= now,
-            or_(Report.lease_expires_at.is_(None), Report.lease_expires_at <= now),
-        )
-        .order_by(Report.window_start)
-        .limit(1)
-        .scalar_subquery()
+    eligibility = (
+        Report.state.in_((ReportState.PENDING, ReportState.FAILED)),
+        Report.next_attempt_at <= now,
+        or_(Report.lease_expires_at.is_(None), Report.lease_expires_at <= now),
     )
+    candidate_id = await session.scalar(
+        select(Report.id).where(*eligibility).order_by(Report.window_start).limit(1)
+    )
+    await session.commit()
+    if candidate_id is None:
+        return None
     statement = (
         update(Report)
         .where(
-            Report.id == candidate,
-            or_(Report.lease_expires_at.is_(None), Report.lease_expires_at <= now),
+            Report.id == candidate_id,
+            *eligibility,
         )
         .values(lease_owner=owner, lease_expires_at=now + lease_duration)
         .returning(Report)

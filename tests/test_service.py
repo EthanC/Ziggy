@@ -1436,7 +1436,8 @@ async def test_report_scheduler_creates_claims_and_delivers(monkeypatch):
         - state.config.reporting.finalization_grace
     )
     stop = asyncio.Event()
-    session = MagicMock(scalar=AsyncMock(return_value=None))
+    window_session = MagicMock(scalar=AsyncMock(return_value=None))
+    delivery_session = MagicMock()
     window = SimpleNamespace()
     report = SimpleNamespace()
     monkeypatch.setattr(service, "next_report_window", MagicMock(return_value=window))
@@ -1451,10 +1452,15 @@ async def test_report_scheduler_creates_claims_and_delivers(monkeypatch):
         event.set()
 
     monkeypatch.setattr(service, "_wait", stop_wait)
-    await service._report_scheduler(state, Sessions(session), "instance", stop)
+    await service._report_scheduler(
+        state, Sessions(window_session, delivery_session), "instance", stop
+    )
 
     create.assert_awaited_once()
+    assert create.call_args.args[0] is window_session
+    assert claim_report.call_args.args[0] is delivery_session
     deliver.assert_awaited_once()
+    assert deliver.call_args.args[0] is delivery_session
     assert deliver.call_args.args[2] == "discord"
     assert deliver.call_args.args[4] == state.web_archive_url
 

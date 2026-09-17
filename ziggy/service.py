@@ -678,6 +678,7 @@ async def _report_scheduler(
             )
             if window is not None:
                 await create_report(session, window, now)
+        async with sessions() as session:
             report = await claim_report(session, instance_id, now, _LEASE_DURATION)
             if report is not None:
                 await deliver_report(

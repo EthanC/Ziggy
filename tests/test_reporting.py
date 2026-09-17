@@ -526,12 +526,17 @@ async def test_deliver_report_persists_discord_metadata(monkeypatch):
         "channel_id": "channel",
         "webhook_id": "webhook",
     }
-    webhook = MagicMock()
-    webhook.execute_async = AsyncMock(return_value=response)
-    monkeypatch.setattr(reporting, "build_report_webhook", lambda *_: webhook)
     session = MagicMock()
     session.scalar = AsyncMock(return_value=None)
     session.commit = AsyncMock()
+
+    async def execute():
+        session.commit.assert_awaited_once_with()
+        return response
+
+    webhook = MagicMock()
+    webhook.execute_async = AsyncMock(side_effect=execute)
+    monkeypatch.setattr(reporting, "build_report_webhook", lambda *_: webhook)
 
     await reporting.deliver_report(session, report, "https://discord.invalid", NOW)
 
@@ -544,7 +549,7 @@ async def test_deliver_report_persists_discord_metadata(monkeypatch):
         report.discord_webhook_id,
     ) == ("message", "channel", "webhook")
     assert report.lease_owner is None
-    session.commit.assert_awaited_once()
+    assert session.commit.await_count == 2
 
 
 async def test_deliver_report_builds_webhook_with_previous_report(
@@ -605,7 +610,7 @@ async def test_deliver_report_retries_boundary_failures(monkeypatch, failure):
     assert report.next_attempt_at == NOW + timedelta(seconds=2)
     assert report.error == type(failure).__name__
     assert report.lease_owner is None
-    session.commit.assert_awaited_once()
+    assert session.commit.await_count == 2
 
 
 async def test_deliver_report_retries_invalid_discord_response(monkeypatch):
@@ -693,3 +698,27 @@ async def test_claim_report_takes_oldest_eligible_and_respects_lease(sessions):
             await reporting.claim_report(session, "mine", NOW, timedelta(minutes=5))
             is None
         )
+
+
+async def test_claim_report_loses_race_without_overwriting_lease(sessions):
+    async with sessions() as session:
+        report = make_report(lease_owner=None, lease_expires_at=None)
+        session.add(report)
+        await session.commit()
+
+        original_scalar = session.scalar
+
+        async def claim_elsewhere(statement):
+            candidate_id = await original_scalar(statement)
+            report.lease_owner = "other"
+            report.lease_expires_at = NOW + timedelta(minutes=5)
+            await session.commit()
+            return candidate_id
+
+        session.scalar = claim_elsewhere
+        claimed = await reporting.claim_report(
+            session, "mine", NOW, timedelta(minutes=5)
+        )
+
+        assert claimed is None
+        assert report.lease_owner == "other"
