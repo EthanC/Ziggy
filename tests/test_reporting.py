@@ -374,19 +374,9 @@ def test_build_report_webhook_uses_archival_report_layout():
         lifetime_deactivated_count=123,
         active_domain_count=2_345,
     )
-    previous_report = make_report(
-        discovered_count=1_218,
-        archived_count=1_010,
-        outstanding_count=234,
-        first_archive_count=100,
-        deactivated_count=10,
-        active_domain_count=2_300,
-    )
-
     webhook = reporting.build_report_webhook(
         report,
         "https://discord.invalid/api/webhooks/id/token",
-        previous_report,
         "https://archive.org/details/@ziggy/web-archive",
     )
 
@@ -407,10 +397,10 @@ def test_build_report_webhook_uses_archival_report_layout():
     ]
     assert container.components[0].content == "## Archival Report"
     assert container.components[1].content == (
-        "- Discovered: **1,234** (+16) | **12,345** Lifetime\n"
-        "- Archived: **1,000** (-10) | **10,000** Lifetime\n"
-        "  - First Archives: **123** (+23) | **1,234** Lifetime\n"
-        "- Deactivated: **12** (+2) | **123** Lifetime\n"
+        "- Discovered: **1,234** | **12,345** Lifetime\n"
+        "- Archived: **1,000** | **10,000** Lifetime\n"
+        "  - First Archives: **123** | **1,234** Lifetime\n"
+        "- Deactivated: **12** | **123** Lifetime\n"
         "- Pending: **234**"
     )
     assert container.components[2].divider is True
@@ -444,17 +434,17 @@ def test_build_report_webhook_defensively_rejects_missing_v2_flag(monkeypatch):
     webhook.add_component.assert_called_once()
 
 
-def test_build_report_webhook_uses_zero_baseline_for_first_report():
+def test_build_report_webhook_omits_change_stats():
     webhook = reporting.build_report_webhook(
         make_report(), "https://discord.invalid/hook"
     )
 
     assert webhook.components[0].components[1].content == (
-        "- Discovered: **5** (+5) | **5** Lifetime\n"
-        "- Archived: **3** (+3) | **3** Lifetime\n"
-        "  - First Archives: **1** (+1) | **1** Lifetime\n"
-        "- Deactivated: **1** (+1) | **1** Lifetime\n"
-        "- Pending: **2** (+2)"
+        "- Discovered: **5** | **5** Lifetime\n"
+        "- Archived: **3** | **3** Lifetime\n"
+        "  - First Archives: **1** | **1** Lifetime\n"
+        "- Deactivated: **1** | **1** Lifetime\n"
+        "- Pending: **2**"
     )
     assert len(webhook.components[0].components) == 4
     assert len(webhook.components) == 1
@@ -552,16 +542,7 @@ async def test_deliver_report_persists_discord_metadata(monkeypatch):
     assert session.commit.await_count == 2
 
 
-async def test_deliver_report_builds_webhook_with_previous_report(
-    sessions, monkeypatch
-):
-    previous_report = make_report(
-        window_start=NOW - timedelta(days=2),
-        window_end=NOW - timedelta(days=1),
-        state=ReportState.DELIVERED,
-        lease_owner=None,
-        lease_expires_at=None,
-    )
+async def test_deliver_report_builds_webhook_with_archive_url(sessions, monkeypatch):
     report = make_report()
     response = MagicMock()
     response.json.return_value = {"id": "message", "channel_id": "channel"}
@@ -571,7 +552,7 @@ async def test_deliver_report_builds_webhook_with_previous_report(
     monkeypatch.setattr(reporting, "build_report_webhook", build_webhook)
 
     async with sessions() as session:
-        session.add_all([previous_report, report])
+        session.add(report)
         await session.commit()
 
         await reporting.deliver_report(
@@ -585,7 +566,6 @@ async def test_deliver_report_builds_webhook_with_previous_report(
     build_webhook.assert_called_once_with(
         report,
         "https://discord.invalid",
-        previous_report,
         "https://archive.org/details/@ziggy/web-archive",
     )
 

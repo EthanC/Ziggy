@@ -153,59 +153,33 @@ async def create_report(
 def build_report_webhook(
     report: Report,
     webhook_url: str,
-    previous_report: Report | None = None,
     web_archive_url: str | None = None,
 ) -> Webhook:
     """Construct the required Components v2 message without legacy fields."""
-    previous_discovered = (
-        previous_report.discovered_count if previous_report is not None else 0
-    )
-    previous_archived = (
-        previous_report.archived_count if previous_report is not None else 0
-    )
-    previous_first_archives = (
-        previous_report.first_archive_count if previous_report is not None else 0
-    )
-    previous_deactivated = (
-        previous_report.deactivated_count if previous_report is not None else 0
-    )
-    previous_outstanding = (
-        previous_report.outstanding_count if previous_report is not None else 0
-    )
-    first_archive_change = _change_stat(
-        report.first_archive_count, previous_first_archives
-    )
     page_stats = Markdown.bulleted_list(
         [
             (
                 f"Discovered: {Markdown.bold(f'{report.discovered_count:,}')}"
-                f"{_change_stat(report.discovered_count, previous_discovered)} | "
-                f"{Markdown.bold(f'{report.lifetime_discovered_count:,}')} Lifetime"
+                f" | {Markdown.bold(f'{report.lifetime_discovered_count:,}')} Lifetime"
             ),
             (
                 f"Archived: {Markdown.bold(f'{report.archived_count:,}')}"
-                f"{_change_stat(report.archived_count, previous_archived)} | "
-                f"{Markdown.bold(f'{report.lifetime_archived_count:,}')} Lifetime"
+                f" | {Markdown.bold(f'{report.lifetime_archived_count:,}')} Lifetime"
             ),
             {
                 "value": (
                     "First Archives: "
                     f"{Markdown.bold(f'{report.first_archive_count:,}')}"
-                    f"{first_archive_change} | "
-                    f"{Markdown.bold(f'{report.lifetime_first_archive_count:,}')} "
+                    f" | {Markdown.bold(f'{report.lifetime_first_archive_count:,}')} "
                     "Lifetime"
                 ),
                 "indent": 1,
             },
             (
                 f"Deactivated: {Markdown.bold(f'{report.deactivated_count:,}')}"
-                f"{_change_stat(report.deactivated_count, previous_deactivated)} | "
-                f"{Markdown.bold(f'{report.lifetime_deactivated_count:,}')} Lifetime"
+                f" | {Markdown.bold(f'{report.lifetime_deactivated_count:,}')} Lifetime"
             ),
-            (
-                f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')}"
-                f"{_change_stat(report.outstanding_count, previous_outstanding)}"
-            ),
+            f"Pending: {Markdown.bold(f'{report.outstanding_count:,}')}",
         ]
     )
     counts = page_stats
@@ -284,17 +258,11 @@ async def deliver_report(
         _release_report(report)
         await session.commit()
         return
-    previous_report = await session.scalar(
-        select(Report)
-        .where(Report.window_end <= report.window_start)
-        .order_by(Report.window_end.desc())
-        .limit(1)
-    )
-    # Release the SQLite read snapshot before waiting on Discord.
+    # Release the SQLite transaction before waiting on Discord.
     await session.commit()
     try:
         response = await build_report_webhook(
-            report, webhook_url, previous_report, web_archive_url
+            report, webhook_url, web_archive_url
         ).execute_async()
         payload = response.json()
     except (niquests_exceptions.RequestException, ValueError, TypeError) as error:
@@ -352,11 +320,6 @@ async def claim_report(
 def _release_report(report: Report) -> None:
     report.lease_owner = None
     report.lease_expires_at = None
-
-
-def _change_stat(current: int, previous: int) -> str:
-    change = current - previous
-    return "" if change == 0 else f" ({change:+,})"
 
 
 def _message_metadata(payload: object) -> tuple[str, str, str | None] | None:
