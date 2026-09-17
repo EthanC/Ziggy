@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -79,10 +80,13 @@ class FakeSession:
 
 
 class FakeDatabaseSession:
-    def __init__(self, inserted_urls=None):
+    def __init__(self, inserted_urls=None, existing_urls=()):
         self.statements = []
         self.commits = 0
         self.inserted_urls = inserted_urls
+        self.existing_urls = existing_urls
+        self.scalar_calls = 0
+        self.no_autoflush = nullcontext()
 
     async def execute(self, statement):
         self.statements.append(statement)
@@ -92,7 +96,12 @@ class FakeDatabaseSession:
         return SimpleNamespace(scalars=lambda: iter(returned))
 
     async def scalars(self, _statement):
-        return ()
+        self.scalar_calls += 1
+        if self.scalar_calls == 1:
+            return self.existing_urls
+        return tuple(
+            SimpleNamespace(url=url, blocked_reason=None) for url in self.existing_urls
+        )
 
     async def commit(self):
         self.commits += 1
@@ -105,9 +114,12 @@ class FakeClient:
 
     async def fetch(self, *args, **kwargs):
         self.calls.append((args, kwargs))
-        if isinstance(self.outcome, BaseException):
-            raise self.outcome
-        return self.outcome
+        outcome = (
+            self.outcome.pop(0) if isinstance(self.outcome, list) else self.outcome
+        )
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 class FakeRandom:
@@ -480,6 +492,22 @@ async def test_fetch_304_does_not_read_body(monkeypatch):
     assert response.chunk_sizes == []
 
 
+async def test_fetch_status_only_does_not_read_body(monkeypatch):
+    response = FakeResponse(200, body=b"must not be read")
+    client, _, _ = install_client(monkeypatch, [response])
+
+    result = await client.fetch(
+        "https://example.com/",
+        "example.com",
+        include_subdomains=False,
+        read_body=False,
+    )
+
+    assert result.status_code == 200
+    assert result.body == b""
+    assert response.chunk_sizes == []
+
+
 async def test_fetch_decompresses_raw_query_bearing_gzip_sitemap(monkeypatch):
     xml = b"<urlset><url><loc>/found</loc></url></urlset>"
     client, _, _ = install_client(
@@ -788,7 +816,19 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
                 "etag": '"old"',
                 "last_modified": "old-date",
             },
-        )
+        ),
+        (
+            ("https://example.com/child", "example.com"),
+            {"include_subdomains": False, "read_body": False},
+        ),
+        (
+            ("https://example.com/redirect", "example.com"),
+            {"include_subdomains": False, "read_body": False},
+        ),
+        (
+            ("https://example.com/header", "example.com"),
+            {"include_subdomains": False, "read_body": False},
+        ),
     ]
     assert page.status_code == 200
     assert page.final_url == "https://example.com/final"
@@ -801,7 +841,7 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
     assert page.crawl_attempts == 0
     assert page.crawl_lease_owner is None
     assert page.crawl_lease_expires_at is None
-    assert session.commits == 1
+    assert session.commits == 2
     assert len(session.statements) == 1
     statement = session.statements[0]
     params = statement.compile().params
@@ -880,6 +920,47 @@ async def test_crawl_page_logs_only_urls_inserted_by_database(monkeypatch):
     )
 
     assert logged == [("Page found: {}", "https://example.com/new")]
+
+
+async def test_crawl_page_stores_only_successfully_validated_new_urls():
+    page = make_page()
+    result = make_result(
+        body=(
+            b'<!doctype html><a href="/ok">ok</a>'
+            b'<a href="/missing">missing</a><a href="/timeout">timeout</a>'
+            b'<a href="/known">known</a>'
+        )
+    )
+    client = FakeClient(
+        [
+            result,
+            make_result(final_url="https://example.com/ok"),
+            make_result(status_code=404, final_url="https://example.com/missing"),
+            crawler.FetchError("timeout", transient=True),
+        ]
+    )
+    session = FakeDatabaseSession(existing_urls=("https://example.com/known",))
+
+    await crawler.crawl_page(
+        session,
+        page,
+        configured_host="example.com",
+        include_subdomains=False,
+        client=client,
+        settings=make_settings(),
+        now=NOW,
+    )
+
+    params = session.statements[0].compile().params
+    assert [value for key, value in params.items() if key.startswith("url_m")] == [
+        "https://example.com/ok",
+    ]
+    assert [call[0][0] for call in client.calls[1:]] == [
+        "https://example.com/ok",
+        "https://example.com/missing",
+        "https://example.com/timeout",
+    ]
+    assert all(call[1]["read_body"] is False for call in client.calls[1:])
 
 
 async def test_crawl_page_allows_exact_subdomains_when_configured():

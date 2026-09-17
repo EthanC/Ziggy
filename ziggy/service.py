@@ -47,7 +47,7 @@ from ziggy.database import (
     session_factory,
 )
 from ziggy.logging import LoggingController
-from ziggy.models import ArchiveJob, Capture, Domain, Page, Report, ServiceState
+from ziggy.models import ArchiveJob, Domain, Page, Report, ServiceState
 from ziggy.reporting import (
     claim_report,
     create_report,
@@ -475,43 +475,9 @@ async def _submit_one(
             page.archive_lease_expires_at = None
             await session.commit()
             return
-        previous_capture = await session.scalar(
-            select(Capture.id).where(Capture.page_id == page.id).limit(1)
-        )
-        if previous_capture is not None:
-            now = datetime.now(UTC)
-            try:
-                result = await state.crawler.fetch(
-                    page.url,
-                    domain.host,
-                    include_subdomains=domain.include_subdomains,
-                )
-            except FetchError as error:
-                page.error = str(error)
-                page.next_archive_at = now + timedelta(minutes=1)
-                page.archive_lease_owner = None
-                page.archive_lease_expires_at = None
-                await session.commit()
-                logger.warning("Archive preflight failed for {}: {}", page.url, error)
-                return
-            page.status_code = result.status_code
-            page.final_url = result.final_url
-            page.last_crawled_at = now
-            page.first_crawled_at = page.first_crawled_at or now
-            if not _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
-                page.active = False
-                page.deactivated_at = now
-                page.error = f"HTTP {result.status_code}"
-                page.archive_lease_owner = None
-                page.archive_lease_expires_at = None
-                await session.commit()
-                logger.info(
-                    "Page marked inactive after archive preflight returned HTTP {}: {}",
-                    result.status_code,
-                    page.url,
-                )
-                return
-            page.error = None
+        await session.commit()
+        if not await _archive_preflight(session, page, domain, state.crawler):
+            return
         job = await create_archive_intent(session, page, datetime.now(UTC))
         try:
             await submit_archive_job(
@@ -598,6 +564,9 @@ async def _poll_one(
                     settings=state.config.archive,
                     now=datetime.now(UTC),
                     allow_submission=domain.active and page.active and page.in_scope,
+                    preflight=lambda: _archive_preflight(
+                        session, page, domain, state.crawler, job=job
+                    ),
                 )
             else:
                 await poll_archive_job(
@@ -606,6 +575,7 @@ async def _poll_one(
                     page=page,
                     domain=domain,
                     client=state.archive_client,
+                    crawler=state.crawler,
                     settings=state.config.archive,
                     now=datetime.now(UTC),
                     max_query_variants_per_base=(
@@ -620,6 +590,65 @@ async def _poll_one(
             )
         except Exception as error:  # noqa: BLE001 - preserve scheduler liveness.
             await _archive_worker_failure(session, job, page, error)
+
+
+async def _archive_preflight(
+    session: AsyncSession,
+    page: Page,
+    domain: Domain,
+    crawler: CrawlerClient,
+    *,
+    job: ArchiveJob | None = None,
+) -> bool:
+    """Require a current successful origin response before remote submission."""
+    now = datetime.now(UTC)
+    try:
+        result = await crawler.fetch(
+            page.url,
+            domain.host,
+            include_subdomains=domain.include_subdomains,
+            read_body=False,
+        )
+    except FetchError as error:
+        page.error = str(error)
+        if job is None:
+            page.next_archive_at = now + timedelta(minutes=1)
+            page.archive_lease_owner = None
+            page.archive_lease_expires_at = None
+        else:
+            job.error = str(error)
+            job.next_attempt_at = now + timedelta(minutes=1)
+            job.lease_owner = None
+            job.lease_expires_at = None
+        await session.commit()
+        logger.warning("Archive preflight failed for {}: {}", page.url, error)
+        return False
+    page.status_code = result.status_code
+    page.final_url = result.final_url
+    page.last_crawled_at = now
+    page.first_crawled_at = page.first_crawled_at or now
+    if not _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
+        page.active = False
+        page.deactivated_at = now
+        page.error = f"HTTP {result.status_code}"
+        if job is None:
+            page.archive_lease_owner = None
+            page.archive_lease_expires_at = None
+        else:
+            job.state = ArchiveJobState.FAILED
+            job.completed_at = now
+            job.error = page.error
+            job.lease_owner = None
+            job.lease_expires_at = None
+        await session.commit()
+        logger.info(
+            "Page marked inactive after archive preflight returned HTTP {}: {}",
+            result.status_code,
+            page.url,
+        )
+        return False
+    page.error = None
+    return True
 
 
 async def _report_scheduler(

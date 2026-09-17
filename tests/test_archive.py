@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -36,6 +37,7 @@ from ziggy.archive import (
     submit_archive_job,
 )
 from ziggy.config import ArchiveSettings
+from ziggy.crawler import FetchError, FetchResult
 from ziggy.database import create_engine, run_migrations, session_factory
 from ziggy.models import (
     ArchiveJob,
@@ -123,6 +125,26 @@ class FakeArchiveClient:
 
     async def close(self) -> None:
         self.close_calls += 1
+
+
+@dataclass(slots=True)
+class FakeCrawler:
+    outcomes: dict[str, FetchResult | FetchError] = field(default_factory=dict)
+    calls: list[tuple[str, str, bool, bool]] = field(default_factory=list)
+
+    async def fetch(
+        self,
+        url: str,
+        configured_host: str,
+        *,
+        include_subdomains: bool,
+        read_body: bool = True,
+    ) -> FetchResult:
+        self.calls.append((url, configured_host, include_subdomains, read_body))
+        outcome = self.outcomes.get(url, FetchResult(200, url, {}, b"", None, ()))
+        if isinstance(outcome, FetchError):
+            raise outcome
+        return outcome
 
 
 @pytest.fixture(params=("metadata", "migrated"))
@@ -273,6 +295,31 @@ async def test_submit_success_persists_remote_acceptance(database: Database):
         assert job.service_code is None
         assert job.lease_owner is None
         assert job.lease_expires_at is None
+
+
+async def test_submit_stops_before_remote_request_when_preflight_fails(
+    database: Database,
+):
+    client = FakeArchiveClient()
+    preflight = AsyncMock(return_value=False)
+    async with database.sessions() as session:
+        _, page = await add_page(session)
+        job = await add_job(session, page)
+        await session.commit()
+
+        await submit_archive_job(
+            session,
+            job,
+            page=page,
+            client=client,
+            settings=SETTINGS,
+            now=NOW,
+            preflight=preflight,
+        )
+
+        preflight.assert_awaited_once_with()
+        assert client.submissions == []
+        assert job.state is ArchiveJobState.INTENT
 
 
 async def test_submit_accepts_reused_remote_job_id(database: Database):
@@ -833,6 +880,7 @@ async def test_outlinks_use_exact_subdomain_scope_and_persist_child_captures(
             page=parent_page,
             domain=exact_domain,
             client=client,
+            crawler=FakeCrawler(),
             settings=SETTINGS,
             now=NOW,
         )
@@ -869,6 +917,49 @@ async def test_outlinks_use_exact_subdomain_scope_and_persist_child_captures(
         assert child_capture.captured_at == CAPTURED_AT
         assert child_capture.wayback_url.endswith("child-exact")
         assert child_capture.first_archive is True
+
+
+async def test_outlinks_skip_new_pages_without_successful_origin(database: Database):
+    children = (
+        success("child-ok", "https://example.com/ok"),
+        success("child-missing", "https://example.com/missing"),
+    )
+    client = FakeArchiveClient(status_result=success(), outlink_results=children)
+    crawler = FakeCrawler(
+        outcomes={
+            "https://example.com/missing": FetchResult(
+                404, "https://example.com/missing", {}, b"", None, ()
+            )
+        }
+    )
+    async with database.sessions() as session:
+        domain, parent_page = await add_page(session, url="https://example.com/article")
+        parent_job = await add_job(
+            session,
+            parent_page,
+            state=ArchiveJobState.SUBMITTED,
+            external_job_id="remote-1",
+        )
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            parent_job,
+            page=parent_page,
+            domain=domain,
+            client=client,
+            crawler=crawler,
+            settings=SETTINGS,
+            now=NOW,
+        )
+
+        urls = set(await session.scalars(select(Page.url)))
+        assert urls == {"https://example.com/article", "https://example.com/ok"}
+        assert {call[0] for call in crawler.calls} == {
+            "https://example.com/ok",
+            "https://example.com/missing",
+        }
+        assert all(call[3] is False for call in crawler.calls)
 
 
 async def test_claims_persisted_intent_for_recovery_even_when_domain_is_inactive(
@@ -2056,6 +2147,7 @@ class OutlinkSession:
     def __init__(self, scalar_results: list[Any]) -> None:
         self.scalar_results = scalar_results
         self.execute_calls = 0
+        self.no_autoflush = nullcontext()
 
     async def execute(self, statement: Any) -> Any:
         del statement
@@ -2069,6 +2161,9 @@ class OutlinkSession:
     async def scalar(self, statement: Any) -> Any:
         del statement
         return self.scalar_results.pop(0)
+
+    async def commit(self) -> None:
+        pass
 
 
 def detached_page(page_id: int = 99) -> Page:
@@ -2110,10 +2205,22 @@ async def test_record_outlinks_tolerates_missing_page_after_insert():
     parent, parent_page, domain = detached_parent()
 
     await archive._record_outlinks(  # noqa: SLF001
-        session, parent, parent_page, domain, [success("child")], SETTINGS, NOW
+        session,
+        parent,
+        parent_page,
+        domain,
+        [success("child")],
+        FakeCrawler(),
+        SETTINGS,
+        NOW,
     )
 
     assert session.execute_calls == 1
+
+
+def test_outlink_processing_requires_origin_validator_for_children():
+    with pytest.raises(ArchiveError, match="origin validator unavailable"):
+        archive._outlink_crawler((success("child"),), None)  # noqa: SLF001
 
 
 async def test_record_outlinks_tolerates_missing_child_job_after_insert():
@@ -2121,7 +2228,14 @@ async def test_record_outlinks_tolerates_missing_child_job_after_insert():
     parent, parent_page, domain = detached_parent()
 
     await archive._record_outlinks(  # noqa: SLF001
-        session, parent, parent_page, domain, [success("child")], SETTINGS, NOW
+        session,
+        parent,
+        parent_page,
+        domain,
+        [success("child")],
+        FakeCrawler(),
+        SETTINGS,
+        NOW,
     )
 
     assert session.execute_calls == 2

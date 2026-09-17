@@ -860,6 +860,11 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
         deactivated_at=None,
         in_scope=True,
         url="https://example.test/",
+        first_crawled_at=None,
+        last_crawled_at=None,
+        status_code=None,
+        final_url=None,
+        error=None,
         archive_lease_owner="owner",
         archive_lease_expires_at=NOW,
     )
@@ -884,11 +889,17 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
     submit = AsyncMock()
     monkeypatch.setattr(service, "create_archive_intent", create_intent)
     monkeypatch.setattr(service, "submit_archive_job", submit)
-    active = SimpleNamespace(active=True)
+    active = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
+    state.crawler.fetch.return_value = FetchResult(200, page.url, {}, b"", None, ())
     session.get = AsyncMock(side_effect=[page, active])
     await service._submit_one(state, Sessions(session), 1)
     submit.assert_awaited_once()
-    state.crawler.fetch.assert_not_called()
+    state.crawler.fetch.assert_awaited_once_with(
+        page.url,
+        active.host,
+        include_subdomains=False,
+        read_body=False,
+    )
 
     session.get = AsyncMock(side_effect=[page, active])
     submit.reset_mock(side_effect=True)
@@ -906,9 +917,7 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
 
 
 @pytest.mark.parametrize("status_code", [400, 404, 500, 503])
-async def test_submit_one_marks_recurring_page_inactive_on_http_error(
-    monkeypatch, status_code
-):
+async def test_submit_one_marks_page_inactive_on_http_error(monkeypatch, status_code):
     state = make_state()
     page = SimpleNamespace(
         id=1,
@@ -953,7 +962,7 @@ async def test_submit_one_marks_recurring_page_inactive_on_http_error(
     assert page.error == f"HTTP {status_code}"
     assert page.archive_lease_owner is None
     assert page.archive_lease_expires_at is None
-    session.commit.assert_awaited_once_with()
+    assert session.commit.await_count == 2
     create_intent.assert_not_awaited()
 
 
@@ -977,6 +986,7 @@ async def test_submit_one_preflights_recurring_page_before_creating_intent(monke
     session = MagicMock(
         get=AsyncMock(side_effect=[page, domain]),
         scalar=AsyncMock(return_value=1),
+        commit=AsyncMock(),
     )
     state.crawler.fetch = AsyncMock(
         return_value=FetchResult(204, page.url, {}, b"", None, ())
@@ -993,6 +1003,7 @@ async def test_submit_one_preflights_recurring_page_before_creating_intent(monke
         page.url,
         domain.host,
         include_subdomains=True,
+        read_body=False,
     )
     assert page.status_code == 204
     assert page.first_crawled_at is not None
@@ -1037,7 +1048,7 @@ async def test_submit_one_retries_recurring_page_after_preflight_fetch_error(
     assert page.error == "connection failed"
     assert before <= page.next_archive_at <= after
     assert page.archive_lease_owner is None
-    session.commit.assert_awaited_once_with()
+    assert session.commit.await_count == 2
     create_intent.assert_not_awaited()
 
 
@@ -1051,12 +1062,20 @@ async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     await service._poll_one(state, Sessions(no_page), "job")
 
     page = SimpleNamespace(
-        domain_id=2, active=True, in_scope=True, url="https://example.test/"
+        domain_id=2,
+        active=True,
+        in_scope=True,
+        url="https://example.test/",
+        first_crawled_at=None,
+        last_crawled_at=None,
+        status_code=None,
+        final_url=None,
+        error=None,
     )
     no_domain = MagicMock(get=AsyncMock(side_effect=[job, page, None]))
     await service._poll_one(state, Sessions(no_domain), "job")
 
-    domain = SimpleNamespace(active=True)
+    domain = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
     session = MagicMock(
         get=AsyncMock(side_effect=[job, page, domain]), commit=AsyncMock()
     )
@@ -1068,6 +1087,14 @@ async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     submit.assert_awaited_once()
     assert job.state is ArchiveJobState.UNCERTAIN
     assert submit.call_args.kwargs["allow_submission"] is True
+    state.crawler.fetch.return_value = FetchResult(200, page.url, {}, b"", None, ())
+    assert await submit.call_args.kwargs["preflight"]() is True
+    state.crawler.fetch.assert_awaited_once_with(
+        page.url,
+        domain.host,
+        include_subdomains=False,
+        read_body=False,
+    )
     poll.assert_not_awaited()
 
     job.state = ArchiveJobState.RATE_LIMITED
@@ -1131,6 +1158,64 @@ async def test_poll_one_delays_no_id_work_while_archive_is_paused(monkeypatch):
     assert job.lease_owner is None
     assert before <= job.next_attempt_at <= after
     session.commit.assert_awaited_once_with()
+
+
+async def test_persisted_archive_preflight_retries_fetch_errors_and_fails_http_errors():
+    page = SimpleNamespace(
+        active=True,
+        deactivated_at=None,
+        url="https://example.test/page",
+        first_crawled_at=None,
+        last_crawled_at=None,
+        status_code=None,
+        final_url=None,
+        error=None,
+    )
+    domain = SimpleNamespace(host="example.test", include_subdomains=False)
+    job = SimpleNamespace(
+        state=ArchiveJobState.UNCERTAIN,
+        completed_at=None,
+        error=None,
+        next_attempt_at=NOW,
+        lease_owner="worker",
+        lease_expires_at=NOW,
+    )
+    session = MagicMock(commit=AsyncMock())
+    crawler = SimpleNamespace(
+        fetch=AsyncMock(side_effect=FetchError("connection failed", transient=True))
+    )
+
+    before = datetime.now(UTC) + timedelta(minutes=1)
+    assert (
+        await service._archive_preflight(session, page, domain, crawler, job=job)
+        is False
+    )
+    after = datetime.now(UTC) + timedelta(minutes=1)
+    assert page.error == "connection failed"
+    assert job.error == "connection failed"
+    assert before <= job.next_attempt_at <= after
+    assert job.lease_owner is None
+    assert job.lease_expires_at is None
+
+    crawler.fetch = AsyncMock(
+        return_value=FetchResult(404, page.url, {}, b"", None, ())
+    )
+    job.lease_owner = "worker"
+    job.lease_expires_at = NOW
+    before = datetime.now(UTC)
+    assert (
+        await service._archive_preflight(session, page, domain, crawler, job=job)
+        is False
+    )
+    after = datetime.now(UTC)
+    assert page.active is False
+    assert before <= page.deactivated_at <= after
+    assert page.error == "HTTP 404"
+    assert job.state is ArchiveJobState.FAILED
+    assert before <= job.completed_at <= after
+    assert job.error == "HTTP 404"
+    assert job.lease_owner is None
+    assert job.lease_expires_at is None
 
 
 async def test_worker_failure_helpers_release_and_delay_work():

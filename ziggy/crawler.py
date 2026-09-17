@@ -15,8 +15,10 @@ from urllib.parse import urlsplit
 
 import niquests
 from loguru import logger
+from sqlalchemy import select
 
 from ziggy.database import insert_page_candidates
+from ziggy.models import Page
 from ziggy.urls import (
     SitemapContents,
     UrlError,
@@ -34,7 +36,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from ziggy.config import CrawlSettings
-    from ziggy.models import Page
 
 _TRANSIENT_STATUSES = {408, 425, 429}
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -191,7 +192,7 @@ class CrawlerClient:
             raise
         return response, limit
 
-    async def fetch(  # noqa: C901
+    async def fetch(  # noqa: C901, PLR0913
         self,
         url: str,
         configured_host: str,
@@ -199,6 +200,7 @@ class CrawlerClient:
         include_subdomains: bool,
         etag: str | None = None,
         last_modified: str | None = None,
+        read_body: bool = True,
     ) -> FetchResult:
         """Fetch one page while enforcing scope at every redirect hop."""
         current = normalize_url(url)
@@ -268,16 +270,14 @@ class CrawlerClient:
                         current = target
                         request_headers = {}
                         continue
-                    body = (
-                        b""
-                        if status_code == _NOT_MODIFIED
-                        else await _read_bounded(
+                    body = b""
+                    if read_body and status_code != _NOT_MODIFIED:
+                        body = await _read_bounded(
                             response, self.settings.max_response_bytes
                         )
-                    )
-                    body = _decode_gzip_sitemap(
-                        current, body, self.settings.max_response_bytes
-                    )
+                        body = _decode_gzip_sitemap(
+                            current, body, self.settings.max_response_bytes
+                        )
                     return FetchResult(
                         status_code,
                         current,
@@ -411,6 +411,54 @@ def discoveries(
     return tuple(found), is_sitemap
 
 
+async def validated_page_candidates(
+    session: AsyncSession,
+    urls: tuple[str, ...],
+    *,
+    configured_host: str,
+    include_subdomains: bool,
+    client: CrawlerClient,
+) -> tuple[str, ...]:
+    """Keep existing pages and unseen candidates whose origin returns 2xx."""
+    unique = tuple(
+        dict.fromkeys(url for url in urls if sensitive_query_key(url) is None)
+    )
+    if not unique:
+        return ()
+    with session.no_autoflush:
+        existing = set(
+            await session.scalars(select(Page.url).where(Page.url.in_(unique)))
+        )
+    # Do not retain a SQLite read snapshot while origin validation performs I/O.
+    await session.commit()
+
+    async def validate(url: str) -> str | None:
+        try:
+            result = await client.fetch(
+                url,
+                configured_host,
+                include_subdomains=include_subdomains,
+                read_body=False,
+            )
+        except FetchError as error:
+            logger.warning("Page validation failed for {}: {}", url, error)
+            return None
+        if _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
+            return url
+        logger.info(
+            "Page ignored after validation returned HTTP {}: {}",
+            result.status_code,
+            url,
+        )
+        return None
+
+    checked = await asyncio.gather(
+        *(validate(url) for url in unique if url not in existing)
+    )
+    accepted = existing | {url for url in checked if url is not None}
+    return tuple(url for url in unique if url in accepted)
+
+
 def _decode_html(body: bytes, encoding: str | None) -> str:
     try:
         return body.decode(encoding or "utf-8", errors="replace")
@@ -498,7 +546,13 @@ async def crawl_page(  # noqa: PLR0913
             include_subdomains=include_subdomains,
         )
     )
-    discovered = tuple(dict.fromkeys(scoped))
+    discovered = await validated_page_candidates(
+        session,
+        tuple(dict.fromkeys(scoped)),
+        configured_host=configured_host,
+        include_subdomains=include_subdomains,
+        client=client,
+    )
     inserted = ()
     if discovered:
         inserted = await insert_page_candidates(
