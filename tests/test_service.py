@@ -33,7 +33,7 @@ from ziggy.config import (
     ZiggySettings,
 )
 from ziggy.crawler import FetchError, FetchResult
-from ziggy.models import Base, ServiceState
+from ziggy.models import Base, Domain, Page, ServiceState
 
 # This suite deliberately covers module-private orchestration boundaries.
 # ruff: noqa: FBT003, S106, SLF001
@@ -1222,7 +1222,7 @@ async def test_persisted_archive_preflight_retries_fetch_errors_and_fails_http_e
 
 
 async def test_worker_failure_helpers_release_and_delay_work():
-    session = MagicMock(commit=AsyncMock(), rollback=AsyncMock())
+    session = MagicMock(commit=AsyncMock(), rollback=AsyncMock(), refresh=AsyncMock())
     page = SimpleNamespace(
         error=None,
         url="https://example.test/",
@@ -1266,6 +1266,60 @@ async def test_worker_failure_helpers_release_and_delay_work():
     assert page.archive_history_lease_expires_at is None
     assert session.commit.await_count == 3
     assert session.rollback.await_count == 3
+    assert session.refresh.await_count == 4
+
+
+async def test_archive_history_worker_failure_refreshes_rollback_expired_page(
+    monkeypatch, tmp_path
+):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'failure.sqlite3').as_posix()}"
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(service.logger, "exception", MagicMock())
+
+    try:
+        async with sessions() as session:
+            domain = Domain(
+                host="example.test",
+                scheme="https",
+                include_subdomains=False,
+                active=True,
+                created_at=NOW,
+                configured_at=NOW,
+            )
+            session.add(domain)
+            await session.flush()
+            page = Page(
+                domain_id=domain.id,
+                url="https://example.test/",
+                discovered_at=NOW,
+                next_crawl_at=NOW,
+                next_archive_at=NOW,
+                archive_history_check_attempts=2,
+                archive_history_lease_owner="worker",
+                archive_history_lease_expires_at=NOW,
+            )
+            session.add(page)
+            await session.commit()
+
+            page.archive_history_check_error = "pending"
+            await session.flush()
+            before = datetime.now(UTC) + timedelta(minutes=1)
+            await service._archive_history_worker_failure(
+                session, page, RuntimeError("failure")
+            )
+            after = datetime.now(UTC) + timedelta(minutes=1)
+
+            assert page.archive_history_check_attempts == 3
+            assert page.archive_history_check_error == "RuntimeError"
+            assert before <= page.next_archive_history_check_at <= after
+            assert page.archive_history_lease_owner is None
+            assert page.archive_history_lease_expires_at is None
+    finally:
+        await engine.dispose()
 
 
 async def test_crawl_scheduler_claims_batch_and_waits_when_idle(monkeypatch):

@@ -807,6 +807,7 @@ async def _worker_failure(
     session: AsyncSession, page: Page, kind: str, error: Exception
 ) -> None:
     await session.rollback()
+    await session.refresh(page)
     page.error = type(error).__name__
     page.crawl_lease_owner = None
     page.crawl_lease_expires_at = None
@@ -819,6 +820,8 @@ async def _archive_worker_failure(
     session: AsyncSession, job: ArchiveJob, page: Page, error: Exception
 ) -> None:
     await session.rollback()
+    await session.refresh(job)
+    await session.refresh(page)
     job.error = type(error).__name__
     job.lease_owner = None
     job.lease_expires_at = None
@@ -831,6 +834,7 @@ async def _archive_history_worker_failure(
     session: AsyncSession, page: Page, error: Exception
 ) -> None:
     await session.rollback()
+    await session.refresh(page)
     page.archive_history_check_attempts += 1
     page.archive_history_check_error = type(error).__name__
     page.next_archive_history_check_at = datetime.now(UTC) + timedelta(minutes=1)
