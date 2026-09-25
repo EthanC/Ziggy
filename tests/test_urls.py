@@ -157,7 +157,10 @@ def test_normalize_url_rejects_invalid_urls(value):
     [
         ("https://abc.example.com/", False, True),
         ("https://ABC.EXAMPLE.COM./", False, True),
+        ("https://www.abc.example.com/", False, True),
+        ("https://www.www.abc.example.com/", False, False),
         ("https://child.abc.example.com/", False, False),
+        ("https://www.child.abc.example.com/", False, False),
         ("https://child.abc.example.com/", True, True),
         ("https://deep.child.abc.example.com/", True, True),
         ("https://example.com/", True, False),
@@ -177,6 +180,11 @@ def test_url_in_scope_honors_exact_abc_subdomain_boundary(
         )
         is expected
     )
+
+
+def test_url_in_scope_treats_configured_www_host_as_apex_alias():
+    assert url_in_scope("https://abc.example.com/", "www.abc.example.com")
+    assert not url_in_scope("https://com/", "www.com")
 
 
 @pytest.mark.parametrize(

@@ -148,6 +148,24 @@ def _normalize_url_host(value: str) -> str:
     return normalize_host(value)
 
 
+def _without_www_alias(host: str) -> str:
+    remainder = host.removeprefix("www.")
+    return remainder if remainder != host and "." in remainder else host
+
+
+def host_in_scope(
+    host: str, configured_host: str, *, include_subdomains: bool = False
+) -> bool:
+    """Check a host against a scope, treating one leading www label as an alias."""
+    normalized_host = normalize_host(host)
+    normalized_scope = normalize_host(configured_host)
+    comparable_host = _without_www_alias(normalized_host)
+    comparable_scope = _without_www_alias(normalized_scope)
+    return comparable_host == comparable_scope or (
+        include_subdomains and comparable_host.endswith(f".{comparable_scope}")
+    )
+
+
 def url_in_scope(
     url: str, configured_host: str, *, include_subdomains: bool = False
 ) -> bool:
@@ -156,11 +174,13 @@ def url_in_scope(
         host_value = urlsplit(normalize_url(url)).hostname
         if host_value is None:
             return False
-        host = host_value.lower().rstrip(".")
-        scope = normalize_host(configured_host)
+        return host_in_scope(
+            host_value,
+            configured_host,
+            include_subdomains=include_subdomains,
+        )
     except ValueError:
         return False
-    return host == scope or (include_subdomains and host.endswith(f".{scope}"))
 
 
 class _PageParser(HTMLParser):

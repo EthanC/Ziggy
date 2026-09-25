@@ -65,7 +65,7 @@ uv run python -m ziggy run --config ziggy.toml
 
 ## Configuration
 
-Each `[[domains]]` table defines one website scope and its recurring seed URLs. Add another table for each website Ziggy should crawl. Seeds are crawled ahead of ordinary frontier pages and use `crawl.seed_interval`, which defaults to one hour; other pages use `crawl.interval`.
+Each `[[domains]]` table defines one website scope and its recurring seed URLs. Add another table for each website Ziggy should crawl. A host and its exact `www.` alias share one scope; other subdomains require `include_subdomains = true`. Seeds are crawled ahead of ordinary frontier pages and use `crawl.seed_interval`, which defaults to one hour; other pages use `crawl.interval`.
 
 ```toml
 [[domains]]

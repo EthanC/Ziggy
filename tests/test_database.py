@@ -492,6 +492,33 @@ async def test_reconcile_domains_transfers_and_deactivates_retained_pages(
         assert child_page.in_scope is True
 
 
+async def test_reconcile_keeps_exact_www_alias_in_apex_scope(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    config = SimpleNamespace(domains=(DomainSettings("example.com"),))
+
+    async with sessions() as session:
+        await reconcile_domains(session, config, now)
+        domain = await session.scalar(select(Domain))
+        assert domain is not None
+        page = Page(
+            domain_id=domain.id,
+            url="https://www.example.com/news",
+            discovered_at=now,
+            next_crawl_at=now,
+            next_archive_at=now,
+        )
+        session.add(page)
+        await session.commit()
+
+        await reconcile_domains(session, config, now + timedelta(hours=1))
+
+        page = await session.get(Page, page.id)
+        assert page is not None
+        assert page.domain_id == domain.id
+        assert page.in_scope is True
+
+
 @pytest.mark.parametrize("kind", ["crawl", "archive"])
 async def test_claim_due_page_skips_out_of_scope_pages(database, kind):
     _, sessions = database

@@ -24,6 +24,7 @@ from sqlalchemy.orm import aliased
 from ziggy.models import ArchiveJob, ArchiveJobState, Domain, Page
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+    host_in_scope,
     query_base_url,
     sensitive_query_key,
 )
@@ -286,7 +287,11 @@ async def reconcile_domains(  # noqa: C901
                     (
                         candidate
                         for host, candidate in configured_by_host.items()
-                        if candidate[0] and page_host.endswith(f".{host}")
+                        if host_in_scope(
+                            page_host,
+                            host,
+                            include_subdomains=candidate[0],
+                        )
                     ),
                     None,
                 )

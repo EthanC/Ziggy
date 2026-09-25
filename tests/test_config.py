@@ -303,7 +303,9 @@ def test_load_config_rejects_invalid_domains(tmp_path, domain, message):
     ("include_subdomains", "seed", "accepted"),
     [
         (False, "https://abc.example.com/page", True),
+        (False, "https://www.abc.example.com/page", True),
         (False, "https://child.abc.example.com/page", False),
+        (False, "https://www.child.abc.example.com/page", False),
         (True, "https://child.abc.example.com/page", True),
         (True, "https://deep.child.abc.example.com/page", True),
         (True, "https://example.com/page", False),
@@ -334,6 +336,10 @@ def test_domain_seed_scope_uses_exact_subdomain_boundary(
         (
             '[{host = "example.com"}, {host = "EXAMPLE.COM."}]',
             "duplicate domain host: example.com",
+        ),
+        (
+            '[{host = "example.com"}, {host = "www.example.com"}]',
+            "overlapping domain scopes",
         ),
         (
             (

@@ -365,6 +365,23 @@ async def test_fetch_omits_empty_conditional_headers(monkeypatch):
     assert session.get_calls[0][1]["headers"] == {}
 
 
+async def test_fetch_follows_exact_www_alias_without_subdomain_scope(monkeypatch):
+    redirect = FakeResponse(308, headers={"Location": "https://www.example.com/end"})
+    final = FakeResponse(200, body=b"done")
+    client, session, _ = install_client(monkeypatch, [redirect, final])
+
+    result = await client.fetch(
+        "https://example.com/", "example.com", include_subdomains=False
+    )
+
+    assert result.final_url == "https://www.example.com/end"
+    assert result.blocked_redirect is None
+    assert [call[0] for call in session.get_calls] == [
+        "https://example.com/",
+        "https://www.example.com/end",
+    ]
+
+
 async def test_fetch_returns_redirect_without_location(monkeypatch):
     response = FakeResponse(301, headers={"Server": "fake"}, encoding="ascii")
     client, _, _ = install_client(monkeypatch, [response])

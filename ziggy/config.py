@@ -15,6 +15,7 @@ from loguru import logger
 
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+    host_in_scope,
     normalize_host,
     normalize_url,
     sensitive_query_key,
@@ -324,8 +325,10 @@ def _parse_domain(value: object, index: int) -> DomainSettings:  # noqa: C901
 
 
 def _host_in_scope(host: str, domain: DomainSettings) -> bool:
-    return host == domain.host or (
-        domain.include_subdomains and host.endswith(f".{domain.host}")
+    return host_in_scope(
+        host,
+        domain.host,
+        include_subdomains=domain.include_subdomains,
     )
 
 
