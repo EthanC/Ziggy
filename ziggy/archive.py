@@ -26,7 +26,6 @@ from loguru import logger
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
-from ziggy.crawler import validated_page_candidates
 from ziggy.database import insert_page_candidates
 from ziggy.models import (
     ArchiveJob,
@@ -59,7 +58,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from ziggy.config import ArchiveSettings
-    from ziggy.crawler import CrawlerClient
 
 
 class ArchiveError(RuntimeError):
@@ -603,7 +601,6 @@ async def poll_archive_job(  # noqa: PLR0911, PLR0913
     page: Page,
     domain: Domain,
     client: ArchiveClient,
-    crawler: CrawlerClient | None = None,
     settings: ArchiveSettings,
     now: datetime,
     max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
@@ -618,7 +615,6 @@ async def poll_archive_job(  # noqa: PLR0911, PLR0913
             page,
             domain,
             client,
-            crawler,
             settings,
             now,
             max_query_variants_per_base,
@@ -683,7 +679,6 @@ async def poll_archive_job(  # noqa: PLR0911, PLR0913
         page,
         domain,
         client,
-        crawler,
         settings,
         now,
         max_query_variants_per_base,
@@ -756,7 +751,6 @@ async def _post_process(  # noqa: PLR0913, PLR0917
     page: Page,
     domain: Domain,
     client: ArchiveClient,
-    crawler: CrawlerClient | None,
     settings: ArchiveSettings,
     now: datetime,
     max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
@@ -768,19 +762,16 @@ async def _post_process(  # noqa: PLR0913, PLR0917
             await session.commit()
         if not job.outlinks_processed:
             children = await client.outlinks(job.external_job_id or "")
-            crawler = _outlink_crawler(children, crawler)
-            if crawler is not None:
-                await _record_outlinks(
-                    session,
-                    job,
-                    page,
-                    domain,
-                    children,
-                    crawler,
-                    settings,
-                    now,
-                    max_query_variants_per_base,
-                )
+            await _record_outlinks(
+                session,
+                job,
+                page,
+                domain,
+                children,
+                settings,
+                now,
+                max_query_variants_per_base,
+            )
             job.outlinks_processed = True
             job.error = None
             await session.commit()
@@ -798,21 +789,12 @@ async def _post_process(  # noqa: PLR0913, PLR0917
         await session.commit()
 
 
-def _outlink_crawler(
-    children: Sequence[SuccessStatus], crawler: CrawlerClient | None
-) -> CrawlerClient | None:
-    if children and crawler is None:
-        raise ArchiveError("origin validator unavailable for archive outlinks")
-    return crawler
-
-
 async def _record_outlinks(  # noqa: PLR0913, PLR0917
     session: AsyncSession,
     parent: ArchiveJob,
     parent_page: Page,
     domain: Domain,
     children: Sequence[SuccessStatus],
-    crawler: CrawlerClient,
     settings: ArchiveSettings,
     now: datetime,
     max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
@@ -830,18 +812,7 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
         ):
             continue
         candidates.append((child, url))
-    storable = set(
-        await validated_page_candidates(
-            session,
-            tuple(url for _, url in candidates),
-            configured_host=domain.host,
-            include_subdomains=domain.include_subdomains,
-            client=crawler,
-        )
-    )
     for child, url in candidates:
-        if url not in storable:
-            continue
         await insert_page_candidates(
             session,
             [

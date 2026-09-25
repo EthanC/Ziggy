@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -118,6 +119,9 @@ class Page(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id", ondelete="CASCADE"))
     url: Mapped[str] = mapped_column(Text, unique=True)
+    is_seed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
     active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     deactivated_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
     in_scope: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
@@ -158,6 +162,12 @@ class Page(Base):
 
     __table_args__ = (
         Index("ix_pages_due_crawl", "next_crawl_at", "crawl_lease_expires_at"),
+        Index(
+            "ix_pages_due_seed_crawl",
+            "next_crawl_at",
+            "crawl_lease_expires_at",
+            sqlite_where=is_seed.is_(True),
+        ),
         Index("ix_pages_due_archive", "next_archive_at", "archive_lease_expires_at"),
         Index(
             "ix_pages_due_archive_history",

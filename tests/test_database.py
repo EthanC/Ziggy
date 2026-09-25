@@ -351,6 +351,85 @@ async def test_reconcile_domains_adds_removes_readds_and_deduplicates_seeds(data
             "https://beta.example/",
             "https://beta.example/again",
         }
+        seeds = {page.url: page.is_seed for page in await session.scalars(select(Page))}
+        assert {url for url, is_seed in seeds.items() if is_seed} == {
+            "http://alpha.example/",
+            "http://alpha.example/new",
+            "https://beta.example/",
+            "https://beta.example/again",
+        }
+
+        await reconcile_domains(
+            session, SimpleNamespace(domains=()), third + timedelta(hours=1)
+        )
+        assert not any(await session.scalars(select(Page.is_seed)))
+
+
+async def test_reconcile_preserves_current_seed_schedule_and_promotes_new_seed(
+    database,
+):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    config = SimpleNamespace(
+        domains=(DomainSettings("example.com"),),
+        crawl=SimpleNamespace(max_query_variants_per_base=0),
+    )
+
+    async with sessions() as session:
+        await reconcile_domains(session, config, now)
+        seed = await session.scalar(select(Page))
+        assert seed is not None
+        assert seed.is_seed is True
+
+        scheduled = now + timedelta(minutes=30)
+        seed.next_crawl_at = scheduled
+        await session.commit()
+        await reconcile_domains(session, config, now + timedelta(minutes=5))
+
+        seed = await session.scalar(select(Page))
+        assert seed is not None
+        assert seed.next_crawl_at == scheduled
+
+        discovered = Page(
+            domain_id=seed.domain_id,
+            url="https://example.com/new",
+            discovered_at=now,
+            next_crawl_at=now + timedelta(days=1),
+            next_archive_at=now,
+        )
+        session.add(discovered)
+        await session.commit()
+        replacement = SimpleNamespace(
+            domains=(DomainSettings("example.com", seeds=("/", "/new")),),
+            crawl=config.crawl,
+        )
+        promoted_at = now + timedelta(minutes=10)
+        await reconcile_domains(session, replacement, promoted_at)
+        promoted = await session.scalar(
+            select(Page).where(Page.url == "https://example.com/new")
+        )
+        assert promoted is not None
+        assert promoted.is_seed is True
+        assert promoted.next_crawl_at == promoted_at
+
+
+async def test_reconcile_admits_explicit_query_seed_when_variant_cap_is_zero(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    config = SimpleNamespace(
+        domains=(DomainSettings("example.com", seeds=("/?page=1",)),),
+        crawl=SimpleNamespace(max_query_variants_per_base=0),
+    )
+
+    async with sessions() as session:
+        await reconcile_domains(session, config, now)
+        seed = await session.scalar(select(Page))
+
+        assert seed is not None
+        assert seed.url == "https://example.com/?page=1"
+        assert seed.is_seed is True
+        assert seed.query_base_url is None
+        assert seed.query_variant_slot is None
 
 
 async def test_reconcile_domains_transfers_and_deactivates_retained_pages(
@@ -563,7 +642,9 @@ async def test_archive_claim_skips_inactive_pages(database):
         )
 
 
-async def test_crawl_claims_inactive_page_only_after_due_active_work_finishes(database):
+async def test_crawl_claims_inactive_page_when_due_active_work_is_already_leased(
+    database,
+):
     _, sessions = database
     now = datetime(2026, 8, 28, 9, tzinfo=UTC)
     inactive = await _add_page(sessions, now - timedelta(days=30))
@@ -585,24 +666,45 @@ async def test_crawl_claims_inactive_page_only_after_due_active_work_finishes(da
         first = await claim_due_page(
             session, "crawl", "worker", now, timedelta(minutes=10)
         )
-        blocked_fallback = await claim_due_page(
+        fallback = await claim_due_page(
             session, "crawl", "worker", now, timedelta(minutes=10)
         )
 
         assert first is not None
         assert first.id == active.id
-        assert blocked_fallback is None
-
-        active.next_crawl_at = now + timedelta(hours=1)
-        active.crawl_lease_owner = None
-        active.crawl_lease_expires_at = None
-        await session.commit()
-
-        fallback = await claim_due_page(
-            session, "crawl", "worker", now, timedelta(minutes=10)
-        )
         assert fallback is not None
         assert fallback.id == inactive.id
+
+
+async def test_crawl_claims_inactive_seed_before_older_active_regular_page(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    regular = await _add_page(sessions, now - timedelta(days=30))
+
+    async with sessions() as session:
+        seed = Page(
+            domain_id=regular.domain_id,
+            url="https://example.com/news",
+            is_seed=True,
+            active=False,
+            discovered_at=now,
+            next_crawl_at=now,
+            next_archive_at=now,
+        )
+        session.add(seed)
+        await session.commit()
+
+        first = await claim_due_page(
+            session, "crawl", "worker", now, timedelta(minutes=10)
+        )
+        second = await claim_due_page(
+            session, "crawl", "worker", now, timedelta(minutes=10)
+        )
+
+        assert first is not None
+        assert first.id == seed.id
+        assert second is not None
+        assert second.id == regular.id
 
 
 async def test_archive_claim_is_blocked_by_every_active_direct_job_state(database):

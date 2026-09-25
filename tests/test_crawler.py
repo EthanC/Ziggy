@@ -97,8 +97,6 @@ class FakeDatabaseSession:
 
     async def scalars(self, _statement):
         self.scalar_calls += 1
-        if self.scalar_calls == 1:
-            return self.existing_urls
         return tuple(
             SimpleNamespace(url=url, blocked_reason=None) for url in self.existing_urls
         )
@@ -164,6 +162,7 @@ def make_page(**changes):
         "id": 11,
         "domain_id": 4,
         "url": "https://example.com/start",
+        "is_seed": False,
         "active": True,
         "deactivated_at": None,
         "discovered_at": NOW - timedelta(days=1),
@@ -817,18 +816,6 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
                 "last_modified": "old-date",
             },
         ),
-        (
-            ("https://example.com/child", "example.com"),
-            {"include_subdomains": False, "read_body": False},
-        ),
-        (
-            ("https://example.com/redirect", "example.com"),
-            {"include_subdomains": False, "read_body": False},
-        ),
-        (
-            ("https://example.com/header", "example.com"),
-            {"include_subdomains": False, "read_body": False},
-        ),
     ]
     assert page.status_code == 200
     assert page.final_url == "https://example.com/final"
@@ -841,7 +828,7 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
     assert page.crawl_attempts == 0
     assert page.crawl_lease_owner is None
     assert page.crawl_lease_expires_at is None
-    assert session.commits == 2
+    assert session.commits == 1
     assert len(session.statements) == 1
     statement = session.statements[0]
     params = statement.compile().params
@@ -922,7 +909,7 @@ async def test_crawl_page_logs_only_urls_inserted_by_database(monkeypatch):
     assert logged == [("Page found: {}", "https://example.com/new")]
 
 
-async def test_crawl_page_stores_only_successfully_validated_new_urls():
+async def test_crawl_page_durably_stores_discoveries_without_origin_preflight():
     page = make_page()
     result = make_result(
         body=(
@@ -931,14 +918,7 @@ async def test_crawl_page_stores_only_successfully_validated_new_urls():
             b'<a href="/known">known</a>'
         )
     )
-    client = FakeClient(
-        [
-            result,
-            make_result(final_url="https://example.com/ok"),
-            make_result(status_code=404, final_url="https://example.com/missing"),
-            crawler.FetchError("timeout", transient=True),
-        ]
-    )
+    client = FakeClient(result)
     session = FakeDatabaseSession(existing_urls=("https://example.com/known",))
 
     await crawler.crawl_page(
@@ -954,13 +934,10 @@ async def test_crawl_page_stores_only_successfully_validated_new_urls():
     params = session.statements[0].compile().params
     assert [value for key, value in params.items() if key.startswith("url_m")] == [
         "https://example.com/ok",
-    ]
-    assert [call[0][0] for call in client.calls[1:]] == [
-        "https://example.com/ok",
         "https://example.com/missing",
         "https://example.com/timeout",
     ]
-    assert all(call[1]["read_body"] is False for call in client.calls[1:])
+    assert len(client.calls) == 1
 
 
 async def test_crawl_page_allows_exact_subdomains_when_configured():
@@ -1070,6 +1047,19 @@ async def test_crawl_page_permanent_status_and_blocked_redirect_schedule_interva
     assert page.next_crawl_at == NOW + make_settings().interval
     assert random.calls == []
     assert session.statements == []
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [make_result(), crawler.FetchError("bad URL", transient=False)],
+)
+async def test_seed_page_uses_seed_interval_after_terminal_result(outcome):
+    page = make_page(is_seed=True)
+
+    session, _, _ = await run_crawl(page, outcome)
+
+    assert page.next_crawl_at == NOW + make_settings().seed_interval
+    assert session.commits == 1
 
 
 @pytest.mark.parametrize(

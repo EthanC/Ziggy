@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "7a3e9c1d4b20"
+HEAD_REVISION = "4c2f9a8e1d76"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -132,6 +132,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     assert migrations.joinpath("versions", "6b519c405276_initial_schema.py").is_file()
     assert migrations.joinpath(
         "versions", "f5c2b31a8d4e_add_page_scope_state.py"
+    ).is_file()
+    assert migrations.joinpath(
+        "versions", "4c2f9a8e1d76_prioritize_seed_pages.py"
     ).is_file()
     assert migrations.joinpath(
         "versions", "9d14f3a7c2e1_allow_reused_archive_job_ids.py"

@@ -51,6 +51,7 @@ def test_load_minimal_config_uses_defaults_and_resolves_database(tmp_path):
     assert config.ziggy.database == (tmp_path / "ziggy.db").resolve()
     assert config.ziggy.config_reload_interval == timedelta(seconds=30)
     assert config.crawl.interval == timedelta(hours=24)
+    assert config.crawl.seed_interval == timedelta(hours=1)
     assert config.crawl.concurrency == 2
     assert config.crawl.per_host_concurrency == 2
     assert config.crawl.request_delay == 1.0
@@ -86,6 +87,7 @@ config_reload_interval = "2m"
 
 [crawl]
 interval = "2h"
+seed_interval = "15m"
 concurrency = 3
 per_host_concurrency = 1
 request_delay = 0
@@ -124,6 +126,7 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
     assert config.ziggy.database == absolute_database
     assert config.ziggy.config_reload_interval == timedelta(minutes=2)
     assert config.crawl.request_delay == 0.0
+    assert config.crawl.seed_interval == timedelta(minutes=15)
     assert config.crawl.request_timeout == 4.5
     assert config.crawl.max_query_variants_per_base == 7
     assert config.archive.max_pending_jobs == 3

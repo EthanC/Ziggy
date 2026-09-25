@@ -65,7 +65,7 @@ uv run python -m ziggy run --config ziggy.toml
 
 ## Configuration
 
-Each `[[domains]]` table defines one website scope and its starting URLs. Add another table for each website Ziggy should crawl.
+Each `[[domains]]` table defines one website scope and its recurring seed URLs. Add another table for each website Ziggy should crawl. Seeds are crawled ahead of ordinary frontier pages and use `crawl.seed_interval`, which defaults to one hour; other pages use `crawl.interval`.
 
 ```toml
 [[domains]]
@@ -80,6 +80,6 @@ seeds = ["/", "/sitemap.xml"]
 | `host` | Hostname to crawl, without a scheme or path | Yes | None |
 | `scheme` | Scheme used for relative seeds | No | `"https"` |
 | `include_subdomains` | Include descendants of `host` in the crawl | No | `false` |
-| `seeds` | Starting paths or in-scope URLs | No | `["/"]` |
+| `seeds` | Priority discovery paths or in-scope URLs | No | `["/"]` |
 
 Crawler, archive, reporting, and logging settings are documented with their defaults in [`ziggy.example.toml`](ziggy.example.toml). `archive.interval` controls both recurring capture scheduling and the Wayback recency window used to prioritize pages. `archive.max_pending_jobs` limits captures still processing at Internet Archive, while `archive.request_delay` sets the minimum delay between Archive.org operations. Authenticated instances also consult the account's live Save Page Now capacity before submitting. Durations use an integer followed by `s`, `m`, `h`, or `d`.

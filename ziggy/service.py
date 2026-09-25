@@ -640,7 +640,6 @@ async def _poll_one(
                     page=page,
                     domain=domain,
                     client=state.archive_client,
-                    crawler=state.crawler,
                     settings=state.config.archive,
                     now=datetime.now(UTC),
                     max_query_variants_per_base=(

@@ -92,6 +92,7 @@ class CrawlSettings:
     """Crawler scheduling and network limits."""
 
     interval: timedelta = timedelta(hours=24)
+    seed_interval: timedelta = timedelta(hours=1)
     concurrency: int = 2
     per_host_concurrency: int = 2
     request_delay: float = 1.0
@@ -199,6 +200,7 @@ def _parse_crawl(data: dict[str, Any]) -> CrawlSettings:
     _only(data, names, "crawl")
     return CrawlSettings(
         interval=parse_duration(data.get("interval", "24h")),
+        seed_interval=parse_duration(data.get("seed_interval", "1h")),
         concurrency=_positive_int(data.get("concurrency", 2), "crawl.concurrency"),
         per_host_concurrency=_positive_int(
             data.get("per_host_concurrency", 2), "crawl.per_host_concurrency"

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from sqlalchemy import case, event, exists, or_, select, text, update
+from sqlalchemy import case, event, exists, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -58,7 +58,7 @@ class _DbapiConnection(Protocol):
     def cursor(self) -> _Cursor: ...
 
 
-async def insert_page_candidates(
+async def insert_page_candidates(  # noqa: C901
     session: AsyncSession,
     candidates: Sequence[Mapping[str, object]],
     max_query_variants_per_base: int,
@@ -79,9 +79,19 @@ async def insert_page_candidates(
         )
     }
     for url, page in existing.items():
-        if page.blocked_reason is None:
-            page.domain_id = cast("int", unique[url]["domain_id"])
+        values = unique[url]
+        is_seed = values.get("is_seed") is True
+        if page.blocked_reason is None or is_seed:
+            page.domain_id = cast("int", values["domain_id"])
             page.in_scope = True
+            if is_seed:
+                if not page.is_seed:
+                    page.next_crawl_at = min(
+                        page.next_crawl_at,
+                        cast("datetime", values["next_crawl_at"]),
+                    )
+                page.is_seed = True
+                page.blocked_reason = None
 
     pending = [values for url, values in unique.items() if url not in existing]
     bases = {
@@ -102,6 +112,11 @@ async def insert_page_candidates(
 
     admitted: list[dict[str, object]] = []
     for values in pending:
+        if values.get("is_seed") is True:
+            values["query_base_url"] = None
+            values["query_variant_slot"] = None
+            admitted.append(values)
+            continue
         base = query_base_url(str(values["url"]))
         if base is None:
             values["query_base_url"] = None
@@ -234,6 +249,15 @@ async def reconcile_domains(  # noqa: C901
             domain.deactivated_at = now
     await session.commit()
 
+    seed_urls = tuple(
+        url for settings, _domain_id in configured for url in settings.seed_urls
+    )
+    stale_seed = Page.is_seed.is_(True)
+    if seed_urls:
+        stale_seed &= Page.url.not_in(seed_urls)
+    await session.execute(update(Page).where(stale_seed).values(is_seed=False))
+    await session.commit()
+
     configured_by_host = {
         settings.host: (settings.include_subdomains, domain_id)
         for settings, domain_id in configured
@@ -284,6 +308,7 @@ async def reconcile_domains(  # noqa: C901
                 {
                     "domain_id": domain_id,
                     "url": url,
+                    "is_seed": True,
                     "in_scope": True,
                     "discovered_at": now,
                     "next_crawl_at": now,
@@ -351,7 +376,6 @@ async def claim_due_page(  # noqa: PLR0913
         due_column <= now,
         or_(expires_column.is_(None), expires_column <= now),
     ]
-    order_by = [due_column, Page.id]
     if kind == "archive":
         if archive_interval is None:
             raise ValueError("archive_interval is required for archive work")
@@ -391,7 +415,14 @@ async def claim_due_page(  # noqa: PLR0913
             (Page.archive_history_checked_at.is_(None), 1),
             else_=2,
         )
-        order_by.insert(0, priority)
+        candidate = (
+            select(Page.id)
+            .join(Domain, Page.domain_id == Domain.id)
+            .where(*conditions)
+            .order_by(priority, due_column, Page.id)
+            .limit(1)
+            .scalar_subquery()
+        )
     else:
         active_page = aliased(Page)
         active_domain = aliased(Domain)
@@ -401,21 +432,37 @@ async def claim_due_page(  # noqa: PLR0913
             .where(
                 active_domain.active.is_(True),
                 active_page.active.is_(True),
+                active_page.is_seed.is_(False),
                 active_page.in_scope.is_(True),
                 active_page.blocked_reason.is_(None),
                 active_page.next_crawl_at <= now,
+                or_(
+                    active_page.crawl_lease_expires_at.is_(None),
+                    active_page.crawl_lease_expires_at <= now,
+                ),
             )
         )
-        conditions.append(or_(Page.active.is_(True), ~due_active_page))
-        order_by.insert(0, Page.active.desc())
-    candidate = (
-        select(Page.id)
-        .join(Domain, Page.domain_id == Domain.id)
-        .where(*conditions)
-        .order_by(*order_by)
-        .limit(1)
-        .scalar_subquery()
-    )
+        seed_candidate = (
+            select(Page.id)
+            .join(Domain, Page.domain_id == Domain.id)
+            .where(*conditions, Page.is_seed.is_(True))
+            .order_by(due_column, Page.id)
+            .limit(1)
+            .scalar_subquery()
+        )
+        regular_candidate = (
+            select(Page.id)
+            .join(Domain, Page.domain_id == Domain.id)
+            .where(
+                *conditions,
+                Page.is_seed.is_(False),
+                or_(Page.active.is_(True), ~due_active_page),
+            )
+            .order_by(Page.active.desc(), due_column, Page.id)
+            .limit(1)
+            .scalar_subquery()
+        )
+        candidate = func.coalesce(seed_candidate, regular_candidate)
     statement = (
         update(Page)
         .where(
