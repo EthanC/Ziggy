@@ -21,7 +21,15 @@ from niquests import exceptions as niquests_exceptions
 from sqlalchemy import distinct, exists, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
-from ziggy.models import Capture, Domain, Page, Report, ReportState
+from ziggy.models import (
+    ArchiveJob,
+    ArchiveJobKind,
+    Capture,
+    Domain,
+    Page,
+    Report,
+    ReportState,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,9 +74,12 @@ async def create_report(
     )
     discovered = await session.scalar(select(func.count(Page.id)).where(*range_filter))
     archived = await session.scalar(
-        select(func.count(distinct(Capture.page_id))).where(
+        select(func.count(distinct(Capture.page_id)))
+        .join(ArchiveJob, Capture.archive_job_id == ArchiveJob.id)
+        .where(
             Capture.completed_at >= window.start,
             Capture.completed_at < window.end,
+            ArchiveJob.kind == ArchiveJobKind.DIRECT,
         )
     )
     outstanding = await session.scalar(
@@ -83,10 +94,13 @@ async def create_report(
         )
     )
     first_archives = await session.scalar(
-        select(func.count(Capture.id)).where(
+        select(func.count(Capture.id))
+        .join(ArchiveJob, Capture.archive_job_id == ArchiveJob.id)
+        .where(
             Capture.completed_at >= window.start,
             Capture.completed_at < window.end,
             Capture.first_archive.is_(True),
+            ArchiveJob.kind == ArchiveJobKind.DIRECT,
         )
     )
     deactivated = await session.scalar(
@@ -102,14 +116,20 @@ async def create_report(
         select(func.count(Page.id)).where(Page.discovered_at < window.end)
     )
     lifetime_archived = await session.scalar(
-        select(func.count(distinct(Capture.page_id))).where(
-            Capture.completed_at < window.end
+        select(func.count(distinct(Capture.page_id)))
+        .join(ArchiveJob, Capture.archive_job_id == ArchiveJob.id)
+        .where(
+            Capture.completed_at < window.end,
+            ArchiveJob.kind == ArchiveJobKind.DIRECT,
         )
     )
     lifetime_first_archives = await session.scalar(
-        select(func.count(Capture.id)).where(
+        select(func.count(Capture.id))
+        .join(ArchiveJob, Capture.archive_job_id == ArchiveJob.id)
+        .where(
             Capture.completed_at < window.end,
             Capture.first_archive.is_(True),
+            ArchiveJob.kind == ArchiveJobKind.DIRECT,
         )
     )
     lifetime_deactivated = await session.scalar(

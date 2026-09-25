@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "e41c7a9d2b60"
+HEAD_REVISION = "7a3e9c1d4b20"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -153,6 +153,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     ).is_file()
     assert migrations.joinpath(
         "versions", "e41c7a9d2b60_add_archive_history_priority.py"
+    ).is_file()
+    assert migrations.joinpath(
+        "versions", "7a3e9c1d4b20_count_direct_archives_in_reports.py"
     ).is_file()
 
 
@@ -370,6 +373,96 @@ async def test_lifetime_report_migration_backfills_existing_rows(tmp_path):
                 )
             ).one()
             assert result == (2, 1, 1, 1)
+    finally:
+        await engine.dispose()
+
+
+async def test_direct_archive_report_migration_excludes_outlink_captures(tmp_path):
+    path = tmp_path / "direct-archive-report-upgrade.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "e41c7a9d2b60")
+    engine = create_engine(path)
+    start = "2026-08-27T09:00:00.000000+00:00"
+    end = "2026-08-28T09:00:00.000000+00:00"
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(id, host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) VALUES "
+                    "(1, 'example.com', 'https', 0, 1, :start, :start)"
+                ),
+                {"start": start},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(id, domain_id, url, active, in_scope, discovered_at, "
+                    "next_crawl_at, next_archive_at, sitemap_depth, crawl_attempts, "
+                    "archive_history_check_attempts) VALUES "
+                    "(1, 1, 'https://example.com/direct', 1, 1, :start, "
+                    ":start, :start, 0, 0, 0), "
+                    "(2, 1, 'https://example.com/outlink', 1, 1, :start, "
+                    ":start, :start, 0, 0, 0)"
+                ),
+                {"start": start},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, intent_at, "
+                    "next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed) VALUES "
+                    "('direct-job', 1, 'DIRECT', 'SUCCEEDED', 'direct-cycle', "
+                    ":start, :start, 0, 1, 1), "
+                    "('outlink-job', 2, 'OUTLINK', 'SUCCEEDED', 'outlink-cycle', "
+                    ":start, :start, 0, 1, 1)"
+                ),
+                {"start": start},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO captures "
+                    "(page_id, archive_job_id, captured_at, wayback_url, "
+                    "completed_at, first_archive) VALUES "
+                    "(1, 'direct-job', :start, 'https://web.archive.org/direct', "
+                    ":start, 1), "
+                    "(2, 'outlink-job', :start, 'https://web.archive.org/outlink', "
+                    ":start, 1)"
+                ),
+                {"start": start},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO reports "
+                    "(window_start, window_end, generated_at, discovered_count, "
+                    "archived_count, outstanding_count, lifetime_discovered_count, "
+                    "lifetime_archived_count, first_archive_count, "
+                    "lifetime_first_archive_count, deactivated_count, "
+                    "lifetime_deactivated_count, active_domain_count, state, "
+                    "attempts, next_attempt_at) VALUES "
+                    "(:start, :end, :end, 2, 2, 0, 2, 2, 2, 2, 0, 0, 1, "
+                    "'PENDING', 0, :end)"
+                ),
+                {"start": start, "end": end},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.connect() as connection:
+            result = (
+                await connection.execute(
+                    text(
+                        "SELECT archived_count, lifetime_archived_count, "
+                        "first_archive_count, lifetime_first_archive_count "
+                        "FROM reports"
+                    )
+                )
+            ).one()
+            assert result == (1, 1, 1, 1)
     finally:
         await engine.dispose()
 

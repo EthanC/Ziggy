@@ -230,6 +230,17 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
         )
         session.add_all([first_archive_job, non_first_archive_job])
         await session.flush()
+        outlink_job = ArchiveJob(
+            page_id=outstanding.id,
+            parent_job_id=first_archive_job.id,
+            kind=ArchiveJobKind.OUTLINK,
+            state=ArchiveJobState.SUCCEEDED,
+            cycle_key="outlink-cycle",
+            intent_at=start,
+            next_attempt_at=start,
+        )
+        session.add(outlink_job)
+        await session.flush()
         session.add_all(
             [
                 Capture(
@@ -247,6 +258,14 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
                     wayback_url="https://web.archive.invalid/not-first",
                     first_archive=False,
                     completed_at=end - timedelta(microseconds=1),
+                ),
+                Capture(
+                    page_id=outstanding.id,
+                    archive_job_id=outlink_job.id,
+                    captured_at=start,
+                    wayback_url="https://web.archive.invalid/outlink",
+                    first_archive=True,
+                    completed_at=start,
                 ),
             ]
         )
@@ -266,7 +285,7 @@ async def test_create_report_uses_fixed_half_open_counts_and_is_idempotent(sessi
             report.lifetime_archived_count,
             report.lifetime_first_archive_count,
             report.lifetime_deactivated_count,
-        ) == (2, 2, 2, 1, 2, 1, 7, 2, 1, 3)
+        ) == (2, 2, 1, 1, 2, 1, 7, 2, 1, 3)
         assert report.state is ReportState.PENDING
         assert report.next_attempt_at == generated
 
