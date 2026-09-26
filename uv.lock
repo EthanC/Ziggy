@@ -170,6 +170,14 @@ wheels = [
 ]
 
 [[package]]
+name = "cronsim"
+version = "2.7"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fb/1a/02f105147f7f2e06ed4f734ff5a6439590bb275a53dd91fc73df6312298a/cronsim-2.7-py3-none-any.whl", hash = "sha256:1e1431fa08c51dc7f72e67e571c7c7a09af26420169b607badd4ca9677ffad1e", size = 14213, upload-time = "2025-10-21T16:38:20.431Z" },
+]
+
+[[package]]
 name = "discord-clyde"
 version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -695,6 +703,27 @@ wheels = [
 ]
 
 [[package]]
+name = "tzdata"
+version = "2026.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/31/3d74fa778a63b98b7374323befcc0be5ab3bd94afd4096a0124e7379152c/tzdata-2026.4.tar.gz", hash = "sha256:f1b8bd365d8d210c55353f4d7f8d6d8561c0ba50d704b700d195a9424bba0d79", size = 199350, upload-time = "2026-09-12T12:56:03.251Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/bc/8737e8d54cf51106118039b83f485a4783112fab49ea9d044b234978a46e/tzdata-2026.4-py2.py3-none-any.whl", hash = "sha256:c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81", size = 347494, upload-time = "2026-09-12T12:56:01.67Z" },
+]
+
+[[package]]
+name = "tzlocal"
+version = "5.4.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tzdata", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/5b/879b2f932adfa7a053c360d50bc896c977fa6426109185f7c12ebdd0cb9d/tzlocal-5.4.4.tar.gz", hash = "sha256:8dbb8660838688a7b6ba4fed31d18dedf842afb4d47ca050d6d891c2c15f3be4", size = 31170, upload-time = "2026-06-29T08:03:40.026Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/a4/017a7a6cbe387d961a688ec31364ae60a5c4e22c96ae9921b79a947c855d/tzlocal-5.4.4-py3-none-any.whl", hash = "sha256:aae09f0126a8a86fa736be266eb4a471380d26a0de3bc14844e7821fee3e2a15", size = 18115, upload-time = "2026-06-29T08:03:38.666Z" },
+]
+
+[[package]]
 name = "urllib3-future"
 version = "2.25.900"
 source = { registry = "https://pypi.org/simple" }
@@ -865,6 +894,7 @@ dependencies = [
     { name = "aiosqlite" },
     { name = "alembic" },
     { name = "archivist-py" },
+    { name = "cronsim" },
     { name = "discord-clyde" },
     { name = "environs" },
     { name = "loguru" },
@@ -872,6 +902,8 @@ dependencies = [
     { name = "niquests" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "starlette" },
+    { name = "tzdata" },
+    { name = "tzlocal" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -890,6 +922,7 @@ requires-dist = [
     { name = "aiosqlite" },
     { name = "alembic" },
     { name = "archivist-py" },
+    { name = "cronsim", specifier = ">=2.7" },
     { name = "discord-clyde", specifier = ">=1.1.0" },
     { name = "environs", specifier = ">=15.2.0" },
     { name = "loguru" },
@@ -897,6 +930,8 @@ requires-dist = [
     { name = "niquests" },
     { name = "sqlalchemy", extras = ["asyncio"] },
     { name = "starlette" },
+    { name = "tzdata", specifier = ">=2026.4" },
+    { name = "tzlocal", specifier = ">=5.4.4" },
     { name = "uvicorn", extras = ["standard"] },
 ]
 

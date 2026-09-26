@@ -20,6 +20,7 @@ Ziggy crawls and preserves websites you care about.
 - Send crawl reports and logs to Discord.
 - Reload configuration without restarting Ziggy.
 - Accept one-time archive requests through an optional HTTP queue.
+- Create verified SQLite backups on a cron schedule.
 
 ## Docker Compose
 
@@ -29,6 +30,7 @@ Create `/path/to/ziggy` and copy `ziggy.example.toml` there as `ziggy.toml`. Con
 | --- | --- | :---: | --- |
 | `PUID` | UID for the container process and files under `/ziggy` | No | `1000` |
 | `PGID` | GID for the container process and files under `/ziggy` | No | `1000` |
+| `TZ` | System timezone used by the container | No | `Etc/UTC` in `.env.example` |
 
 ```yaml
 services:
@@ -84,6 +86,26 @@ seeds = ["/", "/sitemap.xml"]
 | `seeds` | High-priority paths or in-scope URLs for discovery | No | `["/"]` |
 
 [`ziggy.example.toml`](ziggy.example.toml) lists all settings and defaults. `archive.interval` sets the capture schedule and Wayback recency window. `archive.max_pending_jobs` limits pending captures, and `archive.request_delay` spaces Archive.org operations. Authenticated instances also check the account's Save Page Now capacity. Durations are an integer followed by `s`, `m`, `h`, or `d`.
+
+## Database Backups
+
+Ziggy uses SQLite's online-backup API to create a standalone snapshot while the service is running. The default schedule is `0 7 * * *`, or 7:00 AM in the system's local timezone, and the default retention count is seven successful snapshots.
+
+| Environment variable | Description | Default |
+| --- | --- | --- |
+| `ZIGGY_BACKUP_ENABLED` | Enable the backup scheduler | `true` |
+| `ZIGGY_BACKUP_SCHEDULE` | Five-field cron expression | `0 7 * * *` |
+| `ZIGGY_BACKUP_DIRECTORY` | Snapshot destination; relative paths resolve beside the database | `backups` |
+| `ZIGGY_BACKUP_RETENTION_COUNT` | Successful snapshots to keep; `0` keeps all | `7` |
+| `ZIGGY_BACKUP_TIMEZONE` | Optional IANA timezone that overrides the system timezone | System local timezone |
+
+For the default `/ziggy/ziggy.db` database, snapshots are written to `/ziggy/backups`. The Docker Compose bind mount shown above persists both paths. An absolute backup directory outside `/ziggy` needs a separate writable, persistent mount.
+
+Set `TZ`, such as `TZ=America/New_York`, to configure the container's system timezone. Set `ZIGGY_BACKUP_TIMEZONE` when only the backup schedule needs a different IANA timezone. A 7:00 AM schedule remains at 7:00 AM across daylight-saving changes, so adjacent runs can be 23 or 25 hours apart.
+
+Backups run only while Ziggy is running. Startup waits for the next scheduled occurrence and does not replay missed runs. Backups run one at a time; a slow backup neither overlaps another backup nor queues past occurrences. Environment changes require a restart. If several Ziggy instances share one database, enable backups on one instance only.
+
+To restore a snapshot, stop Ziggy and every other process using the database. Move the current database to a safe location, then remove its stale `-wal` and `-shm` files. Copy the selected snapshot to the configured database path, set ownership and permissions for the configured `PUID` and `PGID`, and restart Ziggy. Normal database migrations run during startup.
 
 ## HTTP Queue
 

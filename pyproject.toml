@@ -11,6 +11,7 @@ dependencies = [
     "aiosqlite",
     "alembic",
     "archivist-py",
+    "cronsim>=2.7",
     "discord-clyde>=1.1.0",
     "environs>=15.2.0",
     "loguru",
@@ -18,6 +19,8 @@ dependencies = [
     "niquests",
     "sqlalchemy[asyncio]",
     "starlette",
+    "tzdata>=2026.4",
+    "tzlocal>=5.4.4",
     "uvicorn[standard]",
 ]
 

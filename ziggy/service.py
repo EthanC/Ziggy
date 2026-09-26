@@ -30,6 +30,7 @@ from ziggy.archive import (
     poll_archive_job,
     submit_archive_job,
 )
+from ziggy.backups import run_backup_scheduler
 from ziggy.config import (
     Config,
     ConfigError,
@@ -37,6 +38,7 @@ from ziggy.config import (
     Secrets,
     database_change_requires_restart,
     load_config,
+    resolve_backup_settings,
     resolve_http_settings,
     resolve_secrets,
 )
@@ -144,6 +146,7 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     config = load_config(config_path)
     secrets = resolve_secrets()
     http_settings = resolve_http_settings()
+    backup_settings = resolve_backup_settings(config.ziggy.database)
     logging_controller = LoggingController()
     logging_controller.configure(config.logging, secrets)
     engine: AsyncEngine | None = None
@@ -211,6 +214,11 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
             if http_child is not None:
                 tasks.create_task(
                     _monitor_http_child(http_child, stop), name="http-child-monitor"
+                )
+            if backup_settings.enabled:
+                tasks.create_task(
+                    run_backup_scheduler(config.ziggy.database, backup_settings, stop),
+                    name="backup-scheduler",
                 )
             tasks.create_task(
                 _run_resilient_worker(

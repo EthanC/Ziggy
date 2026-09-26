@@ -5,13 +5,16 @@ from __future__ import annotations
 import re
 import tomllib
 from dataclasses import dataclass, fields
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from cronsim import CronSim, CronSimError
 from environs import Env
 from loguru import logger
+from tzlocal import get_localzone
 
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
@@ -30,6 +33,12 @@ _LOG_DISCORD_WEBHOOK_URL_ENV = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
 _HTTP_ENABLED_ENV = "ZIGGY_HTTP_ENABLED"
 _HTTP_HOST_ENV = "ZIGGY_HTTP_HOST"
 _HTTP_PORT_ENV = "ZIGGY_HTTP_PORT"
+_BACKUP_ENABLED_ENV = "ZIGGY_BACKUP_ENABLED"
+_BACKUP_SCHEDULE_ENV = "ZIGGY_BACKUP_SCHEDULE"
+_BACKUP_DIRECTORY_ENV = "ZIGGY_BACKUP_DIRECTORY"
+_BACKUP_RETENTION_COUNT_ENV = "ZIGGY_BACKUP_RETENTION_COUNT"
+_BACKUP_TIMEZONE_ENV = "ZIGGY_BACKUP_TIMEZONE"
+_CRON_FIELD_COUNT = 5
 _MAX_PORT = 65_535
 
 
@@ -187,6 +196,17 @@ class HttpSettings:
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = 9449
+
+
+@dataclass(frozen=True, slots=True)
+class BackupSettings:
+    """Startup-only scheduled backup settings."""
+
+    enabled: bool
+    schedule: str
+    directory: Path
+    retention_count: int
+    timezone: ZoneInfo
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -428,6 +448,49 @@ def resolve_http_settings(env: Env | None = None) -> HttpSettings:
     if not 1 <= port <= _MAX_PORT:
         raise ConfigError(f"{_HTTP_PORT_ENV} must be between 1 and 65535")
     return HttpSettings(enabled=enabled, host=host, port=port)
+
+
+def resolve_backup_settings(database: Path, env: Env | None = None) -> BackupSettings:
+    """Resolve and validate startup-only scheduled backup settings."""
+    env = env or Env()
+    try:
+        enabled = env.bool(_BACKUP_ENABLED_ENV, default=True)
+        retention_count = env.int(_BACKUP_RETENTION_COUNT_ENV, default=7)
+    except ValueError as error:
+        raise ConfigError(f"invalid backup environment setting: {error}") from error
+
+    schedule = env.str(_BACKUP_SCHEDULE_ENV, default="0 7 * * *")
+    if len(schedule.split()) != _CRON_FIELD_COUNT:
+        raise ConfigError(f"{_BACKUP_SCHEDULE_ENV} must have five fields")
+
+    timezone_name = env.str(_BACKUP_TIMEZONE_ENV, default=None) or None
+    try:
+        timezone = get_localzone() if timezone_name is None else ZoneInfo(timezone_name)
+    except (OSError, ZoneInfoNotFoundError) as error:
+        raise ConfigError(
+            f"{_BACKUP_TIMEZONE_ENV} is not a valid IANA timezone"
+        ) from error
+    try:
+        next(CronSim(schedule, datetime.now(UTC).astimezone(timezone)))
+    except CronSimError as error:
+        raise ConfigError(f"{_BACKUP_SCHEDULE_ENV} is invalid: {error}") from error
+    except StopIteration as error:
+        raise ConfigError(f"{_BACKUP_SCHEDULE_ENV} has no future occurrence") from error
+
+    directory_value = env.str(_BACKUP_DIRECTORY_ENV, default="backups")
+    if not directory_value or directory_value != directory_value.strip():
+        raise ConfigError(f"{_BACKUP_DIRECTORY_ENV} must be a nonempty path")
+    directory = Path(directory_value).expanduser()
+    if not directory.is_absolute():
+        directory = database.parent / directory
+
+    return BackupSettings(
+        enabled=enabled,
+        schedule=schedule,
+        directory=directory.resolve(),
+        retention_count=_nonnegative_int(retention_count, _BACKUP_RETENTION_COUNT_ENV),
+        timezone=timezone,
+    )
 
 
 def database_change_requires_restart(previous: Config, replacement: Config) -> bool:

@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
@@ -23,6 +24,7 @@ from ziggy.archive import (
 )
 from ziggy.config import (
     ArchiveSettings,
+    BackupSettings,
     Config,
     ConfigError,
     CrawlSettings,
@@ -445,6 +447,17 @@ async def test_run_service_owns_startup_tasks_and_cleanup(  # noqa: PLR0915
     monkeypatch.setattr(
         service, "resolve_http_settings", MagicMock(return_value=http_settings)
     )
+    backup_settings = BackupSettings(
+        True,
+        "0 7 * * *",
+        tmp_path / "backups",
+        7,
+        ZoneInfo("UTC"),
+    )
+    resolve_backup = MagicMock(return_value=backup_settings)
+    backup_scheduler = AsyncMock()
+    monkeypatch.setattr(service, "resolve_backup_settings", resolve_backup)
+    monkeypatch.setattr(service, "run_backup_scheduler", backup_scheduler)
     monkeypatch.setattr(service, "_start_http_child", start_http)
     monkeypatch.setattr(service, "_monitor_http_child", monitor_http)
     monkeypatch.setattr(service, "_stop_http_child", stop_http)
@@ -496,6 +509,8 @@ async def test_run_service_owns_startup_tasks_and_cleanup(  # noqa: PLR0915
 
     logging_controller.configure.assert_called_once_with(config.logging, secrets)
     start_http.assert_called_once_with(http_settings, config.ziggy.database)
+    resolve_backup.assert_called_once_with(config.ziggy.database)
+    backup_scheduler.assert_awaited_once()
     monitor_http.assert_awaited_once()
     stop_http.assert_awaited_once_with(http_child)
     archive_client.login.assert_awaited_once_with()
@@ -535,6 +550,21 @@ async def test_run_service_logs_runtime_exception_group(monkeypatch, tmp_path):
         service, "resolve_secrets", MagicMock(return_value=make_secrets())
     )
     monkeypatch.setattr(
+        service,
+        "resolve_backup_settings",
+        MagicMock(
+            return_value=BackupSettings(
+                False,
+                "0 7 * * *",
+                tmp_path / "backups",
+                7,
+                ZoneInfo("UTC"),
+            )
+        ),
+    )
+    backup_scheduler = AsyncMock()
+    monkeypatch.setattr(service, "run_backup_scheduler", backup_scheduler)
+    monkeypatch.setattr(
         service, "LoggingController", MagicMock(return_value=logging_controller)
     )
     monkeypatch.setattr(service, "run_migrations", AsyncMock())
@@ -569,6 +599,7 @@ async def test_run_service_logs_runtime_exception_group(monkeypatch, tmp_path):
         await service.run_service(tmp_path / "ziggy.toml")
 
     assert runtime_error in raised.value.exceptions
+    backup_scheduler.assert_not_awaited()
     log_exception.assert_called_once_with("Ziggy service failed")
     logging_controller.close.assert_awaited_once_with()
 

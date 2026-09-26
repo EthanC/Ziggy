@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import timedelta
+from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from ziggy import config as config_module
 from ziggy.config import (
     ConfigError,
     database_change_requires_restart,
     load_config,
     parse_duration,
+    resolve_backup_settings,
     resolve_http_settings,
     resolve_secrets,
 )
@@ -505,3 +509,112 @@ def test_resolve_http_settings_rejects_invalid_values(
     monkeypatch.setenv(name, value)
     with pytest.raises(ConfigError, match=message):
         resolve_http_settings()
+
+
+_BACKUP_ENVIRONMENT = (
+    "ZIGGY_BACKUP_ENABLED",
+    "ZIGGY_BACKUP_SCHEDULE",
+    "ZIGGY_BACKUP_DIRECTORY",
+    "ZIGGY_BACKUP_RETENTION_COUNT",
+    "ZIGGY_BACKUP_TIMEZONE",
+)
+
+
+def clear_backup_environment(monkeypatch):
+    for name in _BACKUP_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_resolve_backup_settings_uses_defaults_without_creating_directory(
+    monkeypatch, tmp_path
+):
+    clear_backup_environment(monkeypatch)
+    local = ZoneInfo("America/Chicago")
+    get_localzone = MagicMock(return_value=local)
+    monkeypatch.setattr(config_module, "get_localzone", get_localzone)
+    database = tmp_path / "data" / "ziggy.db"
+
+    settings = resolve_backup_settings(database)
+
+    assert settings.enabled is True
+    assert settings.schedule == "0 7 * * *"
+    assert settings.directory == (database.parent / "backups").resolve()
+    assert settings.retention_count == 7
+    assert settings.timezone is local
+    assert not settings.directory.exists()
+    get_localzone.assert_called_once_with()
+
+
+def test_resolve_backup_settings_reads_environment(monkeypatch, tmp_path):
+    clear_backup_environment(monkeypatch)
+    monkeypatch.setenv("ZIGGY_BACKUP_ENABLED", "false")
+    monkeypatch.setenv("ZIGGY_BACKUP_SCHEDULE", "30 2 * * MON-FRI")
+    monkeypatch.setenv("ZIGGY_BACKUP_DIRECTORY", "snapshots")
+    monkeypatch.setenv("ZIGGY_BACKUP_RETENTION_COUNT", "0")
+    monkeypatch.setenv("ZIGGY_BACKUP_TIMEZONE", "America/New_York")
+    database = tmp_path / "data" / "ziggy.db"
+
+    settings = resolve_backup_settings(database)
+
+    assert settings.enabled is False
+    assert settings.schedule == "30 2 * * MON-FRI"
+    assert settings.directory == (database.parent / "snapshots").resolve()
+    assert settings.retention_count == 0
+    assert settings.timezone == ZoneInfo("America/New_York")
+
+
+def test_resolve_backup_settings_preserves_absolute_directory(monkeypatch, tmp_path):
+    clear_backup_environment(monkeypatch)
+    destination = (tmp_path / "absolute-backups").resolve()
+    monkeypatch.setenv("ZIGGY_BACKUP_DIRECTORY", str(destination))
+    monkeypatch.setenv("ZIGGY_BACKUP_TIMEZONE", "UTC")
+
+    settings = resolve_backup_settings(tmp_path / "data" / "ziggy.db")
+
+    assert settings.directory == destination
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("ZIGGY_BACKUP_ENABLED", "perhaps", "invalid backup environment setting"),
+        (
+            "ZIGGY_BACKUP_RETENTION_COUNT",
+            "abc",
+            "invalid backup environment setting",
+        ),
+        ("ZIGGY_BACKUP_RETENTION_COUNT", "-1", "must be a nonnegative integer"),
+        ("ZIGGY_BACKUP_SCHEDULE", "0 7 * *", "must have five fields"),
+        ("ZIGGY_BACKUP_SCHEDULE", "60 7 * * *", "is invalid"),
+        (
+            "ZIGGY_BACKUP_SCHEDULE",
+            "0 7 */3 2 MON#5",
+            "ZIGGY_BACKUP_SCHEDULE has no future occurrence",
+        ),
+        ("ZIGGY_BACKUP_TIMEZONE", "Not/A-Timezone", "valid IANA timezone"),
+        ("ZIGGY_BACKUP_DIRECTORY", "", "must be a nonempty path"),
+        ("ZIGGY_BACKUP_DIRECTORY", " backups ", "must be a nonempty path"),
+    ],
+)
+def test_resolve_backup_settings_rejects_invalid_values(
+    monkeypatch, tmp_path, name, value, message
+):
+    clear_backup_environment(monkeypatch)
+    monkeypatch.setenv(name, value)
+    if name != "ZIGGY_BACKUP_TIMEZONE":
+        monkeypatch.setenv("ZIGGY_BACKUP_TIMEZONE", "UTC")
+
+    with pytest.raises(ConfigError, match=message):
+        resolve_backup_settings(tmp_path / "ziggy.db")
+
+
+def test_resolve_backup_settings_reports_unavailable_system_timezone(
+    monkeypatch, tmp_path
+):
+    clear_backup_environment(monkeypatch)
+    monkeypatch.setattr(
+        config_module, "get_localzone", MagicMock(side_effect=OSError("unavailable"))
+    )
+
+    with pytest.raises(ConfigError, match="valid IANA timezone"):
+        resolve_backup_settings(tmp_path / "ziggy.db")

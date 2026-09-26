@@ -28,14 +28,17 @@ def test_check_config_resolves_secrets_and_returns_success(monkeypatch):
     load = MagicMock(return_value=loaded)
     resolve = MagicMock()
     resolve_http = MagicMock()
+    resolve_backup = MagicMock()
     monkeypatch.setattr(cli, "load_config", load)
     monkeypatch.setattr(cli, "resolve_secrets", resolve)
     monkeypatch.setattr(cli, "resolve_http_settings", resolve_http)
+    monkeypatch.setattr(cli, "resolve_backup_settings", resolve_backup)
 
     assert cli.main(["check-config", "--config", str(CONFIG_PATH)]) == 0
     load.assert_called_once_with(CONFIG_PATH)
     resolve.assert_called_once_with()
     resolve_http.assert_called_once_with()
+    resolve_backup.assert_called_once_with(loaded.ziggy.database)
 
 
 @pytest.mark.parametrize(("healthy", "exit_code"), [(True, 0), (False, 1)])

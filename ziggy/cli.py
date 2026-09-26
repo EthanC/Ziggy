@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 from ziggy.config import (
     ConfigError,
     load_config,
+    resolve_backup_settings,
     resolve_http_settings,
     resolve_secrets,
 )
@@ -37,6 +38,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "check-config":
             resolve_secrets()
             resolve_http_settings()
+            resolve_backup_settings(config.ziggy.database)
             return 0
         if arguments.command == "healthcheck":
             http_settings = resolve_http_settings()
