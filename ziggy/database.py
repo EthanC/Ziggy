@@ -109,7 +109,7 @@ async def insert_page_candidates(  # noqa: C901
             )
         )
         for base, slot in rows:
-            occupied[str(base)].add(int(slot))
+            occupied[str(base)].add(cast("int", slot))
 
     admitted: list[dict[str, object]] = []
     for values in pending:
