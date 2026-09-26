@@ -27,6 +27,10 @@ _INTERNET_ARCHIVE_PASSWORD_ENV = "ZIGGY_INTERNET_ARCHIVE_PASSWORD"  # noqa: S105
 _INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV = "ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD"
 _DISCORD_WEBHOOK_URL_ENV = "ZIGGY_DISCORD_WEBHOOK_URL"
 _LOG_DISCORD_WEBHOOK_URL_ENV = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
+_HTTP_ENABLED_ENV = "ZIGGY_HTTP_ENABLED"
+_HTTP_HOST_ENV = "ZIGGY_HTTP_HOST"
+_HTTP_PORT_ENV = "ZIGGY_HTTP_PORT"
+_MAX_PORT = 65_535
 
 
 class ConfigError(ValueError):
@@ -174,6 +178,15 @@ class Secrets:
     archive_password: str | None
     reporting_webhook_url: str | None
     logging_webhook_url: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class HttpSettings:
+    """Startup-only HTTP listener settings."""
+
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 9449
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:
@@ -399,6 +412,22 @@ def resolve_secrets(env: Env | None = None) -> Secrets:
         reporting_webhook_url=env.str(_DISCORD_WEBHOOK_URL_ENV, default=None) or None,
         logging_webhook_url=env.str(_LOG_DISCORD_WEBHOOK_URL_ENV, default=None) or None,
     )
+
+
+def resolve_http_settings(env: Env | None = None) -> HttpSettings:
+    """Resolve and validate startup-only HTTP listener settings."""
+    env = env or Env()
+    try:
+        enabled = env.bool(_HTTP_ENABLED_ENV, default=False)
+        port = env.int(_HTTP_PORT_ENV, default=9449)
+    except ValueError as error:
+        raise ConfigError(f"invalid HTTP environment setting: {error}") from error
+    host = env.str(_HTTP_HOST_ENV, default="127.0.0.1")
+    if not host or host != host.strip():
+        raise ConfigError(f"{_HTTP_HOST_ENV} must be a nonempty host")
+    if not 1 <= port <= _MAX_PORT:
+        raise ConfigError(f"{_HTTP_PORT_ENV} must be between 1 and 65535")
+    return HttpSettings(enabled=enabled, host=host, port=port)
 
 
 def database_change_requires_restart(previous: Config, replacement: Config) -> bool:

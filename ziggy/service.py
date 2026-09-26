@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import signal
 import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from loguru import logger
@@ -32,9 +33,11 @@ from ziggy.archive import (
 from ziggy.config import (
     Config,
     ConfigError,
+    HttpSettings,
     Secrets,
     database_change_requires_restart,
     load_config,
+    resolve_http_settings,
     resolve_secrets,
 )
 from ziggy.crawler import CrawlerClient, FetchError, crawl_page
@@ -48,8 +51,16 @@ from ziggy.database import (
     run_migrations,
     session_factory,
 )
+from ziggy.http.server import run_http_child
 from ziggy.logging import LoggingController
-from ziggy.models import ArchiveJob, Domain, Page, Report, ServiceState
+from ziggy.models import (
+    ArchiveJob,
+    ArchiveSubmission,
+    Domain,
+    Page,
+    Report,
+    ServiceState,
+)
 from ziggy.reporting import (
     claim_report,
     create_report,
@@ -70,6 +81,10 @@ _HEALTH_MAX_AGE = timedelta(seconds=90)
 _ARCHIVE_CAPACITY_RECHECK_DELAY = 30.0
 _SUCCESS_MIN = 200
 _SUCCESS_MAX = 299
+_HTTP_SHUTDOWN_GRACE = 10.0
+_HTTP_HEALTH_TIMEOUT = 2.0
+_HTTP_STATUS_PARTS = 2
+_WILDCARD_IPV4 = "0.0.0.0"  # noqa: S104
 
 
 @dataclass(slots=True)
@@ -97,10 +112,38 @@ class RuntimeState:
             await crawler.close()
 
 
+class _ChildProcess(Protocol):
+    @property
+    def exitcode(self) -> int | None: ...
+
+    def start(self) -> None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def join(self, timeout: float | None = None) -> None: ...
+
+    def terminate(self) -> None: ...
+
+    def kill(self) -> None: ...
+
+
+class _ChildShutdown(Protocol):
+    def set(self) -> None: ...
+
+
+@dataclass(slots=True)
+class HttpChild:
+    """Parent-owned handles for the optional HTTP process."""
+
+    process: _ChildProcess
+    shutdown: _ChildShutdown
+
+
 async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     """Start Ziggy, own all resources, and stop cleanly on a signal."""
     config = load_config(config_path)
     secrets = resolve_secrets()
+    http_settings = resolve_http_settings()
     logging_controller = LoggingController()
     logging_controller.configure(config.logging, secrets)
     engine: AsyncEngine | None = None
@@ -143,7 +186,9 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     instance_id = str(uuid4())
     stop = asyncio.Event()
     remove_signals = _install_signal_handlers(stop)
+    http_child: HttpChild | None = None
     try:
+        http_child = _start_http_child(http_settings, config.ziggy.database)
         now = datetime.now(UTC)
         state.started_at = now
         async with sessions() as session:
@@ -163,6 +208,10 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
             async with sessions() as session:
                 await reconcile_domains(session, config, now)
             logger.info("Ziggy service started")
+            if http_child is not None:
+                tasks.create_task(
+                    _monitor_http_child(http_child, stop), name="http-child-monitor"
+                )
             tasks.create_task(
                 _run_resilient_worker(
                     "configuration watcher",
@@ -221,6 +270,8 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
     finally:
         stop.set()
         remove_signals()
+        if http_child is not None:
+            await _stop_http_child(http_child)
         async with sessions() as session:
             await release_leases(session, instance_id)
             await session.execute(
@@ -236,6 +287,51 @@ async def run_service(config_path: Path) -> None:  # noqa: PLR0915
         await engine.dispose()
         logger.info("Ziggy service stopped")
         await logging_controller.close()
+
+
+def _start_http_child(settings: HttpSettings, database: Path) -> HttpChild | None:
+    """Spawn the opt-in HTTP process without sharing parent resources."""
+    if not settings.enabled:
+        return None
+    context = multiprocessing.get_context("spawn")
+    shutdown = context.Event()
+    process = context.Process(
+        target=run_http_child,
+        args=(database, settings.host, settings.port, shutdown),
+        name="ziggy-http",
+    )
+    try:
+        process.start()
+    except OSError:
+        logger.exception("Unable to start HTTP child process")
+        return None
+    logger.info("HTTP admission child started on {}:{}", settings.host, settings.port)
+    return HttpChild(process, shutdown)
+
+
+async def _monitor_http_child(child: HttpChild, stop: asyncio.Event) -> None:
+    """Observe child failure without propagating it to Ziggy workers."""
+    while not stop.is_set() and child.process.is_alive():
+        await _wait(stop, _IDLE_DELAY)
+    if not stop.is_set():
+        child.process.join(0)
+        logger.error(
+            "HTTP child exited unexpectedly with code {}", child.process.exitcode
+        )
+
+
+async def _stop_http_child(child: HttpChild) -> None:
+    """Request portable shutdown, then bound reaping time."""
+    child.shutdown.set()
+    await asyncio.to_thread(child.process.join, _HTTP_SHUTDOWN_GRACE)
+    if child.process.is_alive():
+        logger.warning("HTTP child exceeded shutdown grace period; terminating")
+        child.process.terminate()
+        await asyncio.to_thread(child.process.join, 5.0)
+    if child.process.is_alive():
+        logger.error("HTTP child ignored termination; killing")
+        child.process.kill()
+        await asyncio.to_thread(child.process.join)
 
 
 async def _run_resilient_worker(
@@ -534,16 +630,43 @@ async def _submit_one(
         page = await session.get(Page, page_id)
         if page is None:
             return
-        domain = await session.get(Domain, page.domain_id)
-        if domain is None or not domain.active or not page.active or not page.in_scope:
-            page.archive_lease_owner = None
-            page.archive_lease_expires_at = None
-            await session.commit()
-            return
+        domain = (
+            await session.get(Domain, page.domain_id)
+            if page.domain_id is not None
+            else None
+        )
+        now = datetime.now(UTC)
+        ordinary = (
+            domain is not None
+            and domain.active
+            and page.active
+            and page.in_scope
+            and getattr(page, "blocked_reason", None) is None
+            and getattr(page, "next_archive_at", now) <= now
+        )
+        if not ordinary:
+            pending_receipt = await session.scalar(
+                select(ArchiveSubmission.id).where(
+                    ArchiveSubmission.page_id == page.id,
+                    ArchiveSubmission.archive_job_id.is_(None),
+                )
+            )
+            if pending_receipt is None:
+                page.archive_lease_owner = None
+                page.archive_lease_expires_at = None
+                await session.commit()
+                return
         await session.commit()
-        if not await _archive_preflight(session, page, domain, state.crawler):
+        if ordinary and not await _archive_preflight(
+            session, page, domain, state.crawler
+        ):
             return
-        job = await create_archive_intent(session, page, datetime.now(UTC))
+        if ordinary:
+            job = await create_archive_intent(session, page, datetime.now(UTC))
+        else:
+            job = await create_archive_intent(
+                session, page, datetime.now(UTC), archive_only=True
+            )
         try:
             await submit_archive_job(
                 session,
@@ -601,8 +724,13 @@ async def _poll_one(
         page = await session.get(Page, job.page_id)
         if page is None:
             return
-        domain = await session.get(Domain, page.domain_id)
-        if domain is None:
+        domain = (
+            await session.get(Domain, page.domain_id)
+            if page.domain_id is not None
+            else None
+        )
+        archive_only = getattr(job, "archive_only", False)
+        if domain is None and not archive_only:
             return
         try:
             if job.state == ArchiveJobState.INTENT or (
@@ -628,9 +756,21 @@ async def _poll_one(
                     client=state.archive_client,
                     settings=state.config.archive,
                     now=datetime.now(UTC),
-                    allow_submission=domain.active and page.active and page.in_scope,
-                    preflight=lambda: _archive_preflight(
-                        session, page, domain, state.crawler, job=job
+                    allow_submission=(
+                        archive_only
+                        or (
+                            domain is not None
+                            and domain.active
+                            and page.active
+                            and page.in_scope
+                        )
+                    ),
+                    preflight=(
+                        None
+                        if archive_only or domain is None
+                        else lambda: _archive_preflight(
+                            session, page, domain, state.crawler, job=job
+                        )
                     ),
                 )
             else:
@@ -771,8 +911,13 @@ async def _heartbeat(
         await _wait(stop, _HEARTBEAT_INTERVAL)
 
 
-async def check_health(path: Path, now: datetime | None = None) -> bool:
-    """Return whether any running instance has a recent database heartbeat."""
+async def check_health(
+    path: Path,
+    now: datetime | None = None,
+    *,
+    http: HttpSettings | None = None,
+) -> bool:
+    """Return whether enabled service components are healthy."""
     if not await asyncio.to_thread(path.exists):
         logger.error("Health check failed: database does not exist at {}", path)
         return False
@@ -797,10 +942,46 @@ async def check_health(path: Path, now: datetime | None = None) -> bool:
     except OSError, SQLAlchemyError, ValueError:
         logger.exception("Health check failed while reading the service heartbeat")
         return False
-    else:
-        return True
     finally:
         await engine.dispose()
+    return http is None or not http.enabled or await _check_http_health(http)
+
+
+async def _check_http_health(settings: HttpSettings) -> bool:
+    """Require the HTTP child to process a request without consuming admission."""
+    host = {_WILDCARD_IPV4: "127.0.0.1", "::": "::1"}.get(settings.host, settings.host)
+    host_header = f"[{host}]" if ":" in host else host
+    writer: asyncio.StreamWriter | None = None
+    try:
+        async with asyncio.timeout(_HTTP_HEALTH_TIMEOUT):
+            reader, writer = await asyncio.open_connection(host, settings.port)
+            writer.write(
+                b"GET /v1/queue HTTP/1.1\r\n"
+                + f"Host: {host_header}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+            )
+            await writer.drain()
+            status_line = await reader.readline()
+    except OSError, TimeoutError, ValueError:
+        logger.exception(
+            "Health check failed while connecting to HTTP listener at {}:{}",
+            settings.host,
+            settings.port,
+        )
+        return False
+    else:
+        status_parts = status_line.split(maxsplit=2)
+        healthy = len(status_parts) >= _HTTP_STATUS_PARTS and status_parts[1] == b"405"
+        if not healthy:
+            logger.error(
+                "Health check failed: HTTP listener returned an unexpected response"
+            )
+        return healthy
+    finally:
+        if writer is not None:
+            writer.close()
+            with suppress(OSError):
+                await writer.wait_closed()
 
 
 async def _worker_failure(

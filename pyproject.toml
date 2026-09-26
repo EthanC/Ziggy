@@ -17,6 +17,8 @@ dependencies = [
     "loguru-discord",
     "niquests",
     "sqlalchemy[asyncio]",
+    "starlette",
+    "uvicorn[standard]",
 ]
 
 [dependency-groups]

@@ -117,7 +117,9 @@ class Page(Base):
     __tablename__ = "pages"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    domain_id: Mapped[int] = mapped_column(ForeignKey("domains.id", ondelete="CASCADE"))
+    domain_id: Mapped[int | None] = mapped_column(
+        ForeignKey("domains.id", ondelete="CASCADE")
+    )
     url: Mapped[str] = mapped_column(Text, unique=True)
     is_seed: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default=false()
@@ -214,6 +216,9 @@ class ArchiveJob(Base):
     service_code: Mapped[str | None] = mapped_column(String(255))
     saved_to_my_archive: Mapped[bool] = mapped_column(Boolean, default=False)
     outlinks_processed: Mapped[bool] = mapped_column(Boolean, default=False)
+    archive_only: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
     lease_owner: Mapped[str | None] = mapped_column(String(36))
     lease_expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
 
@@ -239,6 +244,48 @@ Index(
         )
     ),
 )
+
+
+class ArchiveSubmission(Base):
+    """Attribution and priority for one accepted external URL."""
+
+    __tablename__ = "archive_submissions"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    page_id: Mapped[int] = mapped_column(ForeignKey("pages.id", ondelete="CASCADE"))
+    identifier: Mapped[str] = mapped_column(String(128))
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    accepted_at: Mapped[datetime] = mapped_column(UtcDateTime(), default=utc_now)
+    archive_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("archive_jobs.id", ondelete="RESTRICT")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(identifier) BETWEEN 1 AND 128",
+            name="ck_archive_submissions_identifier_length",
+        ),
+        CheckConstraint(
+            "priority BETWEEN -100 AND 100",
+            name="ck_archive_submissions_priority",
+        ),
+        Index(
+            "ix_archive_submissions_pending",
+            "page_id",
+            priority.desc(),
+            "accepted_at",
+            "id",
+            sqlite_where=archive_job_id.is_(None),
+        ),
+        Index(
+            "ix_archive_submissions_job",
+            "archive_job_id",
+            priority.desc(),
+        ),
+        Index("ix_archive_submissions_page", "page_id"),
+    )
 
 
 class Capture(Base):

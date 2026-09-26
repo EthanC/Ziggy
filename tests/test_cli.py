@@ -27,23 +27,28 @@ def test_check_config_resolves_secrets_and_returns_success(monkeypatch):
     loaded = config()
     load = MagicMock(return_value=loaded)
     resolve = MagicMock()
+    resolve_http = MagicMock()
     monkeypatch.setattr(cli, "load_config", load)
     monkeypatch.setattr(cli, "resolve_secrets", resolve)
+    monkeypatch.setattr(cli, "resolve_http_settings", resolve_http)
 
     assert cli.main(["check-config", "--config", str(CONFIG_PATH)]) == 0
     load.assert_called_once_with(CONFIG_PATH)
     resolve.assert_called_once_with()
+    resolve_http.assert_called_once_with()
 
 
 @pytest.mark.parametrize(("healthy", "exit_code"), [(True, 0), (False, 1)])
 def test_healthcheck_exit_code(monkeypatch, healthy, exit_code):
     database = Path("health.sqlite3")
+    http = SimpleNamespace(enabled=True, host="127.0.0.1", port=9449)
     monkeypatch.setattr(cli, "load_config", MagicMock(return_value=config(database)))
+    monkeypatch.setattr(cli, "resolve_http_settings", MagicMock(return_value=http))
     check = AsyncMock(return_value=healthy)
     monkeypatch.setattr(cli, "check_health", check)
 
     assert cli.main(["healthcheck", "--config", str(CONFIG_PATH)]) == exit_code
-    check.assert_awaited_once_with(database)
+    check.assert_awaited_once_with(database, http=http)
 
 
 def test_run_starts_service_and_returns_success(monkeypatch):

@@ -43,6 +43,7 @@ from ziggy.models import (
     ArchiveJob,
     ArchiveJobKind,
     ArchiveJobState,
+    ArchiveSubmission,
     Base,
     Capture,
     Domain,
@@ -88,6 +89,7 @@ class FakeArchiveClient:
     captures_error: ArchiveError | None = None
     latest_capture_error: ArchiveError | None = None
     submissions: list[tuple[str, timedelta]] = field(default_factory=list)
+    capture_outlink_options: list[bool] = field(default_factory=list)
     status_calls: list[str] = field(default_factory=list)
     outlink_calls: list[str] = field(default_factory=list)
     add_calls: list[str] = field(default_factory=list)
@@ -95,8 +97,15 @@ class FakeArchiveClient:
     latest_capture_calls: list[str] = field(default_factory=list)
     close_calls: int = 0
 
-    async def submit(self, url: str, dedupe_window: timedelta) -> str:
+    async def submit(
+        self,
+        url: str,
+        dedupe_window: timedelta,
+        *,
+        capture_outlinks: bool = True,
+    ) -> str:
         self.submissions.append((url, dedupe_window))
+        self.capture_outlink_options.append(capture_outlinks)
         if self.submit_error is not None:
             raise self.submit_error
         return self.submit_result
@@ -275,6 +284,7 @@ async def test_submit_success_persists_remote_acceptance(database: Database):
         )
 
         assert client.submissions == [(page.url, SETTINGS.dedupe_window)]
+        assert client.capture_outlink_options == [True]
         assert job.external_job_id == "accepted-42"
         assert job.state is ArchiveJobState.SUBMITTED
         assert job.submitted_at == NOW
@@ -2364,3 +2374,224 @@ async def test_record_outlinks_tolerates_missing_child_job_after_insert():
     )
 
     assert session.execute_calls == 2
+
+
+async def test_archive_only_job_disables_outlinks_and_keeps_page_one_shot(
+    database: Database,
+):
+    client = FakeArchiveClient(status_result=success())
+    async with database.sessions() as session:
+        page = Page(
+            domain_id=None,
+            url="https://outside.example/page",
+            in_scope=False,
+            discovered_at=NOW,
+            next_crawl_at=NOW,
+            next_archive_at=NOW,
+            next_archive_history_check_at=None,
+        )
+        session.add(page)
+        await session.flush()
+        job = await add_job(session, page)
+        job.archive_only = True
+        job.outlinks_processed = True
+        await session.commit()
+
+        await submit_archive_job(
+            session, job, page=page, client=client, settings=SETTINGS, now=NOW
+        )
+        assert client.capture_outlink_options == [False]
+        assert job.external_job_id == "remote-1"
+
+        original_schedule = page.next_archive_at
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=None,
+            client=client,
+            settings=SETTINGS,
+            now=CAPTURED_AT,
+        )
+        assert job.state is ArchiveJobState.SUCCEEDED
+        assert page.next_archive_at == original_schedule
+        assert client.outlink_calls == []
+
+
+async def test_archive_only_post_processing_repairs_outlink_completion(
+    database: Database,
+):
+    client = FakeArchiveClient()
+    async with database.sessions() as session:
+        page = Page(
+            domain_id=None,
+            url="https://outside.example/repair",
+            in_scope=False,
+            discovered_at=NOW,
+            next_crawl_at=NOW,
+            next_archive_at=NOW,
+        )
+        session.add(page)
+        await session.flush()
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.SUCCEEDED,
+            external_job_id="remote-repair",
+            saved=True,
+            outlinks_processed=False,
+        )
+        job.archive_only = True
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=None,
+            client=client,
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert job.outlinks_processed is True
+        assert client.outlink_calls == []
+
+
+async def test_archive_job_claim_uses_submission_priority_after_restart(
+    database: Database,
+):
+    async with database.sessions() as session:
+        _, low_page = await add_page(
+            session, host="low.example", url="https://low.example/"
+        )
+        _, high_page = await add_page(
+            session, host="high.example", url="https://high.example/"
+        )
+        low_job = await add_job(session, low_page, job_id="low")
+        high_job = await add_job(session, high_page, job_id="high")
+        for job in (low_job, high_job):
+            job.archive_only = True
+            job.lease_owner = None
+            job.lease_expires_at = None
+        session.add_all(
+            (
+                ArchiveSubmission(
+                    page_id=low_page.id,
+                    identifier="caller",
+                    priority=-10,
+                    accepted_at=NOW,
+                    archive_job_id=low_job.id,
+                ),
+                ArchiveSubmission(
+                    page_id=high_page.id,
+                    identifier="caller",
+                    priority=20,
+                    accepted_at=NOW,
+                    archive_job_id=high_job.id,
+                ),
+            )
+        )
+        await session.commit()
+
+    async with database.sessions() as restarted:
+        claimed = await claim_archive_job(restarted, "worker", NOW, LEASE)
+        assert claimed is not None
+        assert claimed.id == "high"
+
+
+async def test_archive_only_terminal_failures_do_not_change_recurring_schedule(
+    database: Database,
+):
+    async with database.sessions() as session:
+        page = Page(
+            domain_id=None,
+            url="https://outside.example/failure",
+            in_scope=False,
+            discovered_at=NOW,
+            next_crawl_at=NOW,
+            next_archive_at=NOW,
+        )
+        session.add(page)
+        await session.flush()
+        job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-failure",
+        )
+        job.archive_only = True
+        job.submitted_at = NOW - SETTINGS.pending_timeout
+        await session.commit()
+
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=None,
+            client=FakeArchiveClient(
+                status_result=PendingStatus("remote-failure", None)
+            ),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert job.state is ArchiveJobState.FAILED
+        assert page.next_archive_at == NOW
+
+        retry_job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-retry",
+            job_id="retry",
+            attempts=SETTINGS.max_attempts - 1,
+        )
+        retry_job.archive_only = True
+        await session.commit()
+        await poll_archive_job(
+            session,
+            retry_job,
+            page=page,
+            domain=None,
+            client=FakeArchiveClient(status_error=ArchiveError("offline")),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert retry_job.state is ArchiveJobState.FAILED
+        assert page.next_archive_at == NOW
+
+        failed_job = await add_job(
+            session,
+            page,
+            state=ArchiveJobState.PENDING,
+            external_job_id="remote-terminal",
+            job_id="terminal",
+        )
+        failed_job.archive_only = True
+        await session.commit()
+        await poll_archive_job(
+            session,
+            failed_job,
+            page=page,
+            domain=None,
+            client=FakeArchiveClient(
+                status_result=FailedStatus("remote-terminal", "error:blocked")
+            ),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert failed_job.state is ArchiveJobState.FAILED
+        assert page.next_archive_at == NOW
+
+        intent = ArchiveJob(
+            id="intent-failure",
+            page_id=page.id,
+            kind=ArchiveJobKind.DIRECT,
+            state=ArchiveJobState.INTENT,
+            cycle_key="intent-failure-cycle",
+            intent_at=NOW,
+            next_attempt_at=NOW,
+            archive_only=True,
+        )
+        archive._fail_job(intent, page, SETTINGS, NOW)  # noqa: SLF001
+        assert intent.state is ArchiveJobState.FAILED
+        assert page.next_archive_at == NOW

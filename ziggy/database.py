@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from contextlib import closing
+from dataclasses import dataclass
 from importlib import resources
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from sqlalchemy import case, event, exists, func, or_, select, text, update
+from sqlalchemy import and_, case, event, exists, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,7 +23,14 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import aliased
 
-from ziggy.models import ArchiveJob, ArchiveJobState, Domain, Page
+from ziggy.models import (
+    ArchiveJob,
+    ArchiveJobKind,
+    ArchiveJobState,
+    ArchiveSubmission,
+    Domain,
+    Page,
+)
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
     host_in_scope,
@@ -40,6 +49,13 @@ if TYPE_CHECKING:
 
 WorkKind = Literal["crawl", "archive"]
 _RECONCILE_BATCH_SIZE = 1_000
+ACTIVE_ARCHIVE_STATES = (
+    ArchiveJobState.INTENT,
+    ArchiveJobState.UNCERTAIN,
+    ArchiveJobState.SUBMITTED,
+    ArchiveJobState.PENDING,
+    ArchiveJobState.RATE_LIMITED,
+)
 _PRE_QUERY_FRONTIER_REVISIONS = {
     None,
     "6b519c405276",
@@ -59,7 +75,19 @@ class _DbapiConnection(Protocol):
     def cursor(self) -> _Cursor: ...
 
 
-async def insert_page_candidates(  # noqa: C901
+@dataclass(frozen=True, slots=True)
+class SubmissionReceipt:
+    """Durable acknowledgement for one normalized URL."""
+
+    id: str
+    url: str
+
+
+class AdmissionCapacityError(RuntimeError):
+    """The configured outstanding-submission capacity is exhausted."""
+
+
+async def insert_page_candidates(  # noqa: C901, PLR0912, PLR0915
     session: AsyncSession,
     candidates: Sequence[Mapping[str, object]],
     max_query_variants_per_base: int,
@@ -79,9 +107,13 @@ async def insert_page_candidates(  # noqa: C901
             select(Page).where(Page.url.in_(tuple(unique)))
         )
     }
+    promote: list[tuple[Page, dict[str, object]]] = []
     for url, page in existing.items():
         values = unique[url]
         is_seed = values.get("is_seed") is True
+        if getattr(page, "domain_id", values["domain_id"]) is None and not is_seed:
+            promote.append((page, values))
+            continue
         if page.blocked_reason is None or is_seed:
             page.domain_id = cast("int", values["domain_id"])
             page.in_scope = True
@@ -97,7 +129,7 @@ async def insert_page_candidates(  # noqa: C901
     pending = [values for url, values in unique.items() if url not in existing]
     bases = {
         base
-        for values in pending
+        for values in [*pending, *(values for _page, values in promote)]
         if (base := query_base_url(str(values["url"]))) is not None
     }
     occupied: dict[str, set[int]] = {base: set() for base in bases}
@@ -112,6 +144,28 @@ async def insert_page_candidates(  # noqa: C901
             occupied[str(base)].add(cast("int", slot))
 
     admitted: list[dict[str, object]] = []
+    for page, values in promote:
+        base = query_base_url(str(values["url"]))
+        if base is not None:
+            free_slot = next(
+                (
+                    slot
+                    for slot in range(1, max_query_variants_per_base + 1)
+                    if slot not in occupied[base]
+                ),
+                None,
+            )
+            if free_slot is None:
+                continue
+            occupied[base].add(free_slot)
+            page.query_base_url = base
+            page.query_variant_slot = free_slot
+        page.domain_id = cast("int", values["domain_id"])
+        page.in_scope = True
+        page.discovered_from_id = cast("int | None", values.get("discovered_from_id"))
+        page.sitemap_depth = cast("int", values.get("sitemap_depth", 0))
+        page.next_crawl_at = cast("datetime", values["next_crawl_at"])
+
     for values in pending:
         if values.get("is_seed") is True:
             values["query_base_url"] = None
@@ -147,12 +201,87 @@ async def insert_page_candidates(  # noqa: C901
     return tuple(result.scalars())
 
 
+async def admit_archive_submissions(  # noqa: PLR0913
+    session: AsyncSession,
+    identifier: str,
+    urls: Sequence[str],
+    priority: int,
+    now: datetime,
+    *,
+    outstanding_limit: int,
+) -> tuple[SubmissionReceipt, ...]:
+    """Persist a normalized batch and its attribution in one short transaction."""
+    await session.execute(text("BEGIN IMMEDIATE"))
+    pending = await session.scalar(
+        select(func.count())
+        .select_from(ArchiveSubmission)
+        .where(ArchiveSubmission.archive_job_id.is_(None))
+    )
+    active = await session.scalar(
+        select(func.count())
+        .select_from(ArchiveJob)
+        .join(ArchiveSubmission, ArchiveSubmission.archive_job_id == ArchiveJob.id)
+        .where(ArchiveJob.state.in_(ACTIVE_ARCHIVE_STATES))
+    )
+    if (pending or 0) + (active or 0) + len(urls) > outstanding_limit:
+        await session.rollback()
+        raise AdmissionCapacityError("outstanding submission capacity is exhausted")
+
+    existing = {
+        page.url: page
+        for page in await session.scalars(select(Page).where(Page.url.in_(urls)))
+    }
+    for url in urls:
+        if url not in existing:
+            page = Page(
+                domain_id=None,
+                url=url,
+                active=True,
+                in_scope=False,
+                discovered_at=now,
+                next_crawl_at=now,
+                next_archive_at=now,
+                next_archive_history_check_at=None,
+            )
+            session.add(page)
+            existing[url] = page
+    await session.flush()
+
+    active_jobs = {
+        job.page_id: job.id
+        for job in await session.scalars(
+            select(ArchiveJob).where(
+                ArchiveJob.page_id.in_(page.id for page in existing.values()),
+                ArchiveJob.kind == ArchiveJobKind.DIRECT,
+                ArchiveJob.state.in_(ACTIVE_ARCHIVE_STATES),
+            )
+        )
+    }
+    receipts = tuple(SubmissionReceipt(str(uuid4()), url) for url in urls)
+    await session.execute(
+        insert(ArchiveSubmission),
+        [
+            {
+                "id": receipt.id,
+                "page_id": existing[receipt.url].id,
+                "identifier": identifier,
+                "priority": priority,
+                "accepted_at": now,
+                "archive_job_id": active_jobs.get(existing[receipt.url].id),
+            }
+            for receipt in receipts
+        ],
+    )
+    await session.commit()
+    return receipts
+
+
 def database_url(path: Path) -> str:
     """Build an aiosqlite URL for an absolute database path."""
     return f"sqlite+aiosqlite:///{path.as_posix()}"
 
 
-def create_engine(path: Path) -> AsyncEngine:
+def create_engine(path: Path, *, busy_timeout_ms: int = 5_000) -> AsyncEngine:
     """Create an async engine with required SQLite connection pragmas."""
     path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_async_engine(database_url(path))
@@ -166,7 +295,7 @@ def create_engine(path: Path) -> AsyncEngine:
         try:
             cursor.execute("PRAGMA foreign_keys=ON")
             cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             cursor.execute("PRAGMA synchronous=NORMAL")
         finally:
             cursor.close()
@@ -267,7 +396,7 @@ async def reconcile_domains(  # noqa: C901
     while pages := (
         await session.scalars(
             select(Page)
-            .where(Page.id > last_page_id)
+            .where(Page.id > last_page_id, Page.domain_id.is_not(None))
             .order_by(Page.id)
             .limit(_RECONCILE_BATCH_SIZE)
         )
@@ -374,41 +503,47 @@ async def claim_due_page(  # noqa: PLR0913
         if kind == "crawl"
         else Page.archive_lease_expires_at
     )
-    conditions = [
-        Domain.active.is_(True),
-        Page.in_scope.is_(True),
-        Page.blocked_reason.is_(None),
-        due_column <= now,
-        or_(expires_column.is_(None), expires_column <= now),
-    ]
     if kind == "archive":
         if archive_interval is None:
             raise ValueError("archive_interval is required for archive work")
-        conditions.append(Page.active.is_(True))
-        conditions.append(
+        lease_available = or_(expires_column.is_(None), expires_column <= now)
+        no_active_job = ~exists(
+            select(ArchiveJob.id).where(
+                ArchiveJob.page_id == Page.id,
+                ArchiveJob.kind == ArchiveJobKind.DIRECT,
+                ArchiveJob.state.in_(ACTIVE_ARCHIVE_STATES),
+            )
+        )
+        pending_submissions = (
+            select(
+                ArchiveSubmission.page_id,
+                func.max(ArchiveSubmission.priority).label("priority"),
+                func.min(ArchiveSubmission.accepted_at).label("first_accepted"),
+            )
+            .where(ArchiveSubmission.archive_job_id.is_(None))
+            .group_by(ArchiveSubmission.page_id)
+            .cte("pending_submissions")
+        )
+        ordinary_eligible = and_(
+            Domain.active.is_(True),
+            Page.active.is_(True),
+            Page.in_scope.is_(True),
+            Page.blocked_reason.is_(None),
+            due_column <= now,
             or_(
                 Page.archive_history_lease_expires_at.is_(None),
                 Page.archive_history_lease_expires_at <= now,
-            )
+            ),
         )
-        conditions.append(
-            ~exists(
-                select(ArchiveJob.id).where(
-                    ArchiveJob.page_id == Page.id,
-                    ArchiveJob.state.in_(
-                        (
-                            ArchiveJobState.INTENT,
-                            ArchiveJobState.UNCERTAIN,
-                            ArchiveJobState.SUBMITTED,
-                            ArchiveJobState.PENDING,
-                            ArchiveJobState.RATE_LIMITED,
-                        )
-                    ),
-                )
-            )
+        effective_priority = case(
+            (
+                ordinary_eligible,
+                func.max(func.coalesce(pending_submissions.c.priority, 0), 0),
+            ),
+            else_=pending_submissions.c.priority,
         )
         cutoff = now - archive_interval
-        priority = case(
+        history_priority = case(
             (
                 Page.archive_history_checked_at.is_not(None)
                 & or_(
@@ -420,15 +555,49 @@ async def claim_due_page(  # noqa: PLR0913
             (Page.archive_history_checked_at.is_(None), 1),
             else_=2,
         )
+        # Enumerate domain page IDs before due filters so API history stays out.
+        eligible_ids = (
+            select(Page.id)
+            .select_from(Domain)
+            .join(
+                Page,
+                Page.id.in_(
+                    select(Page.id).where(Page.domain_id == Domain.id).correlate(Domain)
+                ),
+            )
+            .where(ordinary_eligible)
+            .correlate(None)
+            .union_all(select(pending_submissions.c.page_id))
+        )
         candidate = (
             select(Page.id)
-            .join(Domain, Page.domain_id == Domain.id)
-            .where(*conditions)
-            .order_by(priority, due_column, Page.id)
+            .outerjoin(Domain, Page.domain_id == Domain.id)
+            .outerjoin(pending_submissions, pending_submissions.c.page_id == Page.id)
+            .where(
+                Page.id.in_(eligible_ids),
+                lease_available,
+                no_active_job,
+            )
+            .order_by(
+                effective_priority.desc(),
+                history_priority,
+                case(
+                    (ordinary_eligible, due_column),
+                    else_=pending_submissions.c.first_accepted,
+                ),
+                Page.id,
+            )
             .limit(1)
             .scalar_subquery()
         )
     else:
+        conditions = [
+            Domain.active.is_(True),
+            Page.in_scope.is_(True),
+            Page.blocked_reason.is_(None),
+            due_column <= now,
+            or_(expires_column.is_(None), expires_column <= now),
+        ]
         active_page = aliased(Page)
         active_domain = aliased(Domain)
         due_active_page = exists(

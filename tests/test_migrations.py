@@ -28,7 +28,7 @@ from ziggy.models import (
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "4c2f9a8e1d76"
+HEAD_REVISION = "f31a6b9c2d84"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -72,6 +72,12 @@ def _downgrade_to_base(path):
     command.downgrade(config, "base")
 
 
+def _downgrade_to(path, revision):
+    config = AlembicConfig(ROOT / "alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{path.as_posix()}")
+    command.downgrade(config, revision)
+
+
 def _upgrade_to(path, revision):
     config = AlembicConfig(ROOT / "alembic.ini")
     config.set_main_option("sqlalchemy.url", f"sqlite:///{path.as_posix()}")
@@ -93,6 +99,62 @@ async def _inspect_database(path):
                     text("SELECT version_num FROM alembic_version")
                 )
             return tables, revision
+    finally:
+        await engine.dispose()
+
+
+async def test_http_submission_downgrade_removes_api_only_dependents(tmp_path):
+    path = tmp_path / "http-downgrade.sqlite3"
+    await run_migrations(path)
+    timestamp = "2026-08-28T09:00:00.000000+00:00"
+    engine = create_engine(path)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(id, domain_id, url, is_seed, active, in_scope, discovered_at, "
+                    "next_crawl_at, next_archive_at, sitemap_depth, crawl_attempts, "
+                    "archive_history_check_attempts) VALUES "
+                    "(1, NULL, 'https://outside.example/', 0, 1, 0, :now, :now, "
+                    ":now, 0, 0, 0)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, intent_at, "
+                    "next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed, archive_only) VALUES "
+                    "('api-job', 1, 'DIRECT', 'SUCCEEDED', 'api-cycle', :now, "
+                    ":now, 0, 1, 1, 1)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO captures "
+                    "(page_id, archive_job_id, captured_at, wayback_url, completed_at) "
+                    "VALUES (1, 'api-job', :now, 'https://web.archive.org/api', :now)"
+                ),
+                {"now": timestamp},
+            )
+    finally:
+        await engine.dispose()
+
+    await asyncio.to_thread(_downgrade_to, path, "4c2f9a8e1d76")
+    engine = create_engine(path)
+    try:
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM pages")) == 0
+            assert (
+                await connection.scalar(text("SELECT count(*) FROM archive_jobs")) == 0
+            )
+            assert await connection.scalar(text("SELECT count(*) FROM captures")) == 0
+            assert (
+                await connection.execute(text("PRAGMA foreign_key_check"))
+            ).all() == []
     finally:
         await engine.dispose()
 
@@ -159,6 +221,9 @@ def test_migration_resources_are_packaged_with_ziggy():
     ).is_file()
     assert migrations.joinpath(
         "versions", "7a3e9c1d4b20_count_direct_archives_in_reports.py"
+    ).is_file()
+    assert migrations.joinpath(
+        "versions", "f31a6b9c2d84_add_http_submissions.py"
     ).is_file()
 
 
@@ -872,5 +937,102 @@ async def test_migrated_partial_index_rejects_duplicate_active_direct_jobs(tmp_p
 
             jobs = (await session.scalars(select(ArchiveJob))).all()
             assert {job.id for job in jobs} == {"first", "replacement"}
+    finally:
+        await engine.dispose()
+
+
+async def test_http_submission_migration_preserves_jobs_and_adds_constraints(tmp_path):
+    path = tmp_path / "http-submissions.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "4c2f9a8e1d76")
+    timestamp = "2026-08-28T09:00:00.000000+00:00"
+    engine = create_engine(path)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO domains "
+                    "(id, host, scheme, include_subdomains, active, created_at, "
+                    "configured_at) VALUES (1, 'example.com', 'https', 0, 1, "
+                    ":now, :now)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(id, domain_id, url, is_seed, active, in_scope, discovered_at, "
+                    "next_crawl_at, next_archive_at, sitemap_depth, crawl_attempts, "
+                    "archive_history_check_attempts) VALUES "
+                    "(1, 1, 'https://example.com/', 0, 1, 1, :now, :now, :now, "
+                    "0, 0, 0)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_jobs "
+                    "(id, page_id, kind, state, cycle_key, intent_at, "
+                    "next_attempt_at, attempts, saved_to_my_archive, "
+                    "outlinks_processed) VALUES "
+                    "('existing', 1, 'DIRECT', 'SUCCEEDED', 'cycle', :now, :now, "
+                    "0, 1, 1)"
+                ),
+                {"now": timestamp},
+            )
+    finally:
+        await engine.dispose()
+
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with engine.begin() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT archive_only FROM archive_jobs WHERE id='existing'")
+                )
+                == 0
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO pages "
+                    "(id, domain_id, url, is_seed, active, in_scope, discovered_at, "
+                    "next_crawl_at, next_archive_at, sitemap_depth, crawl_attempts, "
+                    "archive_history_check_attempts) VALUES "
+                    "(2, NULL, 'https://outside.example/', 0, 1, 0, :now, :now, "
+                    ":now, 0, 0, 0)"
+                ),
+                {"now": timestamp},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO archive_submissions "
+                    "(id, page_id, identifier, priority, accepted_at) VALUES "
+                    "('receipt', 2, 'caller', 100, :now)"
+                ),
+                {"now": timestamp},
+            )
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    text(
+                        "INSERT INTO archive_submissions "
+                        "(id, page_id, identifier, priority, accepted_at) VALUES "
+                        "('invalid', 2, '', 101, :now)"
+                    ),
+                    {"now": timestamp},
+                )
+            await connection.rollback()
+        async with engine.connect() as connection:
+            indexes = {
+                row[1]
+                for row in (
+                    await connection.execute(
+                        text("PRAGMA index_list('archive_submissions')")
+                    )
+                ).all()
+            }
+            assert "ix_archive_submissions_pending" in indexes
+            assert (
+                await connection.execute(text("PRAGMA foreign_key_check"))
+            ).all() == []
     finally:
         await engine.dispose()

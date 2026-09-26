@@ -23,7 +23,7 @@ from archivist import (
     ServiceError,
 )
 from loguru import logger
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
 from ziggy.database import insert_page_candidates
@@ -31,6 +31,7 @@ from ziggy.models import (
     ArchiveJob,
     ArchiveJobKind,
     ArchiveJobState,
+    ArchiveSubmission,
     Capture,
     Domain,
     Page,
@@ -115,7 +116,13 @@ ArchiveStatus = PendingStatus | SuccessStatus | FailedStatus
 class ArchiveClient(Protocol):
     """Narrow archive boundary used by workflows and deterministic tests."""
 
-    async def submit(self, url: str, dedupe_window: timedelta) -> str:
+    async def submit(
+        self,
+        url: str,
+        dedupe_window: timedelta,
+        *,
+        capture_outlinks: bool = True,
+    ) -> str:
         """Submit a direct Save Page Now job and return its remote ID."""
 
     async def status(self, job_id: str) -> ArchiveStatus:
@@ -227,10 +234,16 @@ class ArchivistClient:
         except ArchivistError as error:
             raise ArchiveError(type(error).__name__) from error
 
-    async def submit(self, url: str, dedupe_window: timedelta) -> str:
+    async def submit(
+        self,
+        url: str,
+        dedupe_window: timedelta,
+        *,
+        capture_outlinks: bool = True,
+    ) -> str:
         """Submit with account-only options when credentials are configured."""
         options = InternetArchiveSaveOptions(
-            capture_outlinks=True,
+            capture_outlinks=capture_outlinks,
             capture_screenshot=self._has_account,
             save_to_archive=self._has_account,
             if_not_archived_within=dedupe_window,
@@ -461,7 +474,11 @@ def _success(status: InternetArchiveSuccessStatus) -> SuccessStatus:
 
 
 async def create_archive_intent(
-    session: AsyncSession, page: Page, now: datetime
+    session: AsyncSession,
+    page: Page,
+    now: datetime,
+    *,
+    archive_only: bool = False,
 ) -> ArchiveJob:
     """Commit remote submission intent before crossing the external boundary."""
     job = ArchiveJob(
@@ -471,10 +488,21 @@ async def create_archive_intent(
         cycle_key=str(uuid4()),
         intent_at=now,
         next_attempt_at=now,
+        archive_only=archive_only,
+        outlinks_processed=archive_only,
         lease_owner=page.archive_lease_owner,
         lease_expires_at=page.archive_lease_expires_at,
     )
     session.add(job)
+    await session.flush()
+    await session.execute(
+        update(ArchiveSubmission)
+        .where(
+            ArchiveSubmission.page_id == page.id,
+            ArchiveSubmission.archive_job_id.is_(None),
+        )
+        .values(archive_job_id=job.id)
+    )
     page.archive_lease_owner = None
     page.archive_lease_expires_at = None
     await session.commit()
@@ -514,7 +542,14 @@ async def submit_archive_job(  # noqa: PLR0913
     job.error = None
     await session.commit()
     try:
-        external_job_id = await client.submit(page.url, settings.dedupe_window)
+        if job.archive_only:
+            external_job_id = await client.submit(
+                page.url,
+                settings.dedupe_window,
+                capture_outlinks=False,
+            )
+        else:
+            external_job_id = await client.submit(page.url, settings.dedupe_window)
     except ArchiveAuthenticationError:
         job.error = "authentication failed"
         job.next_attempt_at = now + timedelta(minutes=5)
@@ -594,12 +629,12 @@ async def _recover_uncertain(  # noqa: PLR0913
     return True
 
 
-async def poll_archive_job(  # noqa: PLR0911, PLR0913
+async def poll_archive_job(  # noqa: C901, PLR0911, PLR0913
     session: AsyncSession,
     job: ArchiveJob,
     *,
     page: Page,
-    domain: Domain,
+    domain: Domain | None,
     client: ArchiveClient,
     settings: ArchiveSettings,
     now: datetime,
@@ -656,7 +691,8 @@ async def poll_archive_job(  # noqa: PLR0911, PLR0913
             job.completed_at = now
             job.error = "remote job exceeded pending timeout"
             job.service_code = "pending_timeout"
-            page.next_archive_at = now
+            if not job.archive_only:
+                page.next_archive_at = now
             _release_job(job)
             await session.commit()
             logger.warning(
@@ -707,7 +743,8 @@ async def _record_failure(  # noqa: PLR0913, PLR0917
     else:
         job.state = ArchiveJobState.FAILED
         job.completed_at = now
-        page.next_archive_at = now + settings.interval
+        if not job.archive_only:
+            page.next_archive_at = now + settings.interval
         log = logger.warning
         message = "Archive job {} failed with service code {}: {}"
     _release_job(job)
@@ -740,7 +777,8 @@ async def _record_success(  # noqa: PLR0913, PLR0917
         )
         .on_conflict_do_nothing()
     )
-    page.next_archive_at = status.captured_at + settings.interval
+    if not job.archive_only:
+        page.next_archive_at = status.captured_at + settings.interval
     _record_archive_history(page, status.captured_at, now)
     await session.commit()
 
@@ -749,7 +787,7 @@ async def _post_process(  # noqa: PLR0913, PLR0917
     session: AsyncSession,
     job: ArchiveJob,
     page: Page,
-    domain: Domain,
+    domain: Domain | None,
     client: ArchiveClient,
     settings: ArchiveSettings,
     now: datetime,
@@ -760,7 +798,10 @@ async def _post_process(  # noqa: PLR0913, PLR0917
             await client.add_to_my_archive(job.external_job_id or "")
             job.saved_to_my_archive = True
             await session.commit()
-        if not job.outlinks_processed:
+        if job.archive_only and not job.outlinks_processed:
+            job.outlinks_processed = True
+            await session.commit()
+        if not job.outlinks_processed and domain is not None:
             children = await client.outlinks(job.external_job_id or "")
             await _record_outlinks(
                 session,
@@ -977,6 +1018,19 @@ async def claim_archive_job(
         ),
         ArchiveJob.external_job_id.is_(None),
     )
+    submission_priority = (
+        select(func.max(ArchiveSubmission.priority))
+        .where(ArchiveSubmission.archive_job_id == ArchiveJob.id)
+        .correlate(ArchiveJob)
+        .scalar_subquery()
+    )
+    effective_priority = case(
+        (
+            ArchiveJob.archive_only.is_(True),
+            func.coalesce(submission_priority, 0),
+        ),
+        else_=func.max(func.coalesce(submission_priority, -101), 0),
+    )
     candidate = (
         select(ArchiveJob.id)
         .where(
@@ -987,7 +1041,11 @@ async def claim_archive_job(
             ),
             or_(accepted, post_processing, requires_recovery),
         )
-        .order_by(ArchiveJob.next_attempt_at, ArchiveJob.intent_at)
+        .order_by(
+            effective_priority.desc(),
+            ArchiveJob.next_attempt_at,
+            ArchiveJob.intent_at,
+        )
         .limit(1)
         .scalar_subquery()
     )
@@ -1069,7 +1127,8 @@ def _retry_job(
     if job.attempts >= settings.max_attempts:
         job.state = ArchiveJobState.FAILED
         job.completed_at = now
-        page.next_archive_at = now + settings.interval
+        if not job.archive_only:
+            page.next_archive_at = now + settings.interval
     else:
         job.next_attempt_at = now + timedelta(seconds=min(3600, 2**job.attempts))
     _release_job(job)
@@ -1099,7 +1158,8 @@ def _fail_job(
 ) -> None:
     job.state = ArchiveJobState.FAILED
     job.completed_at = now
-    page.next_archive_at = now + settings.interval
+    if not job.archive_only:
+        page.next_archive_at = now + settings.interval
     _release_job(job)
 
 

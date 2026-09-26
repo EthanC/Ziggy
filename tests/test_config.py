@@ -10,6 +10,7 @@ from ziggy.config import (
     database_change_requires_restart,
     load_config,
     parse_duration,
+    resolve_http_settings,
     resolve_secrets,
 )
 
@@ -461,3 +462,46 @@ def test_database_change_requires_restart_only_for_database_change(tmp_path):
         ziggy=replace(config.ziggy, database=tmp_path / "replacement.db"),
     )
     assert database_change_requires_restart(config, replacement)
+
+
+def test_resolve_http_settings_uses_defaults_and_environment(monkeypatch):
+    for name in ("ZIGGY_HTTP_ENABLED", "ZIGGY_HTTP_HOST", "ZIGGY_HTTP_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    assert resolve_http_settings() == resolve_http_settings()
+    defaults = resolve_http_settings()
+    assert (defaults.enabled, defaults.host, defaults.port) == (
+        False,
+        "127.0.0.1",
+        9449,
+    )
+
+    monkeypatch.setenv("ZIGGY_HTTP_ENABLED", "true")
+    monkeypatch.setenv("ZIGGY_HTTP_HOST", "0.0.0.0")  # noqa: S104
+    monkeypatch.setenv("ZIGGY_HTTP_PORT", "8080")
+    settings = resolve_http_settings()
+    assert (settings.enabled, settings.host, settings.port) == (
+        True,
+        "0.0.0.0",  # noqa: S104
+        8080,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("ZIGGY_HTTP_ENABLED", "perhaps", "invalid HTTP environment setting"),
+        ("ZIGGY_HTTP_PORT", "abc", "invalid HTTP environment setting"),
+        ("ZIGGY_HTTP_PORT", "0", "must be between"),
+        ("ZIGGY_HTTP_PORT", "65536", "must be between"),
+        ("ZIGGY_HTTP_HOST", "", "must be a nonempty host"),
+        ("ZIGGY_HTTP_HOST", " localhost ", "must be a nonempty host"),
+    ],
+)
+def test_resolve_http_settings_rejects_invalid_values(
+    monkeypatch, name, value, message
+):
+    for variable in ("ZIGGY_HTTP_ENABLED", "ZIGGY_HTTP_HOST", "ZIGGY_HTTP_PORT"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigError, match=message):
+        resolve_http_settings()

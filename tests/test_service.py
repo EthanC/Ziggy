@@ -27,6 +27,7 @@ from ziggy.config import (
     ConfigError,
     CrawlSettings,
     DomainSettings,
+    HttpSettings,
     LoggingSettings,
     ReportingSettings,
     Secrets,
@@ -101,6 +102,38 @@ class SequencedStop:
 
     def set(self):
         self.was_set = True
+
+
+class FakeChildProcess:
+    def __init__(self, *, alive=True, start_error=None, ignore_terminate=False):
+        self.alive = alive
+        self.start_error = start_error
+        self.ignore_terminate = ignore_terminate
+        self.exitcode = 7
+        self.started = False
+        self.terminated = False
+        self.killed = False
+        self.joins = []
+
+    def start(self):
+        if self.start_error is not None:
+            raise self.start_error
+        self.started = True
+
+    def is_alive(self):
+        return self.alive
+
+    def join(self, timeout=None):
+        self.joins.append(timeout)
+
+    def terminate(self):
+        self.terminated = True
+        if not self.ignore_terminate:
+            self.alive = False
+
+    def kill(self):
+        self.killed = True
+        self.alive = False
 
 
 def make_state(config: Config | None = None, secrets: Secrets | None = None):
@@ -285,6 +318,89 @@ async def test_check_health_returns_false_on_database_error(monkeypatch, tmp_pat
     engine.dispose.assert_awaited_once_with()
 
 
+async def test_check_health_requires_enabled_http_listener(monkeypatch, tmp_path):
+    path = tmp_path / "http-health.sqlite3"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{path.as_posix()}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        session.add(ServiceState(instance_id="live", started_at=NOW, heartbeat_at=NOW))
+        await session.commit()
+    check_http = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(service, "_check_http_health", check_http)
+    settings = HttpSettings(enabled=True)
+
+    assert await service.check_health(path, NOW, http=HttpSettings()) is True
+    check_http.assert_not_awaited()
+    assert await service.check_health(path, NOW, http=settings) is True
+    assert await service.check_health(path, NOW, http=settings) is False
+    assert check_http.await_count == 2
+    await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("configured_host", "connection_host"),
+    [
+        ("0.0.0.0", "127.0.0.1"),  # noqa: S104
+        ("::", "::1"),
+        ("localhost", "localhost"),
+    ],
+)
+async def test_http_health_probe_maps_bind_hosts_and_requires_405(
+    monkeypatch, configured_host, connection_host
+):
+    reader = SimpleNamespace(
+        readline=AsyncMock(return_value=b"HTTP/1.1 405 Method Not Allowed\r\n")
+    )
+    writer = SimpleNamespace(
+        write=MagicMock(),
+        drain=AsyncMock(),
+        close=MagicMock(),
+        wait_closed=AsyncMock(),
+    )
+    connect = AsyncMock(return_value=(reader, writer))
+    monkeypatch.setattr(service.asyncio, "open_connection", connect)
+
+    assert (
+        await service._check_http_health(
+            HttpSettings(enabled=True, host=configured_host, port=9449)
+        )
+        is True
+    )
+    connect.assert_awaited_once_with(connection_host, 9449)
+    assert writer.write.call_args.args[0].startswith(b"GET /v1/queue HTTP/1.1\r\n")
+    writer.drain.assert_awaited_once_with()
+    writer.close.assert_called_once_with()
+    writer.wait_closed.assert_awaited_once_with()
+
+
+async def test_http_health_probe_rejects_bad_response_and_connection_error(
+    monkeypatch,
+):
+    reader = SimpleNamespace(readline=AsyncMock(return_value=b"invalid\r\n"))
+    writer = SimpleNamespace(
+        write=MagicMock(),
+        drain=AsyncMock(),
+        close=MagicMock(),
+        wait_closed=AsyncMock(side_effect=OSError("closed")),
+    )
+    monkeypatch.setattr(
+        service.asyncio,
+        "open_connection",
+        AsyncMock(return_value=(reader, writer)),
+    )
+    settings = HttpSettings(enabled=True)
+    assert await service._check_http_health(settings) is False
+
+    monkeypatch.setattr(
+        service.asyncio,
+        "open_connection",
+        AsyncMock(side_effect=OSError("refused")),
+    )
+    assert await service._check_http_health(settings) is False
+
+
 async def test_heartbeat_updates_and_commits_once(monkeypatch):
     session = MagicMock(execute=AsyncMock(), commit=AsyncMock())
     stop = asyncio.Event()
@@ -321,6 +437,17 @@ async def test_run_service_owns_startup_tasks_and_cleanup(  # noqa: PLR0915
     heartbeat_started = asyncio.Event()
     monkeypatch.setattr(service, "load_config", MagicMock(return_value=config))
     monkeypatch.setattr(service, "resolve_secrets", MagicMock(return_value=secrets))
+    http_settings = HttpSettings(enabled=True)
+    http_child = service.HttpChild(FakeChildProcess(alive=False), MagicMock())
+    start_http = MagicMock(return_value=http_child)
+    monitor_http = AsyncMock()
+    stop_http = AsyncMock()
+    monkeypatch.setattr(
+        service, "resolve_http_settings", MagicMock(return_value=http_settings)
+    )
+    monkeypatch.setattr(service, "_start_http_child", start_http)
+    monkeypatch.setattr(service, "_monitor_http_child", monitor_http)
+    monkeypatch.setattr(service, "_stop_http_child", stop_http)
     monkeypatch.setattr(
         service, "LoggingController", MagicMock(return_value=logging_controller)
     )
@@ -368,6 +495,9 @@ async def test_run_service_owns_startup_tasks_and_cleanup(  # noqa: PLR0915
     await service.run_service(tmp_path / "ziggy.toml")
 
     logging_controller.configure.assert_called_once_with(config.logging, secrets)
+    start_http.assert_called_once_with(http_settings, config.ziggy.database)
+    monitor_http.assert_awaited_once()
+    stop_http.assert_awaited_once_with(http_child)
     archive_client.login.assert_awaited_once_with()
     archive_client.my_web_archive_url.assert_awaited_once_with()
     assert session.add.call_args.args[0].instance_id == "fixed-instance"
@@ -1645,3 +1775,126 @@ async def test_report_scheduler_skips_absent_window_and_report(monkeypatch):
     monkeypatch.setattr(service, "_wait", stop_wait)
     await service._report_scheduler(state, Sessions(session), "instance", stop)
     create.assert_not_awaited()
+
+
+def test_http_child_is_disabled_by_default_and_start_failures_are_isolated(
+    monkeypatch,
+):
+    assert service._start_http_child(HttpSettings(), Path("ziggy.sqlite3")) is None
+
+    failed = FakeChildProcess(start_error=OSError("spawn failed"))
+    context = SimpleNamespace(
+        Event=MagicMock(return_value=MagicMock()),
+        Process=MagicMock(return_value=failed),
+    )
+    monkeypatch.setattr(service.multiprocessing, "get_context", lambda _name: context)
+    assert (
+        service._start_http_child(HttpSettings(enabled=True), Path("ziggy.sqlite3"))
+        is None
+    )
+    assert failed.started is False
+
+
+def test_http_child_starts_with_spawn_and_isolated_arguments(monkeypatch):
+    process = FakeChildProcess()
+    shutdown = MagicMock()
+    context = SimpleNamespace(
+        Event=MagicMock(return_value=shutdown),
+        Process=MagicMock(return_value=process),
+    )
+    get_context = MagicMock(return_value=context)
+    monkeypatch.setattr(service.multiprocessing, "get_context", get_context)
+    settings = HttpSettings(enabled=True, host="127.0.0.1", port=9449)
+
+    child = service._start_http_child(settings, Path("ziggy.sqlite3"))
+
+    assert child is not None
+    assert child.process is process
+    assert child.shutdown is shutdown
+    assert process.started is True
+    get_context.assert_called_once_with("spawn")
+    context.Process.assert_called_once_with(
+        target=service.run_http_child,
+        args=(Path("ziggy.sqlite3"), "127.0.0.1", 9449, shutdown),
+        name="ziggy-http",
+    )
+
+
+async def test_http_child_monitor_returns_without_stopping_workers():
+    process = FakeChildProcess(alive=False)
+    child = service.HttpChild(process, MagicMock())
+    stop = asyncio.Event()
+
+    await service._monitor_http_child(child, stop)
+
+    assert process.joins == [0]
+    assert stop.is_set() is False
+
+    alive = FakeChildProcess(alive=True)
+    stopped = asyncio.Event()
+
+    async def stop_wait(event, _seconds):
+        event.set()
+
+    original_wait = service._wait
+    service._wait = stop_wait
+    try:
+        await service._monitor_http_child(
+            service.HttpChild(alive, MagicMock()), stopped
+        )
+    finally:
+        service._wait = original_wait
+    assert alive.joins == []
+
+
+async def test_http_child_shutdown_reaps_and_terminates_stuck_process():
+    shutdown = MagicMock()
+    graceful = FakeChildProcess(alive=False)
+    await service._stop_http_child(service.HttpChild(graceful, shutdown))
+    shutdown.set.assert_called_once_with()
+    assert graceful.joins == [service._HTTP_SHUTDOWN_GRACE]
+    assert graceful.terminated is False
+
+    stuck_shutdown = MagicMock()
+    stuck = FakeChildProcess(alive=True)
+    await service._stop_http_child(service.HttpChild(stuck, stuck_shutdown))
+    stuck_shutdown.set.assert_called_once_with()
+    assert stuck.terminated is True
+    assert stuck.joins == [service._HTTP_SHUTDOWN_GRACE, 5.0]
+
+    stubborn = FakeChildProcess(alive=True, ignore_terminate=True)
+    await service._stop_http_child(service.HttpChild(stubborn, MagicMock()))
+    assert stubborn.terminated is True
+    assert stubborn.killed is True
+    assert stubborn.joins == [service._HTTP_SHUTDOWN_GRACE, 5.0, None]
+
+
+async def test_api_only_submission_skips_local_preflight(monkeypatch):
+    state = make_state()
+    page = SimpleNamespace(
+        id=1,
+        domain_id=None,
+        active=True,
+        in_scope=False,
+        blocked_reason=None,
+        url="https://outside.example/",
+        next_archive_at=NOW,
+        archive_lease_owner="worker",
+        archive_lease_expires_at=NOW,
+    )
+    session = MagicMock(
+        get=AsyncMock(return_value=page),
+        scalar=AsyncMock(return_value="receipt"),
+        commit=AsyncMock(),
+    )
+    job = SimpleNamespace(archive_only=True)
+    create_intent = AsyncMock(return_value=job)
+    submit = AsyncMock()
+    monkeypatch.setattr(service, "create_archive_intent", create_intent)
+    monkeypatch.setattr(service, "submit_archive_job", submit)
+
+    await service._submit_one(state, Sessions(session), page.id)
+
+    state.crawler.fetch.assert_not_awaited()
+    assert create_intent.call_args.kwargs == {"archive_only": True}
+    submit.assert_awaited_once()

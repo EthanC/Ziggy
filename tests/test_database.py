@@ -5,13 +5,16 @@ from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import event, insert, select, text
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.exc import StatementError
 
 from ziggy import database as database_module
+from ziggy.archive import create_archive_intent
 from ziggy.config import DomainSettings
 from ziggy.database import (
+    AdmissionCapacityError,
+    admit_archive_submissions,
     claim_due_archive_history_check,
     claim_due_page,
     create_engine,
@@ -28,6 +31,7 @@ from ziggy.models import (
     ArchiveJob,
     ArchiveJobKind,
     ArchiveJobState,
+    ArchiveSubmission,
     Capture,
     Domain,
     Page,
@@ -1074,3 +1078,381 @@ async def test_release_leases_only_releases_leases_owned_by_the_instance(databas
             "other",
             expires,
         )
+
+
+async def test_submission_admission_is_durable_bounded_and_shares_active_job(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    async with sessions() as session:
+        receipts = await admit_archive_submissions(
+            session,
+            "external-service",
+            ("https://outside.example/article",),
+            10,
+            now,
+            outstanding_limit=2,
+        )
+        page = await session.scalar(select(Page))
+        receipt = await session.get(ArchiveSubmission, receipts[0].id)
+        assert page is not None
+        assert receipt is not None
+        assert (page.domain_id, page.in_scope) == (None, False)
+        assert (receipt.identifier, receipt.priority, receipt.archive_job_id) == (
+            "external-service",
+            10,
+            None,
+        )
+
+        claimed = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=5),
+            archive_interval=timedelta(days=365),
+        )
+        assert claimed is not None
+        job = await create_archive_intent(session, claimed, now, archive_only=True)
+        await session.refresh(receipt)
+        assert receipt.archive_job_id == job.id
+        assert job.archive_only is True
+
+        shared = await admit_archive_submissions(
+            session,
+            "second-service",
+            (page.url,),
+            -5,
+            now + timedelta(seconds=1),
+            outstanding_limit=2,
+        )
+        shared_receipt = await session.get(ArchiveSubmission, shared[0].id)
+        assert shared_receipt is not None
+        assert shared_receipt.archive_job_id == job.id
+
+        with pytest.raises(AdmissionCapacityError):
+            await admit_archive_submissions(
+                session,
+                "third-service",
+                ("https://other.example/",),
+                0,
+                now,
+                outstanding_limit=2,
+            )
+
+
+async def test_submission_priority_competes_with_ordinary_archive_work(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    ordinary = await _add_page(sessions, now)
+    async with sessions() as session:
+        high = await admit_archive_submissions(
+            session,
+            "caller",
+            ("https://high.example/",),
+            5,
+            now,
+            outstanding_limit=10,
+        )
+        low = await admit_archive_submissions(
+            session,
+            "caller",
+            ("https://low.example/", ordinary.url, "https://high.example/"),
+            -5,
+            now,
+            outstanding_limit=10,
+        )
+
+        first = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=5),
+            archive_interval=timedelta(days=365),
+        )
+        assert first is not None
+        assert first.url == "https://high.example/"
+        await create_archive_intent(session, first, now, archive_only=True)
+
+        second = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=5),
+            archive_interval=timedelta(days=365),
+        )
+        assert second is not None
+        assert second.id == ordinary.id
+        await create_archive_intent(session, second, now)
+
+        third = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=5),
+            archive_interval=timedelta(days=365),
+        )
+        assert third is not None
+        assert third.url == "https://low.example/"
+        assert {high[0].url, low[0].url} == {
+            "https://high.example/",
+            "https://low.example/",
+        }
+
+
+async def test_submission_claim_preserves_acceptance_and_page_id_tie_breakers(database):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    future = await _add_page(sessions, now + timedelta(days=1))
+    urls = (
+        future.url,
+        "https://outside.example/first",
+        "https://outside.example/second",
+    )
+    async with sessions() as session:
+        for url, priority, accepted_at in (
+            (urls[0], -5, now - timedelta(minutes=2)),
+            (urls[1], 5, now - timedelta(minutes=1)),
+            (urls[2], 5, now - timedelta(minutes=1)),
+            (urls[0], 5, now),
+        ):
+            await admit_archive_submissions(
+                session, "caller", (url,), priority, accepted_at, outstanding_limit=10
+            )
+
+        for url in urls:
+            claimed = await claim_due_page(
+                session,
+                "archive",
+                "worker",
+                now,
+                timedelta(minutes=5),
+                archive_interval=timedelta(days=365),
+            )
+            assert claimed is not None
+            assert claimed.url == url
+        assert (
+            await claim_due_page(
+                session,
+                "archive",
+                "other-worker",
+                now,
+                timedelta(minutes=5),
+                archive_interval=timedelta(days=365),
+            )
+            is None
+        )
+
+
+async def test_api_page_is_not_reconciled_but_discovery_promotes_with_query_cap(
+    database,
+):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    config = SimpleNamespace(
+        domains=(DomainSettings("example.com"),),
+        crawl=SimpleNamespace(max_query_variants_per_base=1),
+    )
+    async with sessions() as session:
+        await admit_archive_submissions(
+            session,
+            "caller",
+            (
+                "https://example.com/page?a=1",
+                "https://example.com/page?a=2",
+                "https://example.com/plain",
+            ),
+            0,
+            now,
+            outstanding_limit=10,
+        )
+        await reconcile_domains(session, config, now)
+        pages = {page.url: page for page in await session.scalars(select(Page))}
+        assert pages["https://example.com/page?a=1"].domain_id is None
+        assert pages["https://example.com/plain"].domain_id is None
+        domain = await session.scalar(select(Domain))
+        assert domain is not None
+
+        await insert_discovered_pages(
+            session,
+            domain.id,
+            (
+                "https://example.com/page?a=1",
+                "https://example.com/page?a=2",
+                "https://example.com/plain",
+            ),
+            now,
+            None,
+            max_query_variants_per_base=1,
+        )
+        await session.commit()
+        await session.refresh(pages["https://example.com/page?a=1"])
+        await session.refresh(pages["https://example.com/page?a=2"])
+        assert pages["https://example.com/page?a=1"].domain_id == domain.id
+        assert pages["https://example.com/page?a=1"].query_variant_slot == 1
+        assert pages["https://example.com/page?a=2"].domain_id is None
+        assert pages["https://example.com/plain"].domain_id == domain.id
+
+
+@pytest.mark.parametrize("suffix", ["", "?part=1"])
+async def test_api_promotion_preserves_initial_crawl_metadata_and_archive_state(
+    database, suffix
+):
+    _, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    parent = await _add_page(sessions, now)
+    discovered_at = now + timedelta(hours=1)
+    archived_at = now + timedelta(minutes=5)
+    next_archive_at = archived_at + timedelta(days=365)
+    url = f"https://example.com/child.xml{suffix}"
+    async with sessions() as session:
+        await admit_archive_submissions(
+            session, "caller", (url,), 0, now, outstanding_limit=10
+        )
+        page = await session.scalar(select(Page).where(Page.url == url))
+        assert page is not None
+        page_id = page.id
+        page.archive_history_checked_at = archived_at
+        page.latest_archive_at = archived_at
+        page.next_archive_at = next_archive_at
+        await session.commit()
+
+        candidate = {
+            "domain_id": parent.domain_id,
+            "url": url,
+            "in_scope": True,
+            "discovered_at": discovered_at,
+            "discovered_from_id": parent.id,
+            "next_crawl_at": discovered_at,
+            "next_archive_at": discovered_at,
+            "sitemap_depth": 8,
+        }
+        await insert_page_candidates(session, [candidate], 1)
+        await session.commit()
+        await session.refresh(page)
+
+        assert (page.id, page.domain_id, page.in_scope) == (
+            page_id,
+            parent.domain_id,
+            True,
+        )
+        assert (page.sitemap_depth, page.discovered_from_id, page.next_crawl_at) == (
+            8,
+            parent.id,
+            discovered_at,
+        )
+        assert page.discovered_at == now
+        assert page.archive_history_checked_at == archived_at
+        assert page.latest_archive_at == archived_at
+        assert page.next_archive_at == next_archive_at
+
+        await insert_page_candidates(
+            session, [{**candidate, "sitemap_depth": 0, "discovered_from_id": None}], 1
+        )
+        await session.commit()
+        await session.refresh(page)
+        assert (page.sitemap_depth, page.discovered_from_id) == (8, parent.id)
+
+
+@pytest.mark.parametrize("analyze", [False, True])
+async def test_idle_archive_claim_uses_indexes_without_scanning_api_history(
+    database, analyze
+):
+    engine, sessions = database
+    now = datetime(2026, 8, 28, 9, tzinfo=UTC)
+    await _add_page(sessions, now + timedelta(days=1))
+    async with sessions() as session:
+        await admit_archive_submissions(
+            session,
+            "caller",
+            ("https://outside.example/completed",),
+            0,
+            now,
+            outstanding_limit=10,
+        )
+        page = await session.scalar(select(Page).where(Page.domain_id.is_(None)))
+        assert page is not None
+        job = await create_archive_intent(session, page, now, archive_only=True)
+        job.state = ArchiveJobState.SUCCEEDED
+        history_ids = (
+            await session.scalars(
+                insert(Page).returning(Page.id),
+                [
+                    {
+                        "url": f"https://outside.example/history/{index}",
+                        "in_scope": False,
+                        "next_archive_at": now,
+                    }
+                    for index in range(2_000)
+                ],
+            )
+        ).all()
+        await session.execute(
+            insert(ArchiveJob),
+            [
+                {
+                    "id": f"completed-{page_id}",
+                    "page_id": page_id,
+                    "kind": ArchiveJobKind.DIRECT,
+                    "state": ArchiveJobState.SUCCEEDED,
+                    "cycle_key": f"completed-{page_id}",
+                    "archive_only": True,
+                }
+                for page_id in history_ids
+            ],
+        )
+        await session.execute(
+            insert(ArchiveSubmission),
+            [
+                {
+                    "page_id": page_id,
+                    "identifier": "caller",
+                    "priority": 0,
+                    "accepted_at": now,
+                    "archive_job_id": f"completed-{page_id}",
+                }
+                for page_id in history_ids
+            ],
+        )
+        if analyze:
+            await session.execute(text("ANALYZE"))
+        await session.commit()
+
+        statements = []
+
+        def record_statement(_connection, _cursor, statement, parameters, *_args):
+            statements.append((statement, parameters))
+
+        event.listen(engine.sync_engine, "before_cursor_execute", record_statement)
+        try:
+            claimed = await claim_due_page(
+                session,
+                "archive",
+                "worker",
+                now,
+                timedelta(minutes=5),
+                archive_interval=timedelta(days=365),
+            )
+        finally:
+            event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
+
+        assert claimed is None
+        assert len(statements) == 1
+        statement, parameters = statements[0]
+        async with engine.connect() as connection:
+            plan = await connection.exec_driver_sql(
+                f"EXPLAIN QUERY PLAN {statement}", parameters
+            )
+        details = [row[3] for row in plan]
+        assert not any(
+            detail.startswith("SCAN pages") or "ix_pages_due_archive" in detail
+            for detail in details
+        ), details
+        assert any("ix_pages_domain" in detail for detail in details), details
+        assert any(
+            "ix_archive_submissions_pending" in detail
+            or "ix_archive_submissions_job" in detail
+            for detail in details
+        ), details

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from contextlib import suppress
 from dataclasses import dataclass
@@ -95,6 +96,11 @@ def normalize_url(value: str, *, base: str | None = None) -> str:
     """Resolve and normalize one absolute HTTP or HTTPS URL."""
     if not isinstance(value, str) or not value:
         raise UrlError("URL must be a nonempty string")
+    if any(
+        character.isspace() or unicodedata.category(character) in {"Cc", "Cs"}
+        for character in value
+    ):
+        raise UrlError("URL must not contain whitespace or control characters")
     candidate = urljoin(base, value) if base is not None else value
     try:
         parts = urlsplit(candidate)

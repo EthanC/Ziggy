@@ -11,7 +11,12 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-from ziggy.config import ConfigError, load_config, resolve_secrets
+from ziggy.config import (
+    ConfigError,
+    load_config,
+    resolve_http_settings,
+    resolve_secrets,
+)
 from ziggy.service import check_health, run_service
 
 
@@ -31,9 +36,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config(arguments.config)
         if arguments.command == "check-config":
             resolve_secrets()
+            resolve_http_settings()
             return 0
         if arguments.command == "healthcheck":
-            return 0 if asyncio.run(check_health(config.ziggy.database)) else 1
+            http_settings = resolve_http_settings()
+            return (
+                0
+                if asyncio.run(check_health(config.ziggy.database, http=http_settings))
+                else 1
+            )
         asyncio.run(run_service(arguments.config))
     except KeyboardInterrupt:
         return 130
