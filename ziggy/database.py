@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -13,7 +15,18 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from sqlalchemy import and_, case, event, exists, func, or_, select, text, update
+from sqlalchemy import (
+    and_,
+    case,
+    event,
+    exists,
+    func,
+    literal_column,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,7 +34,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import aliased
 
 from ziggy.models import (
     ArchiveJob,
@@ -30,7 +42,9 @@ from ziggy.models import (
     ArchiveSubmission,
     Domain,
     Page,
+    ScopeCheckpoint,
 )
+from ziggy.transactions import write_transaction
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
     host_in_scope,
@@ -39,11 +53,13 @@ from ziggy.urls import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
     from datetime import datetime, timedelta
     from pathlib import Path
 
     from sqlalchemy.engine import Engine
+    from sqlalchemy.orm import InstrumentedAttribute
+    from sqlalchemy.sql import ColumnElement
 
     from ziggy.config import Config, DomainSettings
 
@@ -345,11 +361,138 @@ def _database_revision(path: Path) -> str | None:
         return None if row is None else str(row[0])
 
 
-async def reconcile_domains(  # noqa: C901
+async def reconcile_domains(  # noqa: C901, PLR0915
     session: AsyncSession, config: Config, now: datetime
 ) -> None:
-    """Apply a complete domain replacement and reconcile retained pages in batches."""
-    await session.execute(text("BEGIN IMMEDIATE"))
+    """Resume changed scope in bounded chunks; skip completed unchanged scans."""
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            sorted(
+                (settings.host, settings.include_subdomains)
+                for settings in config.domains
+            )
+        ).encode()
+    ).hexdigest()
+    await session.commit()
+
+    async def setup() -> tuple[list[tuple[DomainSettings, int]], ScopeCheckpoint]:
+        configured = await _configure_domains(session, config, now)
+        checkpoint = await session.get(ScopeCheckpoint, 1, populate_existing=True)
+        if checkpoint is None:
+            checkpoint = ScopeCheckpoint(
+                id=1, fingerprint=fingerprint, last_page_id=0, completed=False
+            )
+            session.add(checkpoint)
+        elif checkpoint.fingerprint != fingerprint:
+            checkpoint.fingerprint = fingerprint
+            checkpoint.last_page_id = 0
+            checkpoint.completed = False
+        return configured, checkpoint
+
+    configured, checkpoint = await write_transaction(session, setup)
+    configured_by_host = {
+        settings.host: (settings.include_subdomains, domain_id)
+        for settings, domain_id in configured
+    }
+    while not checkpoint.completed:
+        pages = (
+            await session.execute(
+                select(Page.id, Page.url, Page.blocked_reason)
+                .where(Page.id > checkpoint.last_page_id, Page.domain_id.is_not(None))
+                .order_by(Page.id)
+                .limit(_RECONCILE_BATCH_SIZE)
+            )
+        ).all()
+        changes: list[dict[str, object]] = []
+        for page_id, url, blocked_reason in pages:
+            values: dict[str, object] = {"id": page_id}
+            if blocked_reason is not None or sensitive_query_key(url) is not None:
+                values.update(
+                    blocked_reason=blocked_reason or "sensitive_query", in_scope=False
+                )
+            else:
+                host = urlsplit(url).hostname
+                owner = configured_by_host.get(host or "")
+                if owner is None and host is not None:
+                    owner = next(
+                        (
+                            candidate
+                            for configured_host, candidate in configured_by_host.items()
+                            if host_in_scope(
+                                host, configured_host, include_subdomains=candidate[0]
+                            )
+                        ),
+                        None,
+                    )
+                values["in_scope"] = owner is not None
+                if owner is not None:
+                    values["domain_id"] = owner[1]
+            changes.append(values)
+        await session.commit()
+
+        last_page_id = pages[-1][0] if pages else 0
+
+        async def persist_batch(
+            changes: list[dict[str, object]] = changes,
+            last_page_id: int = last_page_id,
+        ) -> bool:
+            await session.refresh(checkpoint)
+            if checkpoint.fingerprint != fingerprint:
+                return False
+            if changes:
+                await session.execute(update(Page), changes)
+                checkpoint.last_page_id = max(checkpoint.last_page_id, last_page_id)
+            else:
+                checkpoint.completed = True
+            return True
+
+        if not await write_transaction(session, persist_batch):
+            return
+
+    seed_urls = tuple(
+        url for settings, _domain_id in configured for url in settings.seed_urls
+    )
+
+    async def clear_seeds() -> None:
+        stale_seed = Page.is_seed.is_(True)
+        if seed_urls:
+            stale_seed &= Page.url.not_in(seed_urls)
+        await session.execute(update(Page).where(stale_seed).values(is_seed=False))
+
+    await write_transaction(session, clear_seeds)
+    query_variant_cap = getattr(
+        getattr(config, "crawl", None),
+        "max_query_variants_per_base",
+        DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+    )
+    candidates = [
+        {
+            "domain_id": domain_id,
+            "url": url,
+            "is_seed": True,
+            "in_scope": True,
+            "discovered_at": now,
+            "next_crawl_at": now,
+            "next_archive_at": now,
+        }
+        for settings, domain_id in configured
+        for url in settings.seed_urls
+    ]
+    for offset in range(0, len(candidates), 200):
+
+        async def insert_seeds(offset: int = offset) -> None:
+            await insert_page_candidates(
+                session, candidates[offset : offset + 200], query_variant_cap
+            )
+
+        await write_transaction(session, insert_seeds)
+
+
+async def _configure_domains(
+    session: AsyncSession,
+    config: Config,
+    now: datetime,
+) -> list[tuple[DomainSettings, int]]:
     configured_hosts = {domain.host for domain in config.domains}
     existing = {domain.host: domain for domain in await session.scalars(select(Domain))}
     configured: list[tuple[DomainSettings, int]] = []
@@ -377,82 +520,7 @@ async def reconcile_domains(  # noqa: C901
         if host not in configured_hosts and domain.active:
             domain.active = False
             domain.deactivated_at = now
-    await session.commit()
-
-    seed_urls = tuple(
-        url for settings, _domain_id in configured for url in settings.seed_urls
-    )
-    stale_seed = Page.is_seed.is_(True)
-    if seed_urls:
-        stale_seed &= Page.url.not_in(seed_urls)
-    await session.execute(update(Page).where(stale_seed).values(is_seed=False))
-    await session.commit()
-
-    configured_by_host = {
-        settings.host: (settings.include_subdomains, domain_id)
-        for settings, domain_id in configured
-    }
-    last_page_id = 0
-    while pages := (
-        await session.scalars(
-            select(Page)
-            .where(Page.id > last_page_id, Page.domain_id.is_not(None))
-            .order_by(Page.id)
-            .limit(_RECONCILE_BATCH_SIZE)
-        )
-    ).all():
-        for page in pages:
-            if (
-                page.blocked_reason is not None
-                or sensitive_query_key(page.url) is not None
-            ):
-                page.blocked_reason = page.blocked_reason or "sensitive_query"
-                page.in_scope = False
-                continue
-            page_host = urlsplit(page.url).hostname
-            owner = configured_by_host.get(page_host or "")
-            if owner is None and page_host is not None:
-                owner = next(
-                    (
-                        candidate
-                        for host, candidate in configured_by_host.items()
-                        if host_in_scope(
-                            page_host,
-                            host,
-                            include_subdomains=candidate[0],
-                        )
-                    ),
-                    None,
-                )
-            page.in_scope = owner is not None
-            if owner is not None:
-                page.domain_id = owner[1]
-        last_page_id = pages[-1].id
-        await session.commit()
-
-    for settings, domain_id in configured:
-        query_variant_cap = getattr(
-            getattr(config, "crawl", None),
-            "max_query_variants_per_base",
-            DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
-        )
-        await insert_page_candidates(
-            session,
-            [
-                {
-                    "domain_id": domain_id,
-                    "url": url,
-                    "is_seed": True,
-                    "in_scope": True,
-                    "discovered_at": now,
-                    "next_crawl_at": now,
-                    "next_archive_at": now,
-                }
-                for url in settings.seed_urls
-            ],
-            query_variant_cap,
-        )
-    await session.commit()
+    return configured
 
 
 async def insert_discovered_pages(  # noqa: PLR0913, PLR0917
@@ -466,9 +534,9 @@ async def insert_discovered_pages(  # noqa: PLR0913, PLR0917
     """Bulk-add normalized discoveries while preserving URL uniqueness."""
     if not urls:
         return
-    await insert_page_candidates(
-        session,
-        [
+    await session.commit()
+    for offset in range(0, len(urls), 200):
+        candidates: list[dict[str, object]] = [
             {
                 "domain_id": domain_id,
                 "url": url,
@@ -478,10 +546,15 @@ async def insert_discovered_pages(  # noqa: PLR0913, PLR0917
                 "next_crawl_at": now,
                 "next_archive_at": now,
             }
-            for url in urls
-        ],
-        max_query_variants_per_base,
-    )
+            for url in urls[offset : offset + 200]
+        ]
+
+        async def persist(candidates: list[dict[str, object]] = candidates) -> None:
+            await insert_page_candidates(
+                session, candidates, max_query_variants_per_base
+            )
+
+        await write_transaction(session, persist)
 
 
 async def claim_due_page(  # noqa: PLR0913
@@ -493,167 +566,245 @@ async def claim_due_page(  # noqa: PLR0913
     *,
     archive_interval: timedelta | None = None,
 ) -> Page | None:
-    """Atomically claim the oldest due page belonging to an active domain."""
-    due_column = Page.next_crawl_at if kind == "crawl" else Page.next_archive_at
-    owner_column = (
-        Page.crawl_lease_owner if kind == "crawl" else Page.archive_lease_owner
-    )
-    expires_column = (
-        Page.crawl_lease_expires_at
-        if kind == "crawl"
-        else Page.archive_lease_expires_at
-    )
+    """Select outside the writer transaction, then recheck and claim one page."""
     if kind == "archive":
         if archive_interval is None:
             raise ValueError("archive_interval is required for archive work")
-        lease_available = or_(expires_column.is_(None), expires_column <= now)
-        no_active_job = ~exists(
-            select(ArchiveJob.id).where(
-                ArchiveJob.page_id == Page.id,
-                ArchiveJob.kind == ArchiveJobKind.DIRECT,
-                ArchiveJob.state.in_(ACTIVE_ARCHIVE_STATES),
-            )
+        eligible = and_(
+            _available(Page.archive_lease_expires_at, now),
+            _available(Page.archive_history_lease_expires_at, now),
+            ~_active_archive_job(),
+            or_(_ordinary_archive(now), _pending_submission()),
         )
-        pending_submissions = (
-            select(
-                ArchiveSubmission.page_id,
-                func.max(ArchiveSubmission.priority).label("priority"),
-                func.min(ArchiveSubmission.accepted_at).label("first_accepted"),
-            )
-            .where(ArchiveSubmission.archive_job_id.is_(None))
-            .group_by(ArchiveSubmission.page_id)
-            .cte("pending_submissions")
-        )
-        ordinary_eligible = and_(
-            Domain.active.is_(True),
-            Page.active.is_(True),
-            Page.in_scope.is_(True),
-            Page.blocked_reason.is_(None),
-            due_column <= now,
-            or_(
-                Page.archive_history_lease_expires_at.is_(None),
-                Page.archive_history_lease_expires_at <= now,
-            ),
-        )
-        effective_priority = case(
-            (
-                ordinary_eligible,
-                func.max(func.coalesce(pending_submissions.c.priority, 0), 0),
-            ),
-            else_=pending_submissions.c.priority,
-        )
-        cutoff = now - archive_interval
-        history_priority = case(
-            (
-                Page.archive_history_checked_at.is_not(None)
-                & or_(
-                    Page.latest_archive_at.is_(None),
-                    Page.latest_archive_at < cutoff,
-                ),
-                0,
-            ),
-            (Page.archive_history_checked_at.is_(None), 1),
-            else_=2,
-        )
-        # Enumerate domain page IDs before due filters so API history stays out.
-        eligible_ids = (
-            select(Page.id)
-            .select_from(Domain)
-            .join(
-                Page,
-                Page.id.in_(
-                    select(Page.id).where(Page.domain_id == Domain.id).correlate(Domain)
-                ),
-            )
-            .where(ordinary_eligible)
-            .correlate(None)
-            .union_all(select(pending_submissions.c.page_id))
-        )
-        candidate = (
-            select(Page.id)
-            .outerjoin(Domain, Page.domain_id == Domain.id)
-            .outerjoin(pending_submissions, pending_submissions.c.page_id == Page.id)
-            .where(
-                Page.id.in_(eligible_ids),
-                lease_available,
-                no_active_job,
-            )
-            .order_by(
-                effective_priority.desc(),
-                history_priority,
-                case(
-                    (ordinary_eligible, due_column),
-                    else_=pending_submissions.c.first_accepted,
-                ),
-                Page.id,
-            )
-            .limit(1)
-            .scalar_subquery()
-        )
-    else:
-        conditions = [
-            Domain.active.is_(True),
-            Page.in_scope.is_(True),
-            Page.blocked_reason.is_(None),
-            due_column <= now,
-            or_(expires_column.is_(None), expires_column <= now),
-        ]
-        active_page = aliased(Page)
-        active_domain = aliased(Domain)
-        due_active_page = exists(
-            select(active_page.id)
-            .join(active_domain, active_page.domain_id == active_domain.id)
-            .where(
-                active_domain.active.is_(True),
-                active_page.active.is_(True),
-                active_page.is_seed.is_(False),
-                active_page.in_scope.is_(True),
-                active_page.blocked_reason.is_(None),
-                active_page.next_crawl_at <= now,
-                or_(
-                    active_page.crawl_lease_expires_at.is_(None),
-                    active_page.crawl_lease_expires_at <= now,
-                ),
-            )
-        )
-        seed_candidate = (
-            select(Page.id)
-            .join(Domain, Page.domain_id == Domain.id)
-            .where(*conditions, Page.is_seed.is_(True))
-            .order_by(due_column, Page.id)
-            .limit(1)
-            .scalar_subquery()
-        )
-        regular_candidate = (
-            select(Page.id)
-            .join(Domain, Page.domain_id == Domain.id)
-            .where(
-                *conditions,
-                Page.is_seed.is_(False),
-                or_(Page.active.is_(True), ~due_active_page),
-            )
-            .order_by(Page.active.desc(), due_column, Page.id)
-            .limit(1)
-            .scalar_subquery()
-        )
-        candidate = func.coalesce(seed_candidate, regular_candidate)
-    statement = (
-        update(Page)
-        .where(
-            Page.id == candidate,
-            or_(expires_column.is_(None), expires_column <= now),
-        )
-        .values(
+        return await _claim_page(
+            session,
+            lambda: _archive_candidate(session, now, archive_interval),
+            eligible,
             {
-                owner_column: owner,
-                expires_column: now + lease_duration,
-            }
+                "archive_lease_owner": owner,
+                "archive_lease_expires_at": now + lease_duration,
+            },
         )
-        .returning(Page)
+
+    eligible = and_(
+        _scoped_page(),
+        Page.next_crawl_at <= now,
+        _available(Page.crawl_lease_expires_at, now),
     )
-    page = (await session.scalars(statement)).one_or_none()
-    await session.commit()
-    return page
+
+    async def candidate() -> int | None:
+        for category in (
+            Page.is_seed.is_(True),
+            and_(Page.is_seed.is_(False), Page.active.is_(True)),
+            and_(Page.is_seed.is_(False), Page.active.is_(False)),
+        ):
+            page_id = await session.scalar(
+                select(Page.id)
+                .where(eligible, category)
+                .order_by(Page.next_crawl_at, Page.id)
+                .limit(1)
+            )
+            if page_id is not None:
+                return page_id
+        return None
+
+    return await _claim_page(
+        session,
+        candidate,
+        eligible,
+        {"crawl_lease_owner": owner, "crawl_lease_expires_at": now + lease_duration},
+    )
+
+
+def _available(
+    column: InstrumentedAttribute[datetime | None], now: datetime
+) -> ColumnElement[bool]:
+    return or_(column.is_(None), column <= now)
+
+
+def _scoped_page() -> ColumnElement[bool]:
+    return and_(
+        Page.in_scope.is_(True),
+        Page.blocked_reason.is_(None),
+        exists(
+            select(Domain.id).where(
+                Domain.id == Page.domain_id, Domain.active.is_(True)
+            )
+        ),
+    )
+
+
+def _ordinary_archive(now: datetime) -> ColumnElement[bool]:
+    return and_(_scoped_page(), Page.active.is_(True), Page.next_archive_at <= now)
+
+
+def _active_archive_job() -> ColumnElement[bool]:
+    return exists(
+        select(ArchiveJob.id).where(
+            ArchiveJob.page_id == Page.id,
+            ArchiveJob.kind == ArchiveJobKind.DIRECT,
+            ArchiveJob.state.in_(ACTIVE_ARCHIVE_STATES),
+        )
+    )
+
+
+def _pending_submission() -> ColumnElement[bool]:
+    return exists(
+        select(ArchiveSubmission.id).where(
+            ArchiveSubmission.page_id == Page.id,
+            ArchiveSubmission.archive_job_id.is_(None),
+        )
+    )
+
+
+async def _archive_candidate(
+    session: AsyncSession,
+    now: datetime,
+    interval: timedelta,
+) -> int | None:
+    available = and_(
+        _available(Page.archive_lease_expires_at, now),
+        _available(Page.archive_history_lease_expires_at, now),
+        ~_active_archive_job(),
+    )
+    ordinary = _ordinary_archive(now)
+    cutoff = now - interval
+    history = case(
+        (
+            and_(
+                Page.archive_history_checked_at.is_not(None),
+                or_(Page.latest_archive_at.is_(None), Page.latest_archive_at < cutoff),
+            ),
+            0,
+        ),
+        (Page.archive_history_checked_at.is_(None), 1),
+        else_=2,
+    )
+    pending = (
+        select(
+            ArchiveSubmission.page_id,
+            func.max(ArchiveSubmission.priority).label("priority"),
+            func.min(ArchiveSubmission.accepted_at).label("accepted"),
+        )
+        .where(ArchiveSubmission.archive_job_id.is_(None))
+        .group_by(ArchiveSubmission.page_id)
+        .subquery()
+    )
+    priority = case(
+        (ordinary, func.max(pending.c.priority, 0)), else_=pending.c.priority
+    )
+    due = case((ordinary, Page.next_archive_at), else_=pending.c.accepted)
+    submitted = (
+        await session.execute(
+            select(Page.id, priority, history, due)
+            .join(pending, pending.c.page_id == Page.id)
+            .where(available)
+            .order_by(priority.desc(), history, due, Page.id)
+            .limit(1)
+        )
+    ).first()
+    if submitted is not None and submitted[1] > 0:
+        return submitted[0]
+
+    candidate = await _ordinary_archive_candidate(session, ordinary & available, cutoff)
+    if candidate is not None:
+        _history_rank, _due_at, page_id = candidate
+        if (
+            submitted is not None
+            and submitted[1] == 0
+            and (submitted[2], submitted[3], submitted[0]) < candidate
+        ):
+            return submitted[0]
+        return page_id
+    return None if submitted is None else submitted[0]
+
+
+async def _ordinary_archive_candidate(
+    session: AsyncSession,
+    eligible: ColumnElement[bool],
+    cutoff: datetime,
+) -> tuple[int, datetime, int] | None:
+    best: tuple[int, datetime, int] | None = None
+    for rank, category in (
+        (
+            0,
+            and_(
+                Page.archive_history_checked_at.is_not(None),
+                Page.latest_archive_at.is_(None),
+            ),
+        ),
+        (
+            0,
+            and_(
+                Page.archive_history_checked_at.is_not(None),
+                Page.latest_archive_at < cutoff,
+            ),
+        ),
+        (1, Page.archive_history_checked_at.is_(None)),
+        (
+            2,
+            and_(
+                Page.archive_history_checked_at.is_not(None),
+                Page.latest_archive_at >= cutoff,
+            ),
+        ),
+    ):
+        if best is not None and rank > best[0]:
+            break
+        # An age-index probe avoids walking the due index when all known captures
+        # are recent. The second probe preserves due-time ordering within a band.
+        if (
+            rank == 0
+            and await session.scalar(
+                select(Page.id)
+                .where(eligible, category)
+                .order_by(Page.latest_archive_at)
+                .limit(1)
+            )
+            is None
+        ):
+            continue
+        row = (
+            await session.execute(
+                select(Page.next_archive_at, Page.id)
+                .where(eligible, category)
+                .order_by(Page.next_archive_at, Page.id)
+                .limit(1)
+            )
+        ).first()
+        if row is not None:
+            candidate = (rank, row[0], row[1])
+            best = candidate if best is None else min(best, candidate)
+    return best
+
+
+async def _claim_page(
+    session: AsyncSession,
+    candidate: Callable[[], Awaitable[int | None]],
+    eligible: ColumnElement[bool],
+    values: Mapping[str, object],
+) -> Page | None:
+    for _ in range(16):
+        page_id = await candidate()
+        await session.commit()
+        if page_id is None:
+            return None
+
+        async def claim(page_id: int = page_id) -> Page | None:
+            return (
+                await session.scalars(
+                    update(Page)
+                    .where(Page.id == page_id, eligible)
+                    .values(**values)
+                    .returning(Page)
+                    .execution_options(populate_existing=True)
+                )
+            ).one_or_none()
+
+        page = await write_transaction(session, claim)
+        if page is not None:
+            return page
+    return None
 
 
 async def claim_due_archive_history_check(
@@ -662,70 +813,42 @@ async def claim_due_archive_history_check(
     now: datetime,
     lease_duration: timedelta,
 ) -> Page | None:
-    """Atomically claim one validated page awaiting a Wayback history check."""
-    active_job = exists(
-        select(ArchiveJob.id).where(
-            ArchiveJob.page_id == Page.id,
-            ArchiveJob.state.in_(
-                (
-                    ArchiveJobState.INTENT,
-                    ArchiveJobState.UNCERTAIN,
-                    ArchiveJobState.SUBMITTED,
-                    ArchiveJobState.PENDING,
-                    ArchiveJobState.RATE_LIMITED,
-                )
-            ),
-        )
+    """Select validated history work before acquiring the writer lock."""
+    eligible = and_(
+        _scoped_page(),
+        Page.active.is_(True),
+        Page.status_code.between(literal_column("200"), literal_column("299")),
+        Page.error.is_(None),
+        Page.archive_history_checked_at.is_(None),
+        Page.next_archive_history_check_at.is_not(None),
+        Page.next_archive_history_check_at <= now,
+        _available(Page.archive_history_lease_expires_at, now),
+        _available(Page.archive_lease_expires_at, now),
+        ~exists(
+            select(ArchiveJob.id).where(
+                ArchiveJob.page_id == Page.id,
+                ArchiveJob.state.in_(ACTIVE_ARCHIVE_STATES),
+            )
+        ),
     )
-    candidate = (
-        select(Page.id)
-        .join(Domain, Page.domain_id == Domain.id)
-        .where(
-            Domain.active.is_(True),
-            Page.active.is_(True),
-            Page.in_scope.is_(True),
-            Page.blocked_reason.is_(None),
-            Page.status_code.between(200, 299),
-            Page.error.is_(None),
-            Page.archive_history_checked_at.is_(None),
-            Page.next_archive_history_check_at.is_not(None),
-            Page.next_archive_history_check_at <= now,
-            or_(
-                Page.archive_history_lease_expires_at.is_(None),
-                Page.archive_history_lease_expires_at <= now,
-            ),
-            or_(
-                Page.archive_lease_expires_at.is_(None),
-                Page.archive_lease_expires_at <= now,
-            ),
-            ~active_job,
+
+    async def candidate() -> int | None:
+        return await session.scalar(
+            select(Page.id)
+            .where(eligible)
+            .order_by(Page.next_archive_history_check_at, Page.id)
+            .limit(1)
         )
-        .order_by(Page.next_archive_history_check_at, Page.id)
-        .limit(1)
-        .scalar_subquery()
+
+    return await _claim_page(
+        session,
+        candidate,
+        eligible,
+        {
+            "archive_history_lease_owner": owner,
+            "archive_history_lease_expires_at": now + lease_duration,
+        },
     )
-    statement = (
-        update(Page)
-        .where(
-            Page.id == candidate,
-            or_(
-                Page.archive_history_lease_expires_at.is_(None),
-                Page.archive_history_lease_expires_at <= now,
-            ),
-            or_(
-                Page.archive_lease_expires_at.is_(None),
-                Page.archive_lease_expires_at <= now,
-            ),
-        )
-        .values(
-            archive_history_lease_owner=owner,
-            archive_history_lease_expires_at=now + lease_duration,
-        )
-        .returning(Page)
-    )
-    page = (await session.scalars(statement)).one_or_none()
-    await session.commit()
-    return page
 
 
 async def release_leases(session: AsyncSession, owner: str) -> None:

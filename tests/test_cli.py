@@ -87,3 +87,12 @@ def test_unexpected_error_redacts_details_and_returns_one(monkeypatch, capsys):
 
     assert cli.main(["run"]) == 1
     assert capsys.readouterr().err == "ziggy: RuntimeError\n"
+
+
+async def test_service_import_is_deferred_to_run_command(monkeypatch):
+    from ziggy import service  # noqa: PLC0415
+
+    run = AsyncMock()
+    monkeypatch.setattr(service, "run_service", run)
+    await cli.run_service(CONFIG_PATH)
+    run.assert_awaited_once_with(CONFIG_PATH)

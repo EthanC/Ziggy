@@ -18,7 +18,14 @@ from ziggy.config import (
     resolve_http_settings,
     resolve_secrets,
 )
-from ziggy.service import check_health, run_service
+from ziggy.health import check_health
+
+
+async def run_service(config_path: Path) -> None:
+    """Load service dependencies only for the long-running command."""
+    from ziggy.service import run_service as run  # noqa: PLC0415
+
+    await run(config_path)
 
 
 def _parser() -> argparse.ArgumentParser:

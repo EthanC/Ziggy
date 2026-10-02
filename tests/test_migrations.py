@@ -22,13 +22,15 @@ from ziggy.models import (
     ArchiveJob,
     ArchiveJobKind,
     ArchiveJobState,
+    ArchiveSubmission,
     Base,
     Domain,
     Page,
+    ScopeCheckpoint,
 )
 
 ROOT = Path(__file__).parents[1]
-HEAD_REVISION = "f31a6b9c2d84"
+HEAD_REVISION = "08c6a1f94d27"
 APPLICATION_TABLES = set(Base.metadata.tables)
 
 
@@ -182,6 +184,51 @@ async def test_fresh_migration_is_at_head_complete_and_matches_model_metadata(tm
                 )
             )
         assert differences == []
+    finally:
+        await engine.dispose()
+
+
+async def test_scheduler_upgrade_preserves_populated_current_revision(tmp_path):
+    path = tmp_path / "current.sqlite3"
+    await asyncio.to_thread(_upgrade_to, path, "f31a6b9c2d84")
+    engine = create_engine(path)
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    async with session_factory(engine)() as session:
+        domain = Domain(host="example.com", scheme="https", include_subdomains=False)
+        session.add(domain)
+        await session.flush()
+        page = Page(domain_id=domain.id, url="https://example.com/", next_crawl_at=now)
+        session.add(page)
+        await session.flush()
+        job = ArchiveJob(
+            id="preserved",
+            page_id=page.id,
+            kind=ArchiveJobKind.DIRECT,
+            state=ArchiveJobState.UNCERTAIN,
+            cycle_key="preserved",
+            attempts=2,
+            next_attempt_at=now,
+        )
+        session.add(job)
+        await session.flush()
+        session.add(
+            ArchiveSubmission(
+                page_id=page.id, identifier="caller", priority=4, archive_job_id=job.id
+            )
+        )
+        await session.commit()
+    await engine.dispose()
+    await run_migrations(path)
+    engine = create_engine(path)
+    try:
+        async with session_factory(engine)() as session:
+            job = await session.get(ArchiveJob, "preserved")
+            assert job.state is ArchiveJobState.UNCERTAIN
+            assert job.attempts == 2
+            assert job.next_attempt_at == now
+            assert (await session.scalar(select(ArchiveSubmission))).priority == 4
+            assert await session.get(ScopeCheckpoint, 1) is None
+            assert (await session.execute(text("PRAGMA foreign_key_check"))).all() == []
     finally:
         await engine.dispose()
 

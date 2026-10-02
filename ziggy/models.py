@@ -18,6 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false,
+    text,
     true,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -178,6 +179,62 @@ class Page(Base):
         ),
         Index("ix_pages_domain", "domain_id"),
         Index(
+            "ix_pages_schedule_seed",
+            "next_crawl_at",
+            "id",
+            sqlite_where=in_scope.is_(True)
+            & blocked_reason.is_(None)
+            & is_seed.is_(True),
+        ),
+        Index(
+            "ix_pages_schedule_crawl",
+            "active",
+            "next_crawl_at",
+            "id",
+            sqlite_where=in_scope.is_(True)
+            & blocked_reason.is_(None)
+            & is_seed.is_(False),
+        ),
+        Index(
+            "ix_pages_schedule_archive_unknown",
+            "next_archive_at",
+            "id",
+            sqlite_where=in_scope.is_(True)
+            & active.is_(True)
+            & blocked_reason.is_(None)
+            & archive_history_checked_at.is_(None),
+        ),
+        Index(
+            "ix_pages_schedule_archive_known",
+            "next_archive_at",
+            "id",
+            sqlite_where=in_scope.is_(True)
+            & active.is_(True)
+            & blocked_reason.is_(None)
+            & archive_history_checked_at.is_not(None),
+        ),
+        Index(
+            "ix_pages_schedule_archive_age",
+            "latest_archive_at",
+            "next_archive_at",
+            "id",
+            sqlite_where=in_scope.is_(True)
+            & active.is_(True)
+            & blocked_reason.is_(None)
+            & archive_history_checked_at.is_not(None),
+        ),
+        Index(
+            "ix_pages_schedule_history",
+            "next_archive_history_check_at",
+            "id",
+            sqlite_where=in_scope.is_(True)
+            & active.is_(True)
+            & blocked_reason.is_(None)
+            & archive_history_checked_at.is_(None)
+            & error.is_(None)
+            & status_code.between(200, 299),
+        ),
+        Index(
             "uq_pages_query_variant_slot",
             "query_base_url",
             "query_variant_slot",
@@ -185,6 +242,15 @@ class Page(Base):
             sqlite_where=query_variant_slot.is_not(None),
         ),
     )
+
+
+ARCHIVE_WORK_PREDICATE = text(
+    "((external_job_id IS NOT NULL "
+    "AND state IN ('SUBMITTED', 'PENDING', 'RATE_LIMITED')) "
+    "OR (external_job_id IS NULL AND state IN ('INTENT', 'UNCERTAIN', 'RATE_LIMITED')) "
+    "OR (state = 'SUCCEEDED' "
+    "AND (saved_to_my_archive IS 0 OR outlinks_processed IS 0)))"
+)
 
 
 class ArchiveJob(Base):
@@ -226,6 +292,13 @@ class ArchiveJob(Base):
         Index("ix_archive_jobs_due", "state", "next_attempt_at", "lease_expires_at"),
         Index("ix_archive_jobs_external_active", "external_job_id", "state"),
         Index("ix_archive_jobs_page", "page_id"),
+        Index(
+            "ix_archive_jobs_work",
+            "next_attempt_at",
+            "intent_at",
+            "id",
+            sqlite_where=ARCHIVE_WORK_PREDICATE,
+        ),
     )
 
 
@@ -369,3 +442,14 @@ class ServiceState(Base):
     started_at: Mapped[datetime] = mapped_column(UtcDateTime())
     heartbeat_at: Mapped[datetime] = mapped_column(UtcDateTime())
     last_report_window_end: Mapped[datetime | None] = mapped_column(UtcDateTime())
+
+
+class ScopeCheckpoint(Base):
+    """Durable cursor for the current scope reconciliation."""
+
+    __tablename__ = "scope_checkpoint"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    last_page_id: Mapped[int] = mapped_column(Integer, default=0)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import signal
-import sqlite3
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -14,8 +13,6 @@ from uuid import uuid4
 
 from loguru import logger
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ziggy.archive import (
     ArchiveAuthenticationError,
@@ -47,7 +44,6 @@ from ziggy.database import (
     claim_due_archive_history_check,
     claim_due_page,
     create_engine,
-    database_url,
     reconcile_domains,
     release_leases,
     run_migrations,
@@ -69,24 +65,24 @@ from ziggy.reporting import (
     deliver_report,
     next_report_window,
 )
+from ziggy.transactions import Lease, LeaseLostError, write_transaction
+from ziggy.transactions import is_database_lock as _is_database_lock
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
-    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+    from ziggy.crawler import FetchResult
 
 _IDLE_DELAY = 0.5
 _LEASE_DURATION = timedelta(minutes=5)
 _HEARTBEAT_INTERVAL = 30.0
-_HEALTH_MAX_AGE = timedelta(seconds=90)
 _ARCHIVE_CAPACITY_RECHECK_DELAY = 30.0
 _SUCCESS_MIN = 200
 _SUCCESS_MAX = 299
 _HTTP_SHUTDOWN_GRACE = 10.0
-_HTTP_HEALTH_TIMEOUT = 2.0
-_HTTP_STATUS_PARTS = 2
-_WILDCARD_IPV4 = "0.0.0.0"  # noqa: S104
 
 
 @dataclass(slots=True)
@@ -357,16 +353,6 @@ async def _run_resilient_worker(
             await _wait(stop, _IDLE_DELAY)
         else:
             return
-
-
-def _is_database_lock(error: BaseException) -> bool:
-    if isinstance(error, BaseExceptionGroup):
-        return all(_is_database_lock(nested) for nested in error.exceptions)
-    return (
-        isinstance(error, OperationalError)
-        and isinstance(error.orig, sqlite3.OperationalError)
-        and "locked" in str(error.orig).casefold()
-    )
 
 
 async def _config_watcher(
@@ -665,16 +651,20 @@ async def _submit_one(
                 await session.commit()
                 return
         await session.commit()
-        if ordinary and not await _archive_preflight(
-            session, page, domain, state.crawler
-        ):
+        try:
+            if ordinary and not await _archive_preflight(
+                session, page, domain, state.crawler
+            ):
+                return
+            if ordinary:
+                job = await create_archive_intent(session, page, datetime.now(UTC))
+            else:
+                job = await create_archive_intent(
+                    session, page, datetime.now(UTC), archive_only=True
+                )
+        except LeaseLostError:
             return
-        if ordinary:
-            job = await create_archive_intent(session, page, datetime.now(UTC))
-        else:
-            job = await create_archive_intent(
-                session, page, datetime.now(UTC), archive_only=True
-            )
+        url = page.url
         try:
             await submit_archive_job(
                 session,
@@ -687,7 +677,7 @@ async def _submit_one(
         except ArchiveAuthenticationError:
             state.archive_paused = True
             logger.error(
-                "Internet Archive authentication paused new submissions: {}", page.url
+                "Internet Archive authentication paused new submissions: {}", url
             )
         except Exception as error:  # noqa: BLE001 - preserve scheduler liveness.
             await _archive_worker_failure(session, job, page, error)
@@ -740,6 +730,7 @@ async def _poll_one(
         archive_only = getattr(job, "archive_only", False)
         if domain is None and not archive_only:
             return
+        url = page.url
         try:
             if job.state == ArchiveJobState.INTENT or (
                 job.state == ArchiveJobState.RATE_LIMITED
@@ -798,7 +789,7 @@ async def _poll_one(
             state.archive_paused = True
             logger.error(
                 "Internet Archive authentication failed during persisted work: {}",
-                page.url,
+                url,
             )
         except Exception as error:  # noqa: BLE001 - preserve scheduler liveness.
             await _archive_worker_failure(session, job, page, error)
@@ -813,7 +804,16 @@ async def _archive_preflight(
     job: ArchiveJob | None = None,
 ) -> bool:
     """Require a current successful origin response before remote submission."""
+    # Recovery retries roll back the whole session, including this domain.
+    await session.refresh(domain)
     now = datetime.now(UTC)
+    lease = (
+        Lease.capture(page, "archive_lease_owner", "archive_lease_expires_at")
+        if job is None
+        else Lease.capture(job, "lease_owner", "lease_expires_at")
+    )
+    await session.commit()
+    result: FetchResult | FetchError
     try:
         result = await crawler.fetch(
             page.url,
@@ -821,19 +821,33 @@ async def _archive_preflight(
             include_subdomains=domain.include_subdomains,
             read_body=False,
         )
-    except FetchError as error:
-        page.error = str(error)
+    except FetchError as caught:
+        result = caught
+
+    async def record() -> bool:
+        return _record_preflight(page, job, result, now)
+
+    return await lease.persist(session, record, (page,) if job is not None else ())
+
+
+def _record_preflight(
+    page: Page,
+    job: ArchiveJob | None,
+    result: FetchResult | FetchError,
+    now: datetime,
+) -> bool:
+    if isinstance(result, FetchError):
+        page.error = str(result)
         if job is None:
             page.next_archive_at = now + timedelta(minutes=1)
             page.archive_lease_owner = None
             page.archive_lease_expires_at = None
         else:
-            job.error = str(error)
+            job.error = str(result)
             job.next_attempt_at = now + timedelta(minutes=1)
             job.lease_owner = None
             job.lease_expires_at = None
-        await session.commit()
-        logger.warning("Archive preflight failed for {}: {}", page.url, error)
+        logger.warning("Archive preflight failed for {}: {}", page.url, result)
         return False
     page.status_code = result.status_code
     page.final_url = result.final_url
@@ -852,7 +866,6 @@ async def _archive_preflight(
             job.error = page.error
             job.lease_owner = None
             job.lease_expires_at = None
-        await session.commit()
         logger.info(
             "Page marked inactive after archive preflight returned HTTP {}: {}",
             result.status_code,
@@ -910,91 +923,24 @@ async def _heartbeat(
 ) -> None:
     while not stop.is_set():
         async with sessions() as session:
-            await session.execute(
-                update(ServiceState)
-                .where(ServiceState.instance_id == instance_id)
-                .values(heartbeat_at=datetime.now(UTC))
-            )
-            await session.commit()
+
+            async def beat() -> None:
+                await session.execute(
+                    update(ServiceState)
+                    .where(ServiceState.instance_id == instance_id)
+                    .values(heartbeat_at=datetime.now(UTC))
+                )
+
+            await write_transaction(session, beat)
         await _wait(stop, _HEARTBEAT_INTERVAL)
-
-
-async def check_health(
-    path: Path,
-    now: datetime | None = None,
-    *,
-    http: HttpSettings | None = None,
-) -> bool:
-    """Return whether enabled service components are healthy."""
-    if not await asyncio.to_thread(path.exists):
-        logger.error("Health check failed: database does not exist at {}", path)
-        return False
-    engine = create_async_engine(database_url(path))
-    try:
-        factory = async_sessionmaker(engine, expire_on_commit=False)
-        async with factory() as session:
-            heartbeat = await session.scalar(
-                select(func.max(ServiceState.heartbeat_at))
-            )
-        current = now or datetime.now(UTC)
-        if heartbeat is None:
-            logger.error("Health check failed: no service heartbeat found")
-            return False
-        heartbeat_age = current - heartbeat
-        if heartbeat_age > _HEALTH_MAX_AGE:
-            logger.error(
-                "Health check failed: service heartbeat is {:.0f}s old",
-                heartbeat_age.total_seconds(),
-            )
-            return False
-    except OSError, SQLAlchemyError, ValueError:
-        logger.exception("Health check failed while reading the service heartbeat")
-        return False
-    finally:
-        await engine.dispose()
-    return http is None or not http.enabled or await _check_http_health(http)
-
-
-async def _check_http_health(settings: HttpSettings) -> bool:
-    """Require the HTTP child to process a request without consuming admission."""
-    host = {_WILDCARD_IPV4: "127.0.0.1", "::": "::1"}.get(settings.host, settings.host)
-    host_header = f"[{host}]" if ":" in host else host
-    writer: asyncio.StreamWriter | None = None
-    try:
-        async with asyncio.timeout(_HTTP_HEALTH_TIMEOUT):
-            reader, writer = await asyncio.open_connection(host, settings.port)
-            writer.write(
-                b"GET /v1/queue HTTP/1.1\r\n"
-                + f"Host: {host_header}\r\n".encode()
-                + b"Connection: close\r\n\r\n"
-            )
-            await writer.drain()
-            status_line = await reader.readline()
-    except OSError, TimeoutError, ValueError:
-        logger.exception(
-            "Health check failed while connecting to HTTP listener at {}:{}",
-            settings.host,
-            settings.port,
-        )
-        return False
-    else:
-        status_parts = status_line.split(maxsplit=2)
-        healthy = len(status_parts) >= _HTTP_STATUS_PARTS and status_parts[1] == b"405"
-        if not healthy:
-            logger.error(
-                "Health check failed: HTTP listener returned an unexpected response"
-            )
-        return healthy
-    finally:
-        if writer is not None:
-            writer.close()
-            with suppress(OSError):
-                await writer.wait_closed()
 
 
 async def _worker_failure(
     session: AsyncSession, page: Page, kind: str, error: Exception
 ) -> None:
+    if isinstance(error, LeaseLostError) or _is_database_lock(error):
+        await session.rollback()
+        return
     await session.rollback()
     await session.refresh(page)
     page.error = type(error).__name__
@@ -1008,6 +954,9 @@ async def _worker_failure(
 async def _archive_worker_failure(
     session: AsyncSession, job: ArchiveJob, page: Page, error: Exception
 ) -> None:
+    if isinstance(error, LeaseLostError) or _is_database_lock(error):
+        await session.rollback()
+        return
     await session.rollback()
     await session.refresh(job)
     await session.refresh(page)
@@ -1022,6 +971,9 @@ async def _archive_worker_failure(
 async def _archive_history_worker_failure(
     session: AsyncSession, page: Page, error: Exception
 ) -> None:
+    if isinstance(error, LeaseLostError) or _is_database_lock(error):
+        await session.rollback()
+        return
     await session.rollback()
     await session.refresh(page)
     page.archive_history_check_attempts += 1

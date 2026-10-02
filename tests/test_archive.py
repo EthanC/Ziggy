@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -19,7 +20,8 @@ from archivist import (
     InvalidServiceResponseError,
     RateLimitError,
 )
-from sqlalchemy import select
+from sqlalchemy import event, select, update
+from sqlalchemy.exc import OperationalError
 
 from ziggy import archive
 from ziggy.archive import (
@@ -49,6 +51,7 @@ from ziggy.models import (
     Domain,
     Page,
 )
+from ziggy.transactions import LeaseLostError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
@@ -242,6 +245,414 @@ def success(
     )
 
 
+@pytest.mark.parametrize("archive_only", [False, True])
+@pytest.mark.parametrize("capture_found", [False, True])
+async def test_no_request_recovery_survives_restart_and_checks_history(
+    database,
+    archive_only,
+    capture_found,
+):
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        if archive_only:
+            page.domain_id = None
+            page.in_scope = False
+        job = await add_job(
+            session, page, state=ArchiveJobState.PENDING, external_job_id="remote-1"
+        )
+        job.archive_only = archive_only
+        await session.commit()
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=FakeArchiveClient(
+                status_result=FailedStatus("remote-1", "error:no-request")
+            ),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        job_id, page_id = job.id, page.id
+
+    async with database.sessions() as session:
+        assert (
+            await claim_archive_job(
+                session, "restart", NOW + timedelta(minutes=14), LEASE
+            )
+            is None
+        )
+        job = await claim_archive_job(
+            session, "restart", NOW + timedelta(minutes=15), LEASE
+        )
+        assert job is not None
+        assert job.id == job_id
+        assert job.attempts == 1
+        page = await session.get(Page, page_id)
+        client = FakeArchiveClient(
+            capture_results=(success(),) if capture_found else ()
+        )
+        await submit_archive_job(
+            session,
+            job,
+            page=page,
+            client=client,
+            settings=SETTINGS,
+            now=NOW + timedelta(minutes=15),
+        )
+        assert client.capture_calls == [(page.url, NOW)]
+        assert len(client.submissions) == (0 if capture_found else 1)
+        if not capture_found:
+            assert client.capture_outlink_options == [not archive_only]
+            client.status_result = success()
+            await poll_archive_job(
+                session,
+                job,
+                page=page,
+                domain=None if archive_only else domain,
+                client=client,
+                settings=SETTINGS,
+                now=NOW + timedelta(minutes=16),
+            )
+        assert job.state is ArchiveJobState.SUCCEEDED
+        assert len((await session.scalars(select(Capture))).all()) == 1
+        assert page.next_archive_at == (
+            NOW if archive_only else CAPTURED_AT + SETTINGS.interval
+        )
+
+
+async def test_no_request_recovery_uses_15_30_60_minutes_then_exhausts(database):
+    settings = replace(SETTINGS, max_attempts=4)
+    client = FakeArchiveClient(
+        status_result=FailedStatus("remote-1", "error:no-request")
+    )
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session, page, state=ArchiveJobState.PENDING, external_job_id="remote-1"
+        )
+        await session.commit()
+        now = NOW
+        for attempt, minutes in enumerate((15, 30, 60), 1):
+            await poll_archive_job(
+                session,
+                job,
+                page=page,
+                domain=domain,
+                client=client,
+                settings=settings,
+                now=now,
+            )
+            assert job.next_attempt_at == now + timedelta(minutes=minutes)
+            assert job.attempts == attempt
+            now = job.next_attempt_at
+            await submit_archive_job(
+                session, job, page=page, client=client, settings=settings, now=now
+            )
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=client,
+            settings=settings,
+            now=now,
+        )
+        assert job.state is ArchiveJobState.FAILED
+        assert job.attempts == 4
+        assert len(client.submissions) == len(client.capture_calls) == 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        None,
+        ArchiveError("lost response"),
+        archive.ArchiveServiceError("gateway timeout"),
+    ],
+)
+@pytest.mark.parametrize("lock_failures", [2, 6])
+async def test_database_retry_does_not_repeat_submission_or_consume_attempt(
+    database,
+    error,
+    lock_failures,
+):
+    failures = 0
+    remote_finished = False
+
+    def contend(connection, cursor, statement, parameters, *args):
+        nonlocal failures
+        if (
+            remote_finished
+            and statement.startswith("UPDATE archive_jobs")
+            and failures < lock_failures
+        ):
+            failures += 1
+            raise OperationalError(
+                statement, parameters, sqlite3.OperationalError("database is locked")
+            )
+
+    async with database.sessions() as session:
+        _, page = await add_page(session)
+        job = await add_job(session, page)
+        await session.commit()
+
+        async def submit(*args, **kwargs):
+            nonlocal remote_finished
+            assert not session.in_transaction()
+            remote_finished = True
+            if error is not None:
+                raise error
+            return "remote-once"
+
+        client = SimpleNamespace(submit=AsyncMock(side_effect=submit))
+        event.listen(database.engine.sync_engine, "before_cursor_execute", contend)
+        try:
+            with (
+                pytest.raises(OperationalError) if lock_failures == 6 else nullcontext()
+            ):
+                await submit_archive_job(
+                    session, job, page=page, client=client, settings=SETTINGS, now=NOW
+                )
+        finally:
+            event.remove(database.engine.sync_engine, "before_cursor_execute", contend)
+        client.submit.assert_awaited_once()
+        assert failures == lock_failures
+        await session.refresh(job)
+        if lock_failures == 6:
+            assert job.state is ArchiveJobState.UNCERTAIN
+            assert job.attempts == 0
+            assert job.external_job_id is None
+            return
+        assert job.attempts == (1 if error else 0)
+        assert job.state is (
+            ArchiveJobState.UNCERTAIN if error else ArchiveJobState.SUBMITTED
+        )
+        if isinstance(error, archive.ArchiveServiceError):
+            assert job.next_attempt_at == NOW + timedelta(minutes=15)
+
+
+async def test_poll_discards_remote_result_when_lease_was_replaced(database):
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session, page, state=ArchiveJobState.PENDING, external_job_id="remote-1"
+        )
+        await session.commit()
+        job_id = job.id
+
+        async def status(remote_id):
+            assert not session.in_transaction()
+            async with database.sessions() as other:
+                await other.execute(
+                    update(ArchiveJob)
+                    .where(ArchiveJob.id == job_id)
+                    .values(lease_owner="replacement")
+                )
+                await other.commit()
+            return success()
+
+        with pytest.raises(LeaseLostError):
+            await poll_archive_job(
+                session,
+                job,
+                page=page,
+                domain=domain,
+                client=SimpleNamespace(status=status),
+                settings=SETTINGS,
+                now=NOW,
+            )
+        await session.refresh(job)
+        assert job.lease_owner == "replacement"
+        assert job.state is ArchiveJobState.PENDING
+        assert await session.scalar(select(Capture)) is None
+
+
+@pytest.mark.parametrize("retry_at", [None, NOW + timedelta(days=2)])
+async def test_daily_capture_limits_persist_next_day_or_supplied_deadline(
+    database, retry_at
+):
+    translated = archive._status(  # noqa: SLF001
+        InternetArchiveFailedStatus("remote-1", service_code="error:too-many-captures")
+    )
+    assert translated.daily_limit is True
+    translated = replace(translated, retry_at=retry_at)
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session, page, state=ArchiveJobState.PENDING, external_job_id="remote-1"
+        )
+        await session.commit()
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=FakeArchiveClient(status_result=translated),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert job.next_attempt_at == (retry_at or NOW + timedelta(days=1))
+        assert job.state is ArchiveJobState.UNCERTAIN
+
+
+async def test_transient_poll_http_failure_uses_recovery_delay(database):
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session, page, state=ArchiveJobState.PENDING, external_job_id="remote-1"
+        )
+        await session.commit()
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=FakeArchiveClient(status_error=archive.ArchiveServiceError("503")),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert job.next_attempt_at == NOW + timedelta(minutes=15)
+        assert job.external_job_id == "remote-1"
+
+
+async def test_outlink_chunks_resume_after_interruption_without_duplicate_captures(
+    database, monkeypatch
+):
+    monkeypatch.setattr(archive, "_OUTLINK_BATCH_SIZE", 2)
+    client = FakeArchiveClient(
+        status_result=success(),
+        outlink_results=tuple(
+            success(f"child-{i}", f"https://example.com/child/{i}") for i in range(5)
+        ),
+    )
+    writes = 0
+
+    def interrupt(connection, cursor, statement, parameters, *args):
+        nonlocal writes
+        if statement.startswith("INSERT INTO captures"):
+            writes += 1
+            if writes == 4:  # Parent and the first two children have committed.
+                raise asyncio.CancelledError
+
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        job = await add_job(
+            session, page, state=ArchiveJobState.PENDING, external_job_id="remote-1"
+        )
+        await session.commit()
+        job_id, page_id, domain_id = job.id, page.id, domain.id
+        event.listen(database.engine.sync_engine, "before_cursor_execute", interrupt)
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await poll_archive_job(
+                    session,
+                    job,
+                    page=page,
+                    domain=domain,
+                    client=client,
+                    settings=SETTINGS,
+                    now=NOW,
+                )
+        finally:
+            event.remove(
+                database.engine.sync_engine, "before_cursor_execute", interrupt
+            )
+
+    async with database.sessions() as session:
+        assert len((await session.scalars(select(Capture))).all()) == 3
+        job = await claim_archive_job(session, "restarted", NOW + LEASE, LEASE)
+        assert job.id == job_id
+        assert job.saved_to_my_archive is True
+        assert job.outlinks_processed is False
+        page = await session.get(Page, page_id)
+        domain = await session.get(Domain, domain_id)
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=client,
+            settings=SETTINGS,
+            now=NOW + LEASE,
+        )
+        assert job.outlinks_processed is True
+        assert len((await session.scalars(select(Capture))).all()) == 6
+        assert client.add_calls == ["remote-1"]
+
+
+@pytest.mark.parametrize("competitor_claims", [1, 20])
+async def test_archive_job_claim_reselects_after_race_with_bounded_attempts(
+    database, monkeypatch, competitor_claims
+):
+    async with database.sessions() as session:
+        domain, page = await add_page(session)
+        for i in range(21):
+            page = Page(domain_id=domain.id, url=f"https://example.com/job/{i}")
+            session.add(page)
+            await session.flush()
+            job = await add_job(session, page, job_id=f"job-{i:02}")
+            job.lease_owner = None
+            job.lease_expires_at = None
+        await session.commit()
+    original = archive.write_transaction
+    lost = 0
+
+    async def competitor(session, operation):
+        nonlocal lost
+        if lost < competitor_claims:
+            async with database.sessions() as other:
+                job_id = await other.scalar(
+                    select(ArchiveJob.id)
+                    .where(ArchiveJob.next_attempt_at <= NOW)
+                    .order_by(ArchiveJob.id)
+                    .limit(1)
+                )
+                await other.execute(
+                    update(ArchiveJob)
+                    .where(ArchiveJob.id == job_id)
+                    .values(next_attempt_at=NOW + timedelta(days=1))
+                )
+                await other.commit()
+            lost += 1
+        return await original(session, operation)
+
+    monkeypatch.setattr(archive, "write_transaction", competitor)
+    async with database.sessions() as session:
+        claimed = await claim_archive_job(session, "worker", NOW, LEASE)
+    if competitor_claims == 1:
+        assert claimed.id == "job-01"
+    else:
+        assert claimed is None
+        assert lost < competitor_claims
+
+
+async def test_archive_job_claim_returns_none_when_queue_is_empty(database):
+    async with database.sessions() as session:
+        assert await claim_archive_job(session, "worker", NOW, LEASE) is None
+
+
+async def test_outlink_processing_respects_deactivated_scope(database):
+    async with database.sessions() as session:
+        domain, page = await add_page(session, active=False)
+        job = await add_job(
+            session, page, state=ArchiveJobState.SUCCEEDED, external_job_id="remote-1"
+        )
+        await session.commit()
+        await poll_archive_job(
+            session,
+            job,
+            page=page,
+            domain=domain,
+            client=FakeArchiveClient(
+                outlink_results=(success("child", "https://example.com/child"),)
+            ),
+            settings=SETTINGS,
+            now=NOW,
+        )
+        assert (await session.scalars(select(Page.url))).all() == [page.url]
+
+
 async def test_create_intent_commits_before_remote_work(database: Database):
     async with database.sessions() as session:
         _, page = await add_page(session)
@@ -268,6 +679,33 @@ async def test_create_intent_commits_before_remote_work(database: Database):
         assert persisted_job.state is ArchiveJobState.INTENT
         assert persisted_page is not None
         assert persisted_page.archive_lease_owner is None
+
+
+async def test_daily_capture_limit_rate_response_waits_until_next_day():
+    native = NativeClient()
+    native.submit_result = RateLimitError("daily capture limit reached")
+    before = datetime.now(UTC)
+    with pytest.raises(ArchiveRateLimitError) as caught:
+        await adapter_with(native).submit(
+            "https://example.com/", SETTINGS.dedupe_window
+        )
+    assert before + timedelta(days=1) <= caught.value.retry_at
+    assert caught.value.retry_at <= datetime.now(UTC) + timedelta(days=1)
+    translated = archive._status(  # noqa: SLF001
+        InternetArchiveFailedStatus(
+            "daily",
+            message="URL captured 10 times today",
+            service_code="error:too-many-requests",
+        )
+    )
+    assert translated.daily_limit is True
+
+
+async def test_status_nontransient_http_error_remains_generic():
+    native = NativeClient()
+    native.status_result = archive.ServiceError("invalid request", status_code=400)
+    with pytest.raises(ArchiveError, match="ServiceError"):
+        await adapter_with(native).status("remote")
 
 
 async def test_submit_success_persists_remote_acceptance(database: Database):
@@ -568,7 +1006,7 @@ async def test_poll_pending_timeout_fails_and_reschedules_immediately(
         assert job.lease_owner is None
 
 
-@pytest.mark.parametrize("service_code", ["robots-denied", "error:service-unavailable"])
+@pytest.mark.parametrize("service_code", ["robots-denied", "error:blocked-url"])
 async def test_poll_terminal_failure_records_service_code(
     database: Database, monkeypatch, service_code: str
 ):
@@ -604,7 +1042,16 @@ async def test_poll_terminal_failure_records_service_code(
         assert warning.call_args.args[-1] == page.url
 
 
-@pytest.mark.parametrize("service_code", ["error:no-captures", "error:not-found"])
+@pytest.mark.parametrize(
+    "service_code",
+    [
+        "error:no-captures",
+        "error:not-found",
+        "error:no-request",
+        "error:gateway-timeout",
+        "error:service-unavailable",
+    ],
+)
 async def test_poll_retryable_service_failure_enters_recovery(
     database: Database, service_code: str
 ):
@@ -640,7 +1087,9 @@ async def test_poll_retryable_service_failure_enters_recovery(
         assert job.lease_owner is None
 
 
-@pytest.mark.parametrize("service_code", ["error:no-captures", "error:not-found"])
+@pytest.mark.parametrize(
+    "service_code", ["error:no-captures", "error:not-found", "error:no-request"]
+)
 async def test_poll_retryable_service_failure_stops_at_attempt_limit(
     database: Database, monkeypatch, service_code: str
 ):
@@ -1590,6 +2039,50 @@ async def test_adapter_rate_limit_delays_the_next_request(monkeypatch):
     assert 0 < sleep.await_args.args[0] <= 30
 
 
+@pytest.mark.parametrize(
+    ("message", "url_limited"),
+    [
+        ("URL has been captured 10 times today", True),
+        ("Daily capture limit reached for this URL", True),
+        ("Maximum captures per day per URL reached", True),
+        ("Per-URL daily capture limit reached", True),
+        ("Account daily capture limit reached", False),
+        ("Daily capture limit reached", False),
+    ],
+)
+@pytest.mark.parametrize("supplied_deadline", [False, True])
+async def test_daily_url_limit_preserves_unrelated_requests(
+    monkeypatch, message, url_limited, supplied_deadline
+):
+    native = NativeClient()
+    before = datetime.now(UTC)
+    deadline = before + timedelta(days=2) if supplied_deadline else None
+    native.submit_result = RateLimitError(message, retry_after=deadline)
+    adapter = adapter_with(native)
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+
+    with pytest.raises(ArchiveRateLimitError) as caught:
+        await adapter.submit("https://example.com/capped", SETTINGS.dedupe_window)
+
+    assert caught.value.retry_at >= before + timedelta(days=1)
+    if deadline is not None:
+        assert caught.value.retry_at == deadline
+    native.submit_result = NativeJob("unrelated-job")
+    assert await adapter.latest_capture_at("https://other.example/") is None
+    assert isinstance(await adapter.status("previous-job"), PendingStatus)
+    assert (
+        await adapter.submit("https://other.example/", SETTINGS.dedupe_window)
+        == "unrelated-job"
+    )
+    if url_limited:
+        sleep.assert_not_awaited()
+        assert adapter._adaptive_request_delay == 0  # noqa: SLF001
+    else:
+        assert sleep.await_args_list[0].args[0] > timedelta(hours=23).total_seconds()
+        assert adapter._adaptive_request_delay == 1  # noqa: SLF001
+
+
 async def test_adapter_rate_limit_without_retry_metadata_uses_one_minute_fallback():
     native = NativeClient()
     native.submit_result = RateLimitError("slow down")
@@ -1601,6 +2094,36 @@ async def test_adapter_rate_limit_without_retry_metadata_uses_one_minute_fallbac
     assert caught.value.retry_at is not None
     assert before + timedelta(minutes=1) <= caught.value.retry_at
     assert caught.value.retry_at <= datetime.now(UTC) + timedelta(minutes=1)
+
+
+async def test_daily_url_deadline_survives_restart_without_client_cooldown(
+    database, monkeypatch
+):
+    deadline = datetime.now(UTC) + timedelta(days=2)
+    native = NativeClient()
+    native.submit_result = RateLimitError(
+        "This URL has been captured 10 times today", retry_after=deadline
+    )
+    adapter = adapter_with(native)
+    sleep = AsyncMock()
+    monkeypatch.setattr(archive.asyncio, "sleep", sleep)
+    async with database.sessions() as session:
+        _, page = await add_page(session)
+        job = await add_job(session, page)
+        await session.commit()
+        job_id = job.id
+        await submit_archive_job(
+            session, job, page=page, client=adapter, settings=SETTINGS, now=NOW
+        )
+
+    async with database.sessions() as session:
+        job = await session.get(ArchiveJob, job_id)
+        assert job.state is ArchiveJobState.UNCERTAIN
+        assert job.next_attempt_at == deadline
+        assert job.attempts == 1
+        assert job.lease_owner is None
+    assert await adapter.latest_capture_at("https://other.example/") is None
+    sleep.assert_not_awaited()
 
 
 async def test_adapter_repeated_rate_limits_increase_request_spacing(monkeypatch):
@@ -2186,7 +2709,12 @@ async def test_archive_history_check_records_latest_capture_and_missing_result()
         archive_lease_owner=None,
         archive_lease_expires_at=None,
     )
-    session = MagicMock(commit=AsyncMock(), refresh=AsyncMock())
+    session = MagicMock(
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        execute=AsyncMock(),
+        rollback=AsyncMock(),
+    )
     client = FakeArchiveClient(latest_capture_result=CAPTURED_AT)
 
     await check_archive_history(session, page, client, NOW)
@@ -2234,7 +2762,12 @@ async def test_archive_history_check_retries_archive_errors(error, expected_retr
         archive_lease_owner=None,
         archive_lease_expires_at=None,
     )
-    session = MagicMock(commit=AsyncMock(), refresh=AsyncMock())
+    session = MagicMock(
+        commit=AsyncMock(),
+        refresh=AsyncMock(),
+        execute=AsyncMock(),
+        rollback=AsyncMock(),
+    )
     client = FakeArchiveClient(latest_capture_error=error)
 
     await check_archive_history(session, page, client, NOW)
@@ -2245,7 +2778,7 @@ async def test_archive_history_check_retries_archive_errors(error, expected_retr
     assert page.next_archive_history_check_at == expected_retry
     assert page.archive_history_lease_owner is None
     assert page.archive_history_lease_expires_at is None
-    session.commit.assert_awaited_once_with()
+    assert session.commit.await_count == 2
 
 
 @pytest.mark.parametrize("conflict", ["history", "archive"])
@@ -2271,7 +2804,10 @@ async def test_archive_history_check_discards_result_after_lease_conflict(confli
             page.archive_lease_expires_at = datetime.now(UTC) + LEASE
 
     session = MagicMock(
-        commit=AsyncMock(), refresh=AsyncMock(side_effect=introduce_conflict)
+        commit=AsyncMock(),
+        refresh=AsyncMock(side_effect=introduce_conflict),
+        execute=AsyncMock(),
+        rollback=AsyncMock(),
     )
 
     await check_archive_history(
@@ -2282,7 +2818,8 @@ async def test_archive_history_check_discards_result_after_lease_conflict(confli
     )
 
     assert page.archive_history_checked_at is None
-    session.commit.assert_not_awaited()
+    session.commit.assert_awaited_once_with()
+    session.rollback.assert_awaited_once_with()
 
 
 class OutlinkSession:
@@ -2351,7 +2888,7 @@ async def test_record_outlinks_tolerates_missing_page_after_insert():
         parent,
         parent_page,
         domain,
-        [success("child")],
+        [(success("child"), "https://example.com/page")],
         SETTINGS,
         NOW,
     )
@@ -2368,7 +2905,7 @@ async def test_record_outlinks_tolerates_missing_child_job_after_insert():
         parent,
         parent_page,
         domain,
-        [success("child")],
+        [(success("child"), "https://example.com/page")],
         SETTINGS,
         NOW,
     )

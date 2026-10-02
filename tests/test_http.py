@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import niquests
 import pytest
@@ -10,11 +13,37 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect
 
-from ziggy.database import create_engine, run_migrations, session_factory
+from ziggy import service
+from ziggy.archive import (
+    FailedStatus,
+    PendingStatus,
+    SuccessStatus,
+    check_archive_history,
+    claim_archive_job,
+    create_archive_intent,
+    poll_archive_job,
+    submit_archive_job,
+)
+from ziggy.config import ArchiveSettings, CrawlSettings
+from ziggy.crawler import FetchResult, crawl_page
+from ziggy.database import (
+    claim_due_page,
+    create_engine,
+    run_migrations,
+    session_factory,
+)
 from ziggy.http import routes
 from ziggy.http.app import create_app
 from ziggy.http.routes import MAX_BODY_BYTES, AdmissionRateLimiter
-from ziggy.models import ArchiveSubmission, Page
+from ziggy.models import (
+    ArchiveJob,
+    ArchiveJobKind,
+    ArchiveJobState,
+    ArchiveSubmission,
+    Domain,
+    Page,
+    ServiceState,
+)
 
 
 @pytest.fixture
@@ -84,6 +113,205 @@ async def test_queue_accepts_canonical_deduplicated_batch_after_commit(http_serv
                 10,
             )
             assert submission.id == payload["submissions"][0]["receipt_id"]
+    finally:
+        await engine.dispose()
+
+
+async def test_workers_admission_heartbeat_and_archive_restart_together(  # noqa: PLR0915
+    http_server, monkeypatch
+):
+    base_url, path, _app = http_server
+    engine = create_engine(path)
+    sessions = session_factory(engine)
+    now = datetime.now(UTC)
+    ready = asyncio.Event()
+    stop = asyncio.Event()
+    arrivals = 0
+    monkeypatch.setattr(service, "_HEARTBEAT_INTERVAL", 0.01)
+
+    async def fetch(url, *args, **kwargs):
+        nonlocal arrivals
+        arrivals += 1
+        if arrivals == 8:
+            ready.set()
+        await ready.wait()
+        body = f'<a href="/variant?p={url.rsplit("/", 1)[-1]}">child</a>'.encode()
+        return FetchResult(200, url, {"Content-Type": "text/html"}, body, None, ())
+
+    try:
+        async with sessions() as session:
+            domain = Domain(
+                host="example.com", scheme="https", include_subdomains=False
+            )
+            session.add(domain)
+            session.add(
+                ServiceState(instance_id="live", started_at=now, heartbeat_at=now)
+            )
+            await session.flush()
+            pages = [
+                Page(
+                    domain_id=domain.id, url=f"https://example.com/{i}", status_code=200
+                )
+                for i in range(10)
+            ]
+            session.add_all(pages)
+            await session.flush()
+            session.add(
+                ArchiveJob(
+                    id="polling",
+                    page_id=pages[9].id,
+                    kind=ArchiveJobKind.DIRECT,
+                    state=ArchiveJobState.PENDING,
+                    cycle_key="polling",
+                    external_job_id="remote",
+                )
+            )
+            await session.commit()
+            page_ids = [page.id for page in pages]
+            domain_id = domain.id
+
+        async def crawl(page_id):
+            async with sessions() as session:
+                page = await session.get(Page, page_id)
+                await crawl_page(
+                    session,
+                    page,
+                    configured_host="example.com",
+                    include_subdomains=False,
+                    client=SimpleNamespace(fetch=fetch),
+                    settings=CrawlSettings(
+                        concurrency=8, max_query_variants_per_base=2
+                    ),
+                    now=now,
+                )
+
+        async def history():
+            await ready.wait()
+            async with sessions() as session:
+                page = await session.get(Page, page_ids[8])
+                await check_archive_history(
+                    session,
+                    page,
+                    SimpleNamespace(latest_capture_at=AsyncMock(return_value=None)),
+                    now,
+                )
+
+        async def poll():
+            await ready.wait()
+            async with sessions() as session:
+                job = await session.get(ArchiveJob, "polling")
+                page = await session.get(Page, page_ids[9])
+                domain = await session.get(Domain, domain_id)
+                await poll_archive_job(
+                    session,
+                    job,
+                    page=page,
+                    domain=domain,
+                    client=SimpleNamespace(
+                        status=AsyncMock(return_value=PendingStatus("remote", None))
+                    ),
+                    settings=ArchiveSettings(),
+                    now=now,
+                )
+
+        async def admit():
+            await ready.wait()
+            return await post_json(
+                base_url,
+                {
+                    "identifier": "concurrent",
+                    "urls": ["https://outside.example/"],
+                    "priority": 5,
+                },
+            )
+
+        heartbeat = asyncio.create_task(service._heartbeat(sessions, "live", stop))  # noqa: SLF001
+        try:
+            *_, response = await asyncio.wait_for(
+                asyncio.gather(
+                    *(crawl(page_id) for page_id in page_ids[:8]),
+                    history(),
+                    poll(),
+                    admit(),
+                ),
+                10,
+            )
+        finally:
+            stop.set()
+            await heartbeat
+        assert response.status_code == 202
+
+        async with sessions() as session:
+            assert (
+                await session.scalar(
+                    select(func.count())
+                    .select_from(Page)
+                    .where(Page.query_variant_slot.is_not(None))
+                )
+                == 2
+            )
+            assert (await session.get(ServiceState, "live")).heartbeat_at > now
+            assert (
+                await session.get(Page, page_ids[8])
+            ).archive_history_checked_at == now
+            claimed = await claim_due_page(
+                session,
+                "archive",
+                "worker",
+                now,
+                timedelta(minutes=5),
+                archive_interval=timedelta(days=30),
+            )
+            assert claimed.url == "https://outside.example/"
+            job = await create_archive_intent(session, claimed, now, archive_only=True)
+            await submit_archive_job(
+                session,
+                job,
+                page=claimed,
+                client=SimpleNamespace(submit=AsyncMock(return_value="api-remote")),
+                settings=ArchiveSettings(),
+                now=now,
+            )
+            await poll_archive_job(
+                session,
+                job,
+                page=claimed,
+                domain=None,
+                client=SimpleNamespace(
+                    status=AsyncMock(
+                        return_value=FailedStatus("api-remote", "error:no-request")
+                    )
+                ),
+                settings=ArchiveSettings(),
+                now=now,
+            )
+            job_id = job.id
+
+        async with sessions() as session:
+            job = await claim_archive_job(
+                session, "restart", now + timedelta(minutes=15), timedelta(minutes=5)
+            )
+            assert job.id == job_id
+            page = await session.get(Page, job.page_id)
+            capture = SuccessStatus(
+                "history", page.url, now, "https://web.archive.org/capture", None, None
+            )
+            client = SimpleNamespace(
+                captures_since=AsyncMock(return_value=(capture,)), submit=AsyncMock()
+            )
+            await submit_archive_job(
+                session,
+                job,
+                page=page,
+                client=client,
+                settings=ArchiveSettings(),
+                now=now + timedelta(minutes=15),
+            )
+            client.submit.assert_not_awaited()
+            assert job.state is ArchiveJobState.SUCCEEDED
+            assert (
+                await session.scalar(select(ArchiveSubmission))
+            ).archive_job_id == job_id
     finally:
         await engine.dispose()
 

@@ -12,10 +12,11 @@ from unittest.mock import AsyncMock, MagicMock, call
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy import event, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from ziggy import service
+from ziggy import health, service
 from ziggy.archive import (
     ArchiveAuthenticationError,
     ArchiveError,
@@ -36,7 +37,8 @@ from ziggy.config import (
     ZiggySettings,
 )
 from ziggy.crawler import FetchError, FetchResult
-from ziggy.models import Base, Domain, Page, ServiceState
+from ziggy.database import create_engine, run_migrations, session_factory
+from ziggy.models import ArchiveJob, ArchiveJobKind, Base, Domain, Page, ServiceState
 
 # This suite deliberately covers module-private orchestration boundaries.
 # ruff: noqa: FBT003, S106, SLF001
@@ -47,6 +49,12 @@ NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
 
 def database_lock(message: str = "database is locked") -> OperationalError:
     return OperationalError("UPDATE example", {}, sqlite3.OperationalError(message))
+
+
+def database_session(**kwargs):
+    return MagicMock(
+        execute=AsyncMock(), refresh=AsyncMock(), rollback=AsyncMock(), **kwargs
+    )
 
 
 def make_config(database: Path = Path("ziggy.sqlite3"), **changes: object) -> Config:
@@ -154,6 +162,154 @@ def make_state(config: Config | None = None, secrets: Secrets | None = None):
         SimpleNamespace(configure=MagicMock()),
         web_archive_url="https://archive.org/details/@ziggy/web-archive",
     )
+
+
+@pytest.fixture
+async def contended_worker_database(tmp_path):
+    path = tmp_path / "worker-contention.sqlite3"
+    await run_migrations(path)
+    engine = create_engine(path, busy_timeout_ms=1)
+    sessions = session_factory(engine)
+    writer = sqlite3.connect(path)
+    failures = []
+
+    def release_writer(context):
+        if writer.in_transaction:
+            assert isinstance(context.original_exception, sqlite3.OperationalError)
+            assert context.original_exception.sqlite_errorcode == sqlite3.SQLITE_BUSY
+            failures.append(context.statement)
+            writer.rollback()
+
+    event.listen(engine.sync_engine, "handle_error", release_writer)
+    try:
+        async with sessions() as session:
+            domain = Domain(
+                host="example.test", scheme="https", include_subdomains=False
+            )
+            session.add(domain)
+            await session.flush()
+            page = Page(
+                domain_id=domain.id,
+                url="https://example.test/",
+                next_archive_at=NOW,
+                archive_lease_owner="worker",
+                archive_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            )
+            session.add(page)
+            await session.commit()
+            page_id = page.id
+        yield make_state(make_config(path)), sessions, writer, failures, page_id
+    finally:
+        event.remove(engine.sync_engine, "handle_error", release_writer)
+        writer.close()
+        await engine.dispose()
+
+
+async def test_uncertain_worker_retries_contention_before_preflight(
+    contended_worker_database,
+):
+    state, sessions, writer, failures, page_id = contended_worker_database
+    async with sessions() as session:
+        page = await session.get(Page, page_id)
+        page.archive_lease_owner = None
+        page.archive_lease_expires_at = None
+        session.add(
+            ArchiveJob(
+                id="recover",
+                page_id=page_id,
+                kind=ArchiveJobKind.DIRECT,
+                state=ArchiveJobState.UNCERTAIN,
+                cycle_key="recover",
+                intent_at=NOW,
+                lease_owner="worker",
+                lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+            )
+        )
+        await session.commit()
+
+    async def history(url, since):
+        writer.execute("BEGIN IMMEDIATE")
+        return ()
+
+    state.archive_client.captures_since = AsyncMock(side_effect=history)
+    state.archive_client.submit = AsyncMock(return_value="accepted-once")
+    state.crawler.fetch.return_value = FetchResult(
+        200, "https://example.test/", {}, b"", None, ()
+    )
+
+    await service._poll_one(state, sessions, "recover")
+
+    assert failures == ["BEGIN IMMEDIATE"]
+    state.archive_client.captures_since.assert_awaited_once_with(
+        "https://example.test/", NOW
+    )
+    state.crawler.fetch.assert_awaited_once_with(
+        "https://example.test/",
+        "example.test",
+        include_subdomains=False,
+        read_body=False,
+    )
+    state.archive_client.submit.assert_awaited_once_with(
+        "https://example.test/", state.config.archive.dedupe_window
+    )
+    async with sessions() as session:
+        job = await session.get(ArchiveJob, "recover")
+        assert job.state is ArchiveJobState.SUBMITTED
+        assert job.external_job_id == "accepted-once"
+        assert job.attempts == 0
+        assert job.error is None
+
+
+@pytest.mark.parametrize("stage", ["submit", "post_process"])
+async def test_authentication_pause_survives_contention_and_expired_page(
+    contended_worker_database, monkeypatch, stage
+):
+    state, sessions, writer, failures, page_id = contended_worker_database
+    logged = MagicMock()
+    monkeypatch.setattr(service.logger, "error", logged)
+
+    async def authentication_error(*args, **kwargs):
+        writer.execute("BEGIN IMMEDIATE")
+        raise ArchiveAuthenticationError("expired credentials")
+
+    remote = AsyncMock(side_effect=authentication_error)
+    if stage == "submit":
+        state.archive_client.submit = remote
+        state.crawler.fetch.return_value = FetchResult(
+            200, "https://example.test/", {}, b"", None, ()
+        )
+        await service._submit_one(state, sessions, page_id)
+    else:
+        async with sessions() as session:
+            session.add(
+                ArchiveJob(
+                    id="post-process",
+                    page_id=page_id,
+                    kind=ArchiveJobKind.DIRECT,
+                    state=ArchiveJobState.SUCCEEDED,
+                    external_job_id="remote",
+                    cycle_key="post-process",
+                )
+            )
+            await session.commit()
+        state.archive_client.add_to_my_archive = remote
+        await service._poll_one(state, sessions, "post-process")
+
+    assert failures == ["BEGIN IMMEDIATE"]
+    remote.assert_awaited_once()
+    assert state.archive_paused is True
+    assert logged.call_args.args[-1] == "https://example.test/"
+    async with sessions() as session:
+        job = await session.scalar(select(ArchiveJob))
+        assert job.state is (
+            ArchiveJobState.UNCERTAIN
+            if stage == "submit"
+            else ArchiveJobState.SUCCEEDED
+        )
+        assert job.error == "authentication failed"
+        assert job.next_attempt_at > datetime.now(UTC) + timedelta(minutes=4)
+        assert job.lease_owner is None
+        assert job.attempts == 0
 
 
 async def test_runtime_state_closes_current_and_retired_clients():
@@ -276,7 +432,7 @@ async def test_check_health_handles_absence_empty_recent_and_stale_database(
     log_error = MagicMock()
     monkeypatch.setattr(service.logger, "error", log_error)
 
-    assert await service.check_health(path, NOW) is False
+    assert await health.check_health(path, NOW) is False
     log_error.assert_called_once_with(
         "Health check failed: database does not exist at {}", path
     )
@@ -285,14 +441,14 @@ async def test_check_health_handles_absence_empty_recent_and_stale_database(
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    assert await service.check_health(path, NOW) is False
+    assert await health.check_health(path, NOW) is False
     log_error.assert_called_with("Health check failed: no service heartbeat found")
 
     async with factory() as session:
         session.add(ServiceState(instance_id="old", started_at=NOW, heartbeat_at=NOW))
         await session.commit()
-    assert await service.check_health(path, NOW + timedelta(seconds=90)) is True
-    assert await service.check_health(path, NOW + timedelta(seconds=91)) is False
+    assert await health.check_health(path, NOW + timedelta(seconds=90)) is True
+    assert await health.check_health(path, NOW + timedelta(seconds=91)) is False
     log_error.assert_called_with(
         "Health check failed: service heartbeat is {:.0f}s old", 91.0
     )
@@ -304,20 +460,12 @@ async def test_check_health_returns_false_on_database_error(monkeypatch, tmp_pat
     path = tmp_path / "broken.sqlite3"
     path.touch()
     log_exception = MagicMock()
-    session = MagicMock()
-    session.scalar = AsyncMock(side_effect=SQLAlchemyError("broken"))
-    engine = SimpleNamespace(dispose=AsyncMock())
     monkeypatch.setattr(service.logger, "exception", log_exception)
-    monkeypatch.setattr(service, "create_async_engine", lambda _url: engine)
-    monkeypatch.setattr(
-        service, "async_sessionmaker", lambda *_args, **_kwargs: Sessions(session)
-    )
 
-    assert await service.check_health(path, NOW) is False
+    assert await health.check_health(path, NOW) is False
     log_exception.assert_called_once_with(
         "Health check failed while reading the service heartbeat"
     )
-    engine.dispose.assert_awaited_once_with()
 
 
 async def test_check_health_requires_enabled_http_listener(monkeypatch, tmp_path):
@@ -330,13 +478,13 @@ async def test_check_health_requires_enabled_http_listener(monkeypatch, tmp_path
         session.add(ServiceState(instance_id="live", started_at=NOW, heartbeat_at=NOW))
         await session.commit()
     check_http = AsyncMock(side_effect=[True, False])
-    monkeypatch.setattr(service, "_check_http_health", check_http)
+    monkeypatch.setattr(health, "_check_http_health", check_http)
     settings = HttpSettings(enabled=True)
 
-    assert await service.check_health(path, NOW, http=HttpSettings()) is True
+    assert await health.check_health(path, NOW, http=HttpSettings()) is True
     check_http.assert_not_awaited()
-    assert await service.check_health(path, NOW, http=settings) is True
-    assert await service.check_health(path, NOW, http=settings) is False
+    assert await health.check_health(path, NOW, http=settings) is True
+    assert await health.check_health(path, NOW, http=settings) is False
     assert check_http.await_count == 2
     await engine.dispose()
 
@@ -365,7 +513,7 @@ async def test_http_health_probe_maps_bind_hosts_and_requires_405(
     monkeypatch.setattr(service.asyncio, "open_connection", connect)
 
     assert (
-        await service._check_http_health(
+        await health._check_http_health(
             HttpSettings(enabled=True, host=configured_host, port=9449)
         )
         is True
@@ -393,14 +541,14 @@ async def test_http_health_probe_rejects_bad_response_and_connection_error(
         AsyncMock(return_value=(reader, writer)),
     )
     settings = HttpSettings(enabled=True)
-    assert await service._check_http_health(settings) is False
+    assert await health._check_http_health(settings) is False
 
     monkeypatch.setattr(
         service.asyncio,
         "open_connection",
         AsyncMock(side_effect=OSError("refused")),
     )
-    assert await service._check_http_health(settings) is False
+    assert await health._check_http_health(settings) is False
 
 
 async def test_heartbeat_updates_and_commits_once(monkeypatch):
@@ -414,7 +562,7 @@ async def test_heartbeat_updates_and_commits_once(monkeypatch):
     monkeypatch.setattr(service, "_wait", stop_wait)
     await service._heartbeat(Sessions(session), "instance", stop)
 
-    session.execute.assert_awaited_once()
+    assert session.execute.await_count == 2
     session.commit.assert_awaited_once_with()
 
 
@@ -1032,7 +1180,7 @@ async def test_submit_one_handles_missing_inactive_authentication_and_failure(
         archive_lease_owner="owner",
         archive_lease_expires_at=NOW,
     )
-    session = MagicMock(
+    session = database_session(
         get=AsyncMock(side_effect=[page, SimpleNamespace(active=False)]),
         scalar=AsyncMock(return_value=None),
         commit=AsyncMock(),
@@ -1098,7 +1246,7 @@ async def test_submit_one_marks_page_inactive_on_http_error(monkeypatch, status_
         archive_lease_expires_at=NOW,
     )
     domain = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
-    session = MagicMock(
+    session = database_session(
         get=AsyncMock(side_effect=[page, domain]),
         scalar=AsyncMock(return_value=1),
         commit=AsyncMock(),
@@ -1126,7 +1274,7 @@ async def test_submit_one_marks_page_inactive_on_http_error(monkeypatch, status_
     assert page.error == f"HTTP {status_code}"
     assert page.archive_lease_owner is None
     assert page.archive_lease_expires_at is None
-    assert session.commit.await_count == 2
+    assert session.commit.await_count == 3
     create_intent.assert_not_awaited()
 
 
@@ -1147,7 +1295,7 @@ async def test_submit_one_preflights_recurring_page_before_creating_intent(monke
         archive_lease_expires_at=NOW,
     )
     domain = SimpleNamespace(active=True, host="example.test", include_subdomains=True)
-    session = MagicMock(
+    session = database_session(
         get=AsyncMock(side_effect=[page, domain]),
         scalar=AsyncMock(return_value=1),
         commit=AsyncMock(),
@@ -1193,7 +1341,7 @@ async def test_submit_one_retries_recurring_page_after_preflight_fetch_error(
         archive_lease_expires_at=NOW,
     )
     domain = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
-    session = MagicMock(
+    session = database_session(
         get=AsyncMock(side_effect=[page, domain]),
         scalar=AsyncMock(return_value=1),
         commit=AsyncMock(),
@@ -1212,7 +1360,7 @@ async def test_submit_one_retries_recurring_page_after_preflight_fetch_error(
     assert page.error == "connection failed"
     assert before <= page.next_archive_at <= after
     assert page.archive_lease_owner is None
-    assert session.commit.await_count == 2
+    assert session.commit.await_count == 3
     create_intent.assert_not_awaited()
 
 
@@ -1221,7 +1369,13 @@ async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     missing = MagicMock(get=AsyncMock(return_value=None))
     await service._poll_one(state, Sessions(missing), "job")
 
-    job = SimpleNamespace(page_id=1, state=ArchiveJobState.INTENT, external_job_id=None)
+    job = SimpleNamespace(
+        page_id=1,
+        state=ArchiveJobState.INTENT,
+        external_job_id=None,
+        lease_owner="worker",
+        lease_expires_at=NOW,
+    )
     no_page = MagicMock(get=AsyncMock(side_effect=[job, None]))
     await service._poll_one(state, Sessions(no_page), "job")
 
@@ -1240,7 +1394,7 @@ async def test_poll_one_validates_records_and_submits_or_polls(monkeypatch):
     await service._poll_one(state, Sessions(no_domain), "job")
 
     domain = SimpleNamespace(active=True, host="example.test", include_subdomains=False)
-    session = MagicMock(
+    session = database_session(
         get=AsyncMock(side_effect=[job, page, domain]), commit=AsyncMock()
     )
     submit = AsyncMock()
@@ -1306,7 +1460,9 @@ async def test_poll_one_delays_no_id_work_while_archive_is_paused(monkeypatch):
         lease_expires_at=NOW,
         next_attempt_at=NOW,
     )
-    page = SimpleNamespace(domain_id=2, active=True, in_scope=True)
+    page = SimpleNamespace(
+        domain_id=2, active=True, in_scope=True, url="https://example.test/"
+    )
     domain = SimpleNamespace(active=True)
     session = MagicMock(
         get=AsyncMock(side_effect=[job, page, domain]), commit=AsyncMock()
@@ -1344,7 +1500,7 @@ async def test_persisted_archive_preflight_retries_fetch_errors_and_fails_http_e
         lease_owner="worker",
         lease_expires_at=NOW,
     )
-    session = MagicMock(commit=AsyncMock())
+    session = database_session(commit=AsyncMock())
     crawler = SimpleNamespace(
         fetch=AsyncMock(side_effect=FetchError("connection failed", transient=True))
     )
@@ -1380,6 +1536,41 @@ async def test_persisted_archive_preflight_retries_fetch_errors_and_fails_http_e
     assert job.error == "HTTP 404"
     assert job.lease_owner is None
     assert job.lease_expires_at is None
+
+
+@pytest.mark.parametrize(
+    "error", [service.LeaseLostError("reclaimed"), database_lock()]
+)
+async def test_worker_failure_helpers_preserve_other_workers_and_database_retries(
+    error,
+):
+    session = database_session(commit=AsyncMock())
+    page = SimpleNamespace()
+    job = SimpleNamespace()
+    await service._worker_failure(session, page, "crawl", error)
+    await service._archive_worker_failure(session, job, page, error)
+    await service._archive_history_worker_failure(session, page, error)
+    assert vars(page) == vars(job) == {}
+    assert session.rollback.await_count == 3
+    session.commit.assert_not_awaited()
+
+
+async def test_submit_one_abandons_replaced_lease_before_intent(monkeypatch):
+    state = make_state()
+    page = SimpleNamespace(id=1, domain_id=2, active=True, in_scope=True)
+    domain = SimpleNamespace(active=True)
+    session = database_session(
+        get=AsyncMock(side_effect=[page, domain]), commit=AsyncMock()
+    )
+    monkeypatch.setattr(
+        service,
+        "_archive_preflight",
+        AsyncMock(side_effect=service.LeaseLostError("reclaimed")),
+    )
+    intent = AsyncMock()
+    monkeypatch.setattr(service, "create_archive_intent", intent)
+    await service._submit_one(state, Sessions(session), 1)
+    intent.assert_not_awaited()
 
 
 async def test_worker_failure_helpers_release_and_delay_work():

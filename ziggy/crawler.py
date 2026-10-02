@@ -7,6 +7,7 @@ import email.utils
 import gzip
 import io
 import zlib
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from random import SystemRandom
@@ -17,6 +18,8 @@ import niquests
 from loguru import logger
 
 from ziggy.database import insert_page_candidates
+from ziggy.models import Domain
+from ziggy.transactions import Lease, LeaseLostError
 from ziggy.urls import (
     SitemapContents,
     UrlError,
@@ -47,6 +50,7 @@ _SUCCESS_MAX = 299
 _SERVER_ERROR_MIN = 500
 _SERVER_ERROR_MAX = 599
 _GZIP_MAGIC = b"\x1f\x8b"
+_DISCOVERY_BATCH_SIZE = 200
 
 
 class RandomSource(Protocol):
@@ -417,7 +421,7 @@ def _decode_html(body: bytes, encoding: str | None) -> str:
         return body.decode("utf-8", errors="replace")
 
 
-async def crawl_page(  # noqa: PLR0913, PLR0915
+async def crawl_page(  # noqa: C901, PLR0913
     session: AsyncSession,
     page: Page,
     *,
@@ -429,6 +433,8 @@ async def crawl_page(  # noqa: PLR0913, PLR0915
     random_source: RandomSource = _RANDOM,
 ) -> None:
     """Fetch one leased page and persist its result and discoveries."""
+    lease = Lease.capture(page, "crawl_lease_owner", "crawl_lease_expires_at")
+    await session.commit()
     recurrence_interval = settings.seed_interval if page.is_seed else settings.interval
     try:
         result = await client.fetch(
@@ -439,19 +445,111 @@ async def crawl_page(  # noqa: PLR0913, PLR0915
             last_modified=page.last_modified if page.active else None,
         )
     except FetchError as error:
-        page.error = str(error)
-        page.crawl_attempts += 1
-        if error.transient and page.crawl_attempts < settings.max_attempts:
-            page.next_crawl_at = retry_time(
-                now, page.crawl_attempts, None, random_source
-            )
-        else:
-            page.next_crawl_at = now + recurrence_interval
-            page.crawl_attempts = 0
-        _release_crawl(page)
-        await session.commit()
+
+        async def fail(failure: FetchError = error) -> None:
+            page.error = str(failure)
+            page.crawl_attempts += 1
+            if failure.transient and page.crawl_attempts < settings.max_attempts:
+                page.next_crawl_at = retry_time(
+                    now, page.crawl_attempts, None, random_source
+                )
+            else:
+                page.next_crawl_at = now + recurrence_interval
+                page.crawl_attempts = 0
+            _release_crawl(page)
+
+        with suppress(LeaseLostError):
+            await lease.persist(session, fail)
         return
 
+    found: tuple[str, ...] = ()
+    is_sitemap = False
+    parsing_error: str | None = None
+    if _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
+        try:
+            found, is_sitemap = await asyncio.to_thread(
+                discoveries, result, page.sitemap_depth
+            )
+        except UrlError as error:
+            parsing_error = str(error)
+    discovered = tuple(
+        dict.fromkeys(
+            value
+            for value in (*result.redirect_urls, *found)
+            if url_in_scope(
+                value, configured_host, include_subdomains=include_subdomains
+            )
+        )
+    )
+    if result.status_code == _NOT_MODIFIED:
+        discovered = ()
+    found_set = set(found)
+    candidates = [
+        {
+            "domain_id": page.domain_id,
+            "url": value,
+            "in_scope": True,
+            "discovered_at": now,
+            "discovered_from_id": page.id,
+            "next_crawl_at": now,
+            "next_archive_at": now,
+            "sitemap_depth": page.sitemap_depth + 1
+            if is_sitemap and value in found_set
+            else 0,
+        }
+        for value in discovered
+    ]
+
+    async def finish() -> None:
+        _record_crawl_result(page, result, settings, now, random_source)
+        if parsing_error is not None:
+            page.error = parsing_error
+        _release_crawl(page)
+
+    with suppress(LeaseLostError):
+        for offset in range(0, len(candidates), _DISCOVERY_BATCH_SIZE):
+
+            async def persist_batch(offset: int = offset) -> tuple[str, ...]:
+                domain = await session.get(
+                    Domain, page.domain_id, populate_existing=True
+                )
+                if (
+                    domain is None
+                    or not domain.active
+                    or not page.in_scope
+                    or page.blocked_reason is not None
+                ):
+                    return ()
+                batch = [
+                    {**values, "domain_id": domain.id}
+                    for values in candidates[offset : offset + _DISCOVERY_BATCH_SIZE]
+                    if url_in_scope(
+                        str(values["url"]),
+                        domain.host,
+                        include_subdomains=domain.include_subdomains,
+                    )
+                ]
+                return await insert_page_candidates(
+                    session,
+                    batch,
+                    settings.max_query_variants_per_base,
+                )
+
+            inserted = await lease.persist(session, persist_batch)
+            for value in inserted:
+                logger.info("Page found: {}", value)
+        # The due time and lease advance only after every idempotent chunk commits.
+        await lease.persist(session, finish)
+
+
+def _record_crawl_result(
+    page: Page,
+    result: FetchResult,
+    settings: CrawlSettings,
+    now: datetime,
+    random_source: RandomSource,
+) -> None:
+    recurrence_interval = settings.seed_interval if page.is_seed else settings.interval
     page.status_code, page.final_url = result.status_code, result.final_url
     page.content_type = _content_type(result.headers)
     page.last_crawled_at = now
@@ -477,53 +575,8 @@ async def crawl_page(  # noqa: PLR0913, PLR0915
         page.next_crawl_at = now + recurrence_interval
         page.crawl_attempts = 0
 
-    if result.status_code == _NOT_MODIFIED:
-        _release_crawl(page)
-        await session.commit()
-        return
-    found: tuple[str, ...] = ()
-    is_sitemap = False
     if _SUCCESS_MIN <= result.status_code <= _SUCCESS_MAX:
         page.active = True
-        try:
-            found, is_sitemap = discoveries(result, page.sitemap_depth)
-        except UrlError as error:
-            page.error = str(error)
-    scoped = tuple(
-        value
-        for value in (*result.redirect_urls, *found)
-        if url_in_scope(
-            value,
-            configured_host,
-            include_subdomains=include_subdomains,
-        )
-    )
-    discovered = tuple(dict.fromkeys(scoped))
-    inserted = ()
-    if discovered:
-        inserted = await insert_page_candidates(
-            session,
-            [
-                {
-                    "domain_id": page.domain_id,
-                    "url": value,
-                    "in_scope": True,
-                    "discovered_at": now,
-                    "discovered_from_id": page.id,
-                    "next_crawl_at": now,
-                    "next_archive_at": now,
-                    "sitemap_depth": page.sitemap_depth + 1
-                    if is_sitemap and value in found
-                    else 0,
-                }
-                for value in discovered
-            ],
-            settings.max_query_variants_per_base,
-        )
-    _release_crawl(page)
-    await session.commit()
-    for value in inserted:
-        logger.info("Page found: {}", value)
 
 
 def _release_crawl(page: Page) -> None:

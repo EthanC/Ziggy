@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -23,11 +24,12 @@ from archivist import (
     ServiceError,
 )
 from loguru import logger
-from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy import String, and_, case, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert
 
 from ziggy.database import insert_page_candidates
 from ziggy.models import (
+    ARCHIVE_WORK_PREDICATE,
     ArchiveJob,
     ArchiveJobKind,
     ArchiveJobState,
@@ -36,6 +38,7 @@ from ziggy.models import (
     Domain,
     Page,
 )
+from ziggy.transactions import Lease, LeaseLostError, write_transaction
 from ziggy.urls import (
     DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
     UrlError,
@@ -51,7 +54,21 @@ _MIN_ADAPTIVE_REQUEST_DELAY = 1.0
 _MAX_ADAPTIVE_REQUEST_DELAY = 60.0
 _INITIAL_STATUS_DELAY = timedelta(seconds=2)
 _SERVICE_FAILURE_RECOVERY_DELAY = timedelta(minutes=15)
-_RETRYABLE_SERVICE_CODES = frozenset({"error:no-captures", "error:not-found"})
+_RETRYABLE_SERVICE_CODES = frozenset(
+    {
+        "error:no-captures",
+        "error:not-found",
+        "error:no-request",
+        "error:gateway-timeout",
+        "error:service-unavailable",
+        "error:bad-gateway",
+        "error:internal-server-error",
+    }
+)
+_DAILY_LIMIT_CODES = frozenset(
+    {"error:too-many-captures", "error:daily-limit", "error:daily-capture-limit"}
+)
+_OUTLINK_BATCH_SIZE = 50
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -67,6 +84,10 @@ class ArchiveError(RuntimeError):
 
 class ArchiveAuthenticationError(ArchiveError):
     """Authentication failed and new submissions must pause."""
+
+
+class ArchiveServiceError(ArchiveError):
+    """An HTTP server failure that needs delayed recovery."""
 
 
 class ArchiveRateLimitError(ArchiveError):
@@ -104,10 +125,12 @@ class SuccessStatus:
 
 @dataclass(frozen=True, slots=True)
 class FailedStatus:
-    """A terminal remote capture failure."""
+    """A failed remote attempt, including any supplied recovery deadline."""
 
     job_id: str
     service_code: str | None
+    retry_at: datetime | None = None
+    daily_limit: bool = False
 
 
 ArchiveStatus = PendingStatus | SuccessStatus | FailedStatus
@@ -382,18 +405,29 @@ class ArchivistClient:
                 result = await request()
             except RateLimitError as error:
                 occurred_at = datetime.now(UTC)
-                retry_at = _retry_at(error.retry_after) or occurred_at + timedelta(
-                    minutes=1
+                retry_at = _retry_at(error.retry_after)
+                message = str(error).casefold()
+                daily_limit = _daily_capture_limit(None, message)
+                if daily_limit:
+                    retry_at = max(
+                        retry_at or occurred_at, occurred_at + timedelta(days=1)
+                    )
+                else:
+                    retry_at = retry_at or occurred_at + timedelta(minutes=1)
+                per_url = daily_limit and any(
+                    marker in message
+                    for marker in ("this url", "per-url", "per url", "url has been")
                 )
-                self._rate_limit_until = retry_at
-                self._adaptive_request_delay = min(
-                    _MAX_ADAPTIVE_REQUEST_DELAY,
-                    max(
-                        _MIN_ADAPTIVE_REQUEST_DELAY,
-                        self._adaptive_request_delay * 2,
-                    ),
-                )
-                self._rate_limit_recovery_started_at = None
+                if not per_url:
+                    self._rate_limit_until = retry_at
+                    self._adaptive_request_delay = min(
+                        _MAX_ADAPTIVE_REQUEST_DELAY,
+                        max(
+                            _MIN_ADAPTIVE_REQUEST_DELAY,
+                            self._adaptive_request_delay * 2,
+                        ),
+                    )
+                    self._rate_limit_recovery_started_at = None
                 raise ArchiveRateLimitError(retry_at) from error
             except ServiceError as error:
                 if error.status_code is not None and (
@@ -405,6 +439,7 @@ class ArchivistClient:
                     minutes = min(60, 2**exponent)
                     self._last_server_error_at = occurred_at
                     self._server_error_until = occurred_at + timedelta(minutes=minutes)
+                    raise ArchiveServiceError(type(error).__name__) from error
                 raise
             else:
                 self._recover_request_pacing(datetime.now(UTC))
@@ -459,7 +494,20 @@ def _status(
         return PendingStatus(status.job_id, _retry_at(status.retry_after))
     if isinstance(status, InternetArchiveSuccessStatus):
         return _success(status)
-    return FailedStatus(status.job_id, status.service_code)
+    return FailedStatus(
+        status.job_id,
+        status.service_code,
+        daily_limit=_daily_capture_limit(status.service_code, status.message),
+    )
+
+
+def _daily_capture_limit(code: str | None, message: str | None) -> bool:
+    if code in _DAILY_LIMIT_CODES:
+        return True
+    return code in (None, "error:too-many-requests") and any(
+        phrase in (message or "").casefold()
+        for phrase in ("daily capture limit", "captures per day", "times today")
+    )
 
 
 def _success(status: InternetArchiveSuccessStatus) -> SuccessStatus:
@@ -481,6 +529,24 @@ async def create_archive_intent(
     archive_only: bool = False,
 ) -> ArchiveJob:
     """Commit remote submission intent before crossing the external boundary."""
+    lease = Lease.capture(page, "archive_lease_owner", "archive_lease_expires_at")
+    await session.commit()
+
+    async def create() -> ArchiveJob:
+        return await _create_archive_intent(
+            session, page, now, archive_only=archive_only
+        )
+
+    return await lease.persist(session, create)
+
+
+async def _create_archive_intent(
+    session: AsyncSession,
+    page: Page,
+    now: datetime,
+    *,
+    archive_only: bool,
+) -> ArchiveJob:
     job = ArchiveJob(
         page_id=page.id,
         kind=ArchiveJobKind.DIRECT,
@@ -505,11 +571,10 @@ async def create_archive_intent(
     )
     page.archive_lease_owner = None
     page.archive_lease_expires_at = None
-    await session.commit()
     return job
 
 
-async def submit_archive_job(  # noqa: PLR0913
+async def submit_archive_job(  # noqa: C901, PLR0913
     session: AsyncSession,
     job: ArchiveJob,
     *,
@@ -521,6 +586,9 @@ async def submit_archive_job(  # noqa: PLR0913
     preflight: Callable[[], Awaitable[bool]] | None = None,
 ) -> None:
     """Submit or recover one persisted direct intent."""
+    url = page.url
+    lease = Lease.capture(job, "lease_owner", "lease_expires_at")
+    await session.commit()
     if job.state == ArchiveJobState.UNCERTAIN and not await _recover_uncertain(
         session,
         job,
@@ -529,59 +597,82 @@ async def submit_archive_job(  # noqa: PLR0913
         settings=settings,
         now=now,
         allow_submission=allow_submission,
+        lease=lease,
     ):
         return
     if not allow_submission:
-        _fail_job(job, page, settings, now)
-        await session.commit()
+
+        async def fail() -> None:
+            _fail_job(job, page, settings, now)
+
+        await lease.persist(session, fail, (page,))
         return
     if preflight is not None and not await preflight():
         return
 
-    job.state = ArchiveJobState.UNCERTAIN
-    job.error = None
-    await session.commit()
+    await _checkpoint_job(session, lease, state=ArchiveJobState.UNCERTAIN, error=None)
+    error: ArchiveError | None = None
+    external_job_id: str | None = None
     try:
         if job.archive_only:
             external_job_id = await client.submit(
-                page.url,
+                url,
                 settings.dedupe_window,
                 capture_outlinks=False,
             )
         else:
-            external_job_id = await client.submit(page.url, settings.dedupe_window)
-    except ArchiveAuthenticationError:
-        job.error = "authentication failed"
-        job.next_attempt_at = now + timedelta(minutes=5)
-        _release_job(job)
-        await session.commit()
-        raise
-    except ArchiveRateLimitError as error:
-        _retry_uncertain(job, now, error, retry_at=error.retry_at)
-        await session.commit()
-        logger.warning(
-            "Archive submission rate limited for job {}: {}", job.id, page.url
-        )
-        return
-    except ArchiveError as error:
-        _retry_uncertain(job, now, error)
-        await session.commit()
+            external_job_id = await client.submit(url, settings.dedupe_window)
+    except ArchiveError as caught:
+        error = caught
+
+    async def record() -> None:
+        if error is not None:
+            _submission_error(job, now, error)
+        else:
+            job.external_job_id = external_job_id
+            job.state = ArchiveJobState.SUBMITTED
+            job.submitted_at = now
+            job.next_attempt_at = now + _INITIAL_STATUS_DELAY
+            job.error = None
+            job.service_code = None
+            _release_job(job)
+
+    await lease.persist(session, record)
+    if isinstance(error, ArchiveAuthenticationError):
+        raise error
+    if error is not None:
         logger.warning(
             "Archive submission failed for job {} ({}): {}",
             job.id,
-            page.url,
             type(error).__name__,
+            url,
         )
-        return
-    job.external_job_id = external_job_id
-    job.state = ArchiveJobState.SUBMITTED
-    job.submitted_at = now
-    job.next_attempt_at = now + _INITIAL_STATUS_DELAY
-    job.error = None
-    job.service_code = None
-    job.lease_owner = None
-    job.lease_expires_at = None
-    await session.commit()
+
+
+def _submission_error(job: ArchiveJob, now: datetime, error: ArchiveError) -> None:
+    if isinstance(error, ArchiveAuthenticationError):
+        job.error = "authentication failed"
+        job.next_attempt_at = now + timedelta(minutes=5)
+        _release_job(job)
+    else:
+        _retry_uncertain(
+            job,
+            now,
+            error,
+            retry_at=error.retry_at
+            if isinstance(error, ArchiveRateLimitError)
+            else None,
+        )
+
+
+async def _checkpoint_job(
+    session: AsyncSession, lease: Lease, **values: object
+) -> None:
+    async def record() -> None:
+        for name, value in values.items():
+            setattr(lease.record, name, value)
+
+    await lease.persist(session, record)
 
 
 async def _recover_uncertain(  # noqa: PLR0913
@@ -593,43 +684,44 @@ async def _recover_uncertain(  # noqa: PLR0913
     settings: ArchiveSettings,
     now: datetime,
     allow_submission: bool,
+    lease: Lease,
 ) -> bool:
+    captures: Sequence[SuccessStatus] = ()
+    error: ArchiveError | None = None
     try:
         captures = await client.captures_since(page.url, job.intent_at)
-    except ArchiveAuthenticationError:
-        job.error = "authentication failed"
-        job.next_attempt_at = now + timedelta(minutes=5)
-        _release_job(job)
-        await session.commit()
-        raise
-    except ArchiveRateLimitError as error:
-        _retry_uncertain(job, now, error, retry_at=error.retry_at)
-        await session.commit()
-        logger.warning("Archive recovery rate limited for job {}: {}", job.id, page.url)
-        return False
-    except ArchiveError as error:
-        _retry_uncertain(job, now, error)
-        await session.commit()
-        logger.warning(
-            "Archive recovery failed for job {} ({}): {}",
-            job.id,
-            page.url,
-            type(error).__name__,
-        )
-        return False
-    if captures:
-        job.saved_to_my_archive = True
-        job.outlinks_processed = True
-        await _record_success(session, job, page, captures[-1], settings, now)
-        return False
-    if job.attempts >= settings.max_attempts or not allow_submission:
-        _fail_job(job, page, settings, now)
-        await session.commit()
-        return False
-    return True
+    except ArchiveError as caught:
+        error = caught
+
+    async def recover() -> bool:
+        if error is not None:
+            _submission_error(job, now, error)
+            return False
+        if captures:
+            job.saved_to_my_archive = True
+            job.outlinks_processed = True
+            await _record_success(
+                session,
+                job,
+                page,
+                max(captures, key=lambda capture: capture.captured_at),
+                settings,
+                now,
+            )
+            _release_job(job)
+            return False
+        if job.attempts >= settings.max_attempts or not allow_submission:
+            _fail_job(job, page, settings, now)
+            return False
+        return True
+
+    recovered = await lease.persist(session, recover, (page,))
+    if isinstance(error, ArchiveAuthenticationError):
+        raise error
+    return recovered
 
 
-async def poll_archive_job(  # noqa: C901, PLR0911, PLR0913
+async def poll_archive_job(  # noqa: PLR0913
     session: AsyncSession,
     job: ArchiveJob,
     *,
@@ -643,6 +735,8 @@ async def poll_archive_job(  # noqa: C901, PLR0911, PLR0913
     """Poll one persisted remote ID and finish resumable post-processing."""
     if job.external_job_id is None:
         raise ArchiveError("persisted polling job has no remote ID")
+    lease = Lease.capture(job, "lease_owner", "lease_expires_at")
+    await session.commit()
     if job.state == ArchiveJobState.SUCCEEDED:
         await _post_process(
             session,
@@ -655,34 +749,61 @@ async def poll_archive_job(  # noqa: C901, PLR0911, PLR0913
             max_query_variants_per_base,
         )
         return
+    status: ArchiveStatus | ArchiveError
     try:
         status = await client.status(job.external_job_id)
-    except ArchiveAuthenticationError:
+    except ArchiveError as caught:
+        status = caught
+
+    async def record() -> None:
+        await _record_poll(session, job, page, status, settings, now)
+
+    await lease.persist(session, record, (page,))
+    if isinstance(status, ArchiveAuthenticationError):
+        raise status
+    if isinstance(status, SuccessStatus):
+        await _post_process(
+            session,
+            job,
+            page,
+            domain,
+            client,
+            settings,
+            now,
+            max_query_variants_per_base,
+        )
+
+
+async def _record_poll(  # noqa: PLR0911, PLR0913, PLR0917
+    session: AsyncSession,
+    job: ArchiveJob,
+    page: Page,
+    status: ArchiveStatus | ArchiveError,
+    settings: ArchiveSettings,
+    now: datetime,
+) -> None:
+    if isinstance(status, ArchiveAuthenticationError):
         job.error = "authentication failed"
         job.next_attempt_at = now + timedelta(minutes=5)
         _release_job(job)
-        await session.commit()
-        raise
-    except ArchiveRateLimitError as error:
-        _rate_limit(job, now, error.retry_at)
-        await session.commit()
+        return
+    if isinstance(status, ArchiveRateLimitError):
+        _rate_limit(job, now, status.retry_at)
         logger.warning("Archive polling rate limited for job {}: {}", job.id, page.url)
         return
-    except ArchiveJobNotFoundError as error:
-        _retry_missing_job(job, now, error)
-        await session.commit()
+    if isinstance(status, ArchiveJobNotFoundError):
+        _retry_missing_job(job, now, status)
         logger.info(
             "Archive job {} is not yet available for polling: {}", job.id, page.url
         )
         return
-    except ArchiveError as error:
-        _retry_job(job, page, settings, now, error)
-        await session.commit()
+    if isinstance(status, ArchiveError):
+        _retry_job(job, page, settings, now, status)
         logger.warning(
             "Archive polling failed for job {} ({}): {}",
             job.id,
             page.url,
-            type(error).__name__,
+            type(status).__name__,
         )
         return
     if isinstance(status, PendingStatus):
@@ -694,7 +815,6 @@ async def poll_archive_job(  # noqa: C901, PLR0911, PLR0913
             if not job.archive_only:
                 page.next_archive_at = now
             _release_job(job)
-            await session.commit()
             logger.warning(
                 "Archive job {} exceeded pending timeout: {}", job.id, page.url
             )
@@ -703,33 +823,22 @@ async def poll_archive_job(  # noqa: C901, PLR0911, PLR0913
         job.next_attempt_at = status.retry_at or now + timedelta(seconds=2)
         job.error = None
         _release_job(job)
-        await session.commit()
         return
     if isinstance(status, FailedStatus):
-        await _record_failure(session, job, page, status, settings, now)
+        _record_failure(job, page, status, settings, now)
         return
     await _record_success(session, job, page, status, settings, now)
-    await _post_process(
-        session,
-        job,
-        page,
-        domain,
-        client,
-        settings,
-        now,
-        max_query_variants_per_base,
-    )
 
 
-async def _record_failure(  # noqa: PLR0913, PLR0917
-    session: AsyncSession,
+def _record_failure(
     job: ArchiveJob,
     page: Page,
     status: FailedStatus,
     settings: ArchiveSettings,
     now: datetime,
 ) -> None:
-    retryable = status.service_code in _RETRYABLE_SERVICE_CODES
+    daily_limit = status.daily_limit or status.service_code in _DAILY_LIMIT_CODES
+    retryable = status.service_code in _RETRYABLE_SERVICE_CODES or daily_limit
     if retryable:
         job.attempts += 1
     job.service_code = status.service_code
@@ -737,7 +846,12 @@ async def _record_failure(  # noqa: PLR0913, PLR0917
         job.state = ArchiveJobState.UNCERTAIN
         job.external_job_id = None
         job.error = status.service_code
-        job.next_attempt_at = now + _service_failure_recovery_delay(job.attempts)
+        delay = (
+            timedelta(days=1)
+            if daily_limit
+            else _service_failure_recovery_delay(job.attempts)
+        )
+        job.next_attempt_at = max(now + delay, status.retry_at or now)
         log = logger.info
         message = "Archive job {} will retry after service code {}: {}"
     else:
@@ -748,7 +862,6 @@ async def _record_failure(  # noqa: PLR0913, PLR0917
         log = logger.warning
         message = "Archive job {} failed with service code {}: {}"
     _release_job(job)
-    await session.commit()
     log(message, job.id, status.service_code or "unknown", page.url)
 
 
@@ -763,7 +876,6 @@ async def _record_success(  # noqa: PLR0913, PLR0917
     job.state = ArchiveJobState.SUCCEEDED
     job.completed_at = now
     job.error = None
-    _release_job(job)
     await session.execute(
         insert(Capture)
         .values(
@@ -780,7 +892,6 @@ async def _record_success(  # noqa: PLR0913, PLR0917
     if not job.archive_only:
         page.next_archive_at = status.captured_at + settings.interval
     _record_archive_history(page, status.captured_at, now)
-    await session.commit()
 
 
 async def _post_process(  # noqa: PLR0913, PLR0917
@@ -793,53 +904,62 @@ async def _post_process(  # noqa: PLR0913, PLR0917
     now: datetime,
     max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
 ) -> None:
+    lease = Lease.capture(job, "lease_owner", "lease_expires_at")
+    await session.commit()
     try:
         if not job.saved_to_my_archive:
             await client.add_to_my_archive(job.external_job_id or "")
-            job.saved_to_my_archive = True
-            await session.commit()
+            await _checkpoint_job(session, lease, saved_to_my_archive=True)
         if job.archive_only and not job.outlinks_processed:
-            job.outlinks_processed = True
-            await session.commit()
+            await _checkpoint_job(session, lease, outlinks_processed=True)
         if not job.outlinks_processed and domain is not None:
             children = await client.outlinks(job.external_job_id or "")
-            await _record_outlinks(
-                session,
-                job,
-                page,
-                domain,
-                children,
-                settings,
-                now,
-                max_query_variants_per_base,
-            )
-            job.outlinks_processed = True
-            job.error = None
-            await session.commit()
+            candidates = await asyncio.to_thread(_outlink_candidates, children)
+            for offset in range(0, len(candidates), _OUTLINK_BATCH_SIZE):
+
+                async def record_batch(offset: int = offset) -> None:
+                    await _record_outlinks(
+                        session,
+                        job,
+                        page,
+                        domain,
+                        candidates[offset : offset + _OUTLINK_BATCH_SIZE],
+                        settings,
+                        now,
+                        max_query_variants_per_base,
+                    )
+
+                await lease.persist(session, record_batch, (page, domain))
+            await _checkpoint_job(session, lease, outlinks_processed=True, error=None)
     except ArchiveAuthenticationError:
-        job.error = "authentication failed"
-        job.next_attempt_at = now + timedelta(minutes=5)
-        await session.commit()
+        await _checkpoint_job(
+            session,
+            lease,
+            error="authentication failed",
+            next_attempt_at=now + timedelta(minutes=5),
+            lease_owner=None,
+            lease_expires_at=None,
+        )
         raise
     except ArchiveRateLimitError as error:
-        job.next_attempt_at = error.retry_at or now + timedelta(minutes=1)
-        job.error = str(error)
-        await session.commit()
+        await _checkpoint_job(
+            session,
+            lease,
+            next_attempt_at=error.retry_at or now + timedelta(minutes=1),
+            error=str(error),
+        )
     except ArchiveError as error:
-        _retry_job(job, page, settings, now, error)
-        await session.commit()
+
+        async def retry(failure: ArchiveError = error) -> None:
+            _retry_job(job, page, settings, now, failure)
+
+        await lease.persist(session, retry, (page,))
+    await _checkpoint_job(session, lease, lease_owner=None, lease_expires_at=None)
 
 
-async def _record_outlinks(  # noqa: PLR0913, PLR0917
-    session: AsyncSession,
-    parent: ArchiveJob,
-    parent_page: Page,
-    domain: Domain,
+def _outlink_candidates(
     children: Sequence[SuccessStatus],
-    settings: ArchiveSettings,
-    now: datetime,
-    max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
-) -> None:
+) -> list[tuple[SuccessStatus, str]]:
     candidates: list[tuple[SuccessStatus, str]] = []
     for child in children:
         try:
@@ -848,12 +968,27 @@ async def _record_outlinks(  # noqa: PLR0913, PLR0917
             continue
         if sensitive_query_key(url) is not None:
             continue
+        candidates.append((child, url))
+    return candidates
+
+
+async def _record_outlinks(  # noqa: PLR0913, PLR0917
+    session: AsyncSession,
+    parent: ArchiveJob,
+    parent_page: Page,
+    domain: Domain,
+    candidates: Sequence[tuple[SuccessStatus, str]],
+    settings: ArchiveSettings,
+    now: datetime,
+    max_query_variants_per_base: int = DEFAULT_MAX_QUERY_VARIANTS_PER_BASE,
+) -> None:
+    if not domain.active:
+        return
+    for child, url in candidates:
         if not url_in_scope(
             url, domain.host, include_subdomains=domain.include_subdomains
         ):
             continue
-        candidates.append((child, url))
-    for child, url in candidates:
         await insert_page_candidates(
             session,
             [
@@ -923,10 +1058,14 @@ async def check_archive_history(
     now: datetime,
 ) -> None:
     """Classify one validated page from its latest Wayback capture."""
-    claimed_lease = (
-        page.archive_history_lease_owner,
-        page.archive_history_lease_expires_at,
+    lease = Lease.capture(
+        page,
+        "archive_history_lease_owner",
+        "archive_history_lease_expires_at",
+        "archive_lease_owner",
+        "archive_lease_expires_at",
     )
+    await session.commit()
     captured_at: datetime | None = None
     error: ArchiveError | None = None
     try:
@@ -934,18 +1073,19 @@ async def check_archive_history(
     except ArchiveError as caught:
         error = caught
 
-    await session.refresh(page)
-    current_lease = (
-        page.archive_history_lease_owner,
-        page.archive_history_lease_expires_at,
-    )
-    archive_lease_active = page.archive_lease_owner is not None and (
-        page.archive_lease_expires_at is None
-        or page.archive_lease_expires_at > datetime.now(UTC)
-    )
-    if current_lease != claimed_lease or archive_lease_active:
-        return
+    async def record() -> None:
+        _record_history_result(page, captured_at, error, now)
 
+    with suppress(LeaseLostError):
+        await lease.persist(session, record)
+
+
+def _record_history_result(
+    page: Page,
+    captured_at: datetime | None,
+    error: ArchiveError | None,
+    now: datetime,
+) -> None:
     if isinstance(error, ArchiveRateLimitError):
         page.archive_history_check_attempts += 1
         page.archive_history_check_error = type(error).__name__
@@ -966,7 +1106,6 @@ async def check_archive_history(
         page.archive_history_check_error = None
     page.archive_history_lease_owner = None
     page.archive_history_lease_expires_at = None
-    await session.commit()
 
 
 def _record_archive_history(
@@ -1031,39 +1170,63 @@ async def claim_archive_job(
         ),
         else_=func.max(func.coalesce(submission_priority, -101), 0),
     )
+    # Pin the partial work index even before ANALYZE. Otherwise SQLite can scan
+    # completed SUCCEEDED jobs through its state index to find unfinished work.
+    work = (
+        text(
+            "SELECT id FROM archive_jobs INDEXED BY ix_archive_jobs_work WHERE "  # noqa: S608 - fixed model predicate, no input values.
+            + str(ARCHIVE_WORK_PREDICATE)
+        )
+        .columns(id=String())
+        .subquery()
+    )
     candidate = (
         select(ArchiveJob.id)
+        .join(work, work.c.id == ArchiveJob.id)
         .where(
             ArchiveJob.next_attempt_at <= now,
             or_(
                 ArchiveJob.lease_expires_at.is_(None),
                 ArchiveJob.lease_expires_at <= now,
             ),
-            or_(accepted, post_processing, requires_recovery),
         )
         .order_by(
             effective_priority.desc(),
             ArchiveJob.next_attempt_at,
             ArchiveJob.intent_at,
+            ArchiveJob.id,
         )
         .limit(1)
-        .scalar_subquery()
     )
-    statement = (
-        update(ArchiveJob)
-        .where(
-            ArchiveJob.id == candidate,
-            or_(
-                ArchiveJob.lease_expires_at.is_(None),
-                ArchiveJob.lease_expires_at <= now,
-            ),
-        )
-        .values(lease_owner=owner, lease_expires_at=now + lease_duration)
-        .returning(ArchiveJob)
-    )
-    job = (await session.scalars(statement)).one_or_none()
-    await session.commit()
-    return job
+    for _ in range(16):
+        job_id = await session.scalar(candidate)
+        await session.commit()
+        if job_id is None:
+            return None
+
+        async def claim(job_id: str = job_id) -> ArchiveJob | None:
+            return (
+                await session.scalars(
+                    update(ArchiveJob)
+                    .where(
+                        ArchiveJob.id == job_id,
+                        ArchiveJob.next_attempt_at <= now,
+                        or_(
+                            ArchiveJob.lease_expires_at.is_(None),
+                            ArchiveJob.lease_expires_at <= now,
+                        ),
+                        or_(accepted, post_processing, requires_recovery),
+                    )
+                    .values(lease_owner=owner, lease_expires_at=now + lease_duration)
+                    .returning(ArchiveJob)
+                    .execution_options(populate_existing=True)
+                )
+            ).one_or_none()
+
+        job = await write_transaction(session, claim)
+        if job is not None:
+            return job
+    return None
 
 
 async def available_archive_submission_slots(
@@ -1130,7 +1293,11 @@ def _retry_job(
         if not job.archive_only:
             page.next_archive_at = now + settings.interval
     else:
-        job.next_attempt_at = now + timedelta(seconds=min(3600, 2**job.attempts))
+        job.next_attempt_at = now + (
+            _service_failure_recovery_delay(job.attempts)
+            if isinstance(error, ArchiveServiceError)
+            else timedelta(seconds=min(3600, 2**job.attempts))
+        )
     _release_job(job)
 
 
@@ -1144,8 +1311,10 @@ def _retry_uncertain(
     job.state = ArchiveJobState.UNCERTAIN
     job.attempts += 1
     job.error = type(error).__name__
-    job.next_attempt_at = retry_at or now + timedelta(
-        seconds=min(3600, 2**job.attempts)
+    job.next_attempt_at = retry_at or now + (
+        _service_failure_recovery_delay(job.attempts)
+        if isinstance(error, ArchiveServiceError)
+        else timedelta(seconds=min(3600, 2**job.attempts))
     )
     _release_job(job)
 

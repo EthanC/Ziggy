@@ -5,6 +5,7 @@ import gzip
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import niquests
 import pytest
@@ -89,6 +90,8 @@ class FakeDatabaseSession:
         self.no_autoflush = nullcontext()
 
     async def execute(self, statement):
+        if str(statement) == "BEGIN IMMEDIATE":
+            return None
         self.statements.append(statement)
         params = statement.compile().params
         urls = [value for key, value in params.items() if key.startswith("url_m")]
@@ -103,6 +106,17 @@ class FakeDatabaseSession:
 
     async def commit(self):
         self.commits += 1
+
+    async def refresh(self, record):
+        pass
+
+    async def get(self, model, key, **kwargs):
+        return SimpleNamespace(
+            id=key, host="example.com", include_subdomains=True, active=True
+        )
+
+    async def rollback(self):
+        pass
 
 
 class FakeClient:
@@ -164,6 +178,7 @@ def make_page(**changes):
         "url": "https://example.com/start",
         "is_seed": False,
         "active": True,
+        "in_scope": True,
         "deactivated_at": None,
         "discovered_at": NOW - timedelta(days=1),
         "discovered_from_id": None,
@@ -845,7 +860,7 @@ async def test_crawl_page_success_updates_metadata_inserts_and_logs_scoped_urls(
     assert page.crawl_attempts == 0
     assert page.crawl_lease_owner is None
     assert page.crawl_lease_expires_at is None
-    assert session.commits == 1
+    assert session.commits == 3
     assert len(session.statements) == 1
     statement = session.statements[0]
     params = statement.compile().params
@@ -887,7 +902,7 @@ async def test_crawl_page_reactivates_inactive_page_after_success(
     assert page.active is True
     assert page.deactivated_at == deactivated_at
     assert page.next_crawl_at == NOW + make_settings().interval
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 async def test_crawl_page_keeps_inactive_page_inactive_after_failed_recheck():
@@ -899,7 +914,7 @@ async def test_crawl_page_keeps_inactive_page_inactive_after_failed_recheck():
     assert page.active is False
     assert page.deactivated_at == deactivated_at
     assert page.next_crawl_at == NOW + make_settings().interval
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 async def test_crawl_page_logs_only_urls_inserted_by_database(monkeypatch):
@@ -1015,7 +1030,7 @@ async def test_crawl_page_304_preserves_existing_metadata_and_skips_discovery():
     assert page.crawl_attempts == 0
     assert page.next_crawl_at == NOW + make_settings().interval
     assert session.statements == []
-    assert session.commits == 1
+    assert session.commits == 2
     assert page.crawl_lease_owner is None
 
 
@@ -1033,7 +1048,7 @@ async def test_crawl_page_transient_status_honors_retry_after():
     assert page.next_crawl_at == NOW + timedelta(seconds=120)
     assert random.calls == [(0.0, 1.0)]
     assert session.statements == []
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 async def test_crawl_page_exhausted_transient_status_resets_attempts():
@@ -1044,7 +1059,7 @@ async def test_crawl_page_exhausted_transient_status_resets_attempts():
     assert page.crawl_attempts == 0
     assert page.next_crawl_at == NOW + make_settings().interval
     assert random.calls == []
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 async def test_crawl_page_permanent_status_and_blocked_redirect_schedule_interval():
@@ -1076,7 +1091,7 @@ async def test_seed_page_uses_seed_interval_after_terminal_result(outcome):
     session, _, _ = await run_crawl(page, outcome)
 
     assert page.next_crawl_at == NOW + make_settings().seed_interval
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 @pytest.mark.parametrize(
@@ -1101,7 +1116,7 @@ async def test_crawl_page_fetch_errors_release_lease_and_schedule(
     assert page.crawl_lease_owner is None
     assert page.crawl_lease_expires_at is None
     assert session.statements == []
-    assert session.commits == 1
+    assert session.commits == 2
     assert bool(random.calls) is (error.transient and initial_attempts == 0)
 
 
@@ -1119,7 +1134,7 @@ async def test_crawl_page_records_discovery_parse_error_without_inserting():
     assert page.status_code == 200
     assert page.next_crawl_at == NOW + make_settings().interval
     assert session.statements == []
-    assert session.commits == 1
+    assert session.commits == 2
 
 
 async def test_crawl_page_propagates_cancellation_without_committing():
@@ -1137,8 +1152,44 @@ async def test_crawl_page_propagates_cancellation_without_committing():
             now=NOW,
         )
 
-    assert session.commits == 0
+    assert session.commits == 1  # End the read transaction before fetching.
     assert page.crawl_lease_owner == "worker"
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["missing-domain", "inactive-domain", "out-of-scope", "blocked", "narrowed-domain"],
+)
+async def test_discovery_revalidates_scope_after_network_work(change):
+    page = make_page()
+    session = FakeDatabaseSession()
+    domain = SimpleNamespace(
+        id=page.domain_id, host="example.com", active=True, include_subdomains=True
+    )
+
+    async def fetch(*args, **kwargs):
+        if change == "out-of-scope":
+            page.in_scope = False
+        elif change == "blocked":
+            page.blocked_reason = "sensitive_query"
+        elif change == "inactive-domain":
+            domain.active = False
+        elif change == "narrowed-domain":
+            domain.include_subdomains = False
+        return make_result(body=b'<a href="https://sub.example.com/child">child</a>')
+
+    session.get = AsyncMock(return_value=None if change == "missing-domain" else domain)
+    await crawler.crawl_page(
+        session,
+        page,
+        configured_host="example.com",
+        include_subdomains=True,
+        client=SimpleNamespace(fetch=fetch),
+        settings=make_settings(),
+        now=NOW,
+    )
+    assert session.statements == []
+    assert page.last_crawled_at == NOW
 
 
 def test_fetch_error_and_response_too_large_classification():

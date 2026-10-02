@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import event, insert, select, text
+from sqlalchemy import event, insert, select, text, update
 from sqlalchemy.dialects import sqlite
 from sqlalchemy.exc import StatementError
 
@@ -35,6 +35,7 @@ from ziggy.models import (
     Capture,
     Domain,
     Page,
+    ScopeCheckpoint,
     UtcDateTime,
 )
 
@@ -1439,20 +1440,221 @@ async def test_idle_archive_claim_uses_indexes_without_scanning_api_history(
             event.remove(engine.sync_engine, "before_cursor_execute", record_statement)
 
         assert claimed is None
-        assert len(statements) == 1
-        statement, parameters = statements[0]
+        assert all(statement.startswith("SELECT") for statement, _ in statements)
+        details = []
         async with engine.connect() as connection:
-            plan = await connection.exec_driver_sql(
-                f"EXPLAIN QUERY PLAN {statement}", parameters
-            )
-        details = [row[3] for row in plan]
+            for statement, parameters in statements:
+                plan = await connection.exec_driver_sql(
+                    f"EXPLAIN QUERY PLAN {statement}", parameters
+                )
+                details.extend(row[3] for row in plan)
         assert not any(
-            detail.startswith("SCAN pages") or "ix_pages_due_archive" in detail
+            detail == "SCAN pages" or "ix_pages_due_archive" in detail
             for detail in details
         ), details
-        assert any("ix_pages_domain" in detail for detail in details), details
+        assert any("ix_pages_schedule_archive" in detail for detail in details), details
         assert any(
             "ix_archive_submissions_pending" in detail
             or "ix_archive_submissions_job" in detail
             for detail in details
         ), details
+
+
+async def test_reconciliation_resumes_committed_cursor_and_skips_unchanged_scan(
+    database, monkeypatch
+):
+    engine, sessions = database
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    original = await _add_page(sessions, now)
+    config = SimpleNamespace(domains=(DomainSettings("example.com"),))
+    monkeypatch.setattr(database_module, "_RECONCILE_BATCH_SIZE", 1)
+    async with sessions() as session:
+        await session.execute(
+            insert(Page),
+            [
+                {"domain_id": original.domain_id, "url": f"https://removed.example/{i}"}
+                for i in range(3)
+            ],
+        )
+        await session.commit()
+
+    batches = 0
+
+    def interrupt(connection, cursor, statement, parameters, *args):
+        nonlocal batches
+        if statement.startswith("UPDATE scope_checkpoint"):
+            batches += 1
+            if batches == 2:
+                raise asyncio.CancelledError
+
+    event.listen(engine.sync_engine, "before_cursor_execute", interrupt)
+    try:
+        async with sessions() as session:
+            with pytest.raises(asyncio.CancelledError):
+                await reconcile_domains(session, config, now)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", interrupt)
+
+    async with sessions() as session:
+        checkpoint = await session.get(ScopeCheckpoint, 1)
+        assert checkpoint.last_page_id == original.id
+        assert checkpoint.completed is False
+        await reconcile_domains(session, config, now)
+        assert checkpoint.completed is True
+        assert (
+            await session.scalars(select(Page.in_scope).where(Page.id > original.id))
+        ).all() == [False] * 3
+
+    statements = []
+
+    def record(connection, cursor, statement, parameters, *args):
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        async with sessions() as session:
+            await reconcile_domains(session, config, now)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert not any("pages.id >" in statement for statement in statements)
+
+
+async def test_reconciliation_stops_when_new_scope_supersedes_its_checkpoint(
+    database, monkeypatch
+):
+    _, sessions = database
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    await _add_page(sessions, now)
+    original = database_module.write_transaction
+    calls = 0
+
+    async def supersede(session, operation):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            async with sessions() as other:
+                await other.execute(
+                    update(ScopeCheckpoint).values(fingerprint="replacement")
+                )
+                await other.commit()
+        return await original(session, operation)
+
+    monkeypatch.setattr(database_module, "write_transaction", supersede)
+    async with sessions() as session:
+        await reconcile_domains(
+            session, SimpleNamespace(domains=(DomainSettings("example.com"),)), now
+        )
+        checkpoint = await session.get(ScopeCheckpoint, 1)
+        assert checkpoint.fingerprint == "replacement"
+        assert checkpoint.completed is False
+
+
+async def test_reordering_domains_and_changing_seeds_does_not_rescan_pages(database):
+    engine, sessions = database
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    config = SimpleNamespace(
+        domains=(DomainSettings("a.example"), DomainSettings("b.example"))
+    )
+    async with sessions() as session:
+        await reconcile_domains(session, config, now)
+    statements = []
+
+    def record(connection, cursor, statement, parameters, *args):
+        statements.append(statement)
+
+    replacement = SimpleNamespace(
+        domains=(DomainSettings("b.example", seeds=("/new",)), config.domains[0])
+    )
+    event.listen(engine.sync_engine, "before_cursor_execute", record)
+    try:
+        async with sessions() as session:
+            await reconcile_domains(session, replacement, now)
+            assert (
+                await session.scalars(
+                    select(Page.url).where(Page.is_seed.is_(True)).order_by(Page.url)
+                )
+            ).all() == [
+                "https://a.example/",
+                "https://b.example/new",
+            ]
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", record)
+    assert not any("pages.id >" in statement for statement in statements)
+
+
+@pytest.mark.parametrize("competitor_claims", [1, 20])
+async def test_page_claim_reselects_after_race_and_bounds_reselection(
+    database, monkeypatch, competitor_claims
+):
+    _, sessions = database
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    page = await _add_page(sessions, now)
+    async with sessions() as session:
+        await session.execute(
+            insert(Page),
+            [
+                {
+                    "domain_id": page.domain_id,
+                    "url": f"https://example.com/{i}",
+                    "next_crawl_at": now,
+                }
+                for i in range(20)
+            ],
+        )
+        await session.commit()
+    original = database_module.write_transaction
+    lost = 0
+
+    async def competitor(session, operation):
+        nonlocal lost
+        if lost < competitor_claims:
+            async with sessions() as other:
+                page_id = await other.scalar(
+                    select(Page.id)
+                    .where(Page.next_crawl_at <= now)
+                    .order_by(Page.id)
+                    .limit(1)
+                )
+                await other.execute(
+                    update(Page)
+                    .where(Page.id == page_id)
+                    .values(next_crawl_at=now + timedelta(days=1))
+                )
+                await other.commit()
+            lost += 1
+        return await original(session, operation)
+
+    monkeypatch.setattr(database_module, "write_transaction", competitor)
+    async with sessions() as session:
+        claimed = await claim_due_page(
+            session, "crawl", "worker", now, timedelta(minutes=5)
+        )
+    if competitor_claims == 1:
+        assert claimed.id == page.id + 1
+    else:
+        assert claimed is None
+        assert lost < competitor_claims
+
+
+async def test_zero_priority_submission_uses_history_then_due_time(database):
+    _, sessions = database
+    now = datetime(2026, 10, 2, tzinfo=UTC)
+    await _add_page(sessions, now)
+    async with sessions() as session:
+        await admit_archive_submissions(
+            session,
+            "caller",
+            ("https://outside.example/",),
+            0,
+            now - timedelta(hours=1),
+            outstanding_limit=10,
+        )
+        claimed = await claim_due_page(
+            session,
+            "archive",
+            "worker",
+            now,
+            timedelta(minutes=5),
+            archive_interval=timedelta(days=30),
+        )
+        assert claimed.url == "https://outside.example/"
