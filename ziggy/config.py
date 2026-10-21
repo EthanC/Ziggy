@@ -30,6 +30,8 @@ _INTERNET_ARCHIVE_PASSWORD_ENV = "ZIGGY_INTERNET_ARCHIVE_PASSWORD"  # noqa: S105
 _INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV = "ZIGGY_INTERNET_ARCHIVE_RECOVERY_PERIOD"
 _DISCORD_WEBHOOK_URL_ENV = "ZIGGY_DISCORD_WEBHOOK_URL"
 _LOG_DISCORD_WEBHOOK_URL_ENV = "ZIGGY_LOG_DISCORD_WEBHOOK_URL"
+_LOG_LEVEL_ENV = "ZIGGY_LOG_LEVEL"
+_LOG_DISCORD_LEVEL_ENV = "ZIGGY_LOG_DISCORD_LEVEL"
 _HTTP_ENABLED_ENV = "ZIGGY_HTTP_ENABLED"
 _HTTP_HOST_ENV = "ZIGGY_HTTP_HOST"
 _HTTP_PORT_ENV = "ZIGGY_HTTP_PORT"
@@ -294,20 +296,13 @@ def _parse_reporting(data: dict[str, Any]) -> ReportingSettings:
     )
 
 
-def _parse_logging(data: dict[str, Any]) -> LoggingSettings:
-    names = {field.name for field in fields(LoggingSettings)}
-    _only(data, names, "logging")
-    level = data.get("level", "INFO")
-    discord_min_level = data.get("discord_min_level", "WARNING")
-    if not isinstance(level, str) or not isinstance(discord_min_level, str):
-        raise ConfigError("logging levels must be strings")
-    normalized_level = _log_level(level, "logging.level")
-    normalized_discord_level = _log_level(
-        discord_min_level, "logging.discord_min_level"
-    )
+def _resolve_logging(env: Env) -> LoggingSettings:
     return LoggingSettings(
-        level=normalized_level,
-        discord_min_level=normalized_discord_level,
+        level=_log_level(env.str(_LOG_LEVEL_ENV, default="INFO"), _LOG_LEVEL_ENV),
+        discord_min_level=_log_level(
+            env.str(_LOG_DISCORD_LEVEL_ENV, default="WARNING"),
+            _LOG_DISCORD_LEVEL_ENV,
+        ),
     )
 
 
@@ -385,7 +380,7 @@ def load_config(path: Path, env: Env | None = None) -> Config:
         raise ConfigError(f"cannot load configuration: {error}") from error
     _only(
         data,
-        {"ziggy", "crawl", "archive", "reporting", "logging", "domains"},
+        {"ziggy", "crawl", "archive", "reporting", "domains"},
         "top-level",
     )
     if "ziggy" not in data:
@@ -397,9 +392,8 @@ def load_config(path: Path, env: Env | None = None) -> Config:
         _parse_domain(value, index) for index, value in enumerate(domains_value)
     )
     _validate_domain_scopes(domains)
-    recovery_value = (env or Env()).str(
-        _INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV, default="15m"
-    )
+    env = env or Env()
+    recovery_value = env.str(_INTERNET_ARCHIVE_RECOVERY_PERIOD_ENV, default="15m")
     try:
         server_error_recovery_period = parse_duration(recovery_value)
     except ConfigError as error:
@@ -411,7 +405,7 @@ def load_config(path: Path, env: Env | None = None) -> Config:
         crawl=_parse_crawl(_section(data, "crawl")),
         archive=_parse_archive(_section(data, "archive"), server_error_recovery_period),
         reporting=_parse_reporting(_section(data, "reporting")),
-        logging=_parse_logging(_section(data, "logging")),
+        logging=_resolve_logging(env),
         domains=domains,
     )
 

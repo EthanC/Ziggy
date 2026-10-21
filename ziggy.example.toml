@@ -27,10 +27,6 @@ pending_timeout = "24h"
 interval = "24h"
 finalization_grace = "5m"
 
-[logging]
-level = "INFO"
-discord_min_level = "WARNING"
-
 [[domains]]
 host = "example.com"
 scheme = "https"

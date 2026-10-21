@@ -115,10 +115,6 @@ pending_timeout = "2h"
 interval = "6h"
 finalization_grace = "2m"
 
-[logging]
-level = "debug"
-discord_min_level = "error"
-
 [[domains]]
 host = "Example.COM."
 scheme = "HTTP"
@@ -139,8 +135,8 @@ seeds = ["/news/../", "https://child.example.com/path#fragment"]
     assert config.archive.pending_timeout == timedelta(hours=2)
     assert config.reporting.interval == timedelta(hours=6)
     assert config.reporting.finalization_grace == timedelta(minutes=2)
-    assert config.logging.level == "DEBUG"
-    assert config.logging.discord_min_level == "ERROR"
+    assert config.logging.level == "INFO"
+    assert config.logging.discord_min_level == "WARNING"
     assert config.domains[0].host == "example.com"
     assert config.domains[0].scheme == "http"
     assert config.domains[0].base_url == "http://example.com/"
@@ -216,7 +212,7 @@ def test_load_config_rejects_invalid_archive_recovery_period(tmp_path, monkeypat
         ),
         (
             '[ziggy]\ndatabase = "x"\n[logging]\ndiscord_webhook_url_env = "LOG_HOOK"',
-            "unknown logging field",
+            "unknown top-level field.*logging",
         ),
         ('archive = 1\n[ziggy]\ndatabase = "x"', "archive must be a TOML table"),
         ('domains = {}\n[ziggy]\ndatabase = "x"', "domains must be an array"),
@@ -252,24 +248,25 @@ def test_load_config_rejects_invalid_numbers(tmp_path, section, field, value, me
         load_config(write_config(tmp_path, body))
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "message"),
-    [
-        ("level", "1", "logging levels must be strings"),
-        ("discord_min_level", "false", "logging levels must be strings"),
-        ("level", '"not-a-level"', "logging.level is not a registered"),
-        (
-            "discord_min_level",
-            '"not-a-level"',
-            "logging.discord_min_level is not a registered",
-        ),
-    ],
-)
-def test_load_config_rejects_invalid_logging_levels(tmp_path, field, value, message):
-    body = f'[ziggy]\ndatabase = "x"\n[logging]\n{field} = {value}\n'
+MINIMAL_CONFIG = '[ziggy]\ndatabase = "x"\n'
 
-    with pytest.raises(ConfigError, match=message):
-        load_config(write_config(tmp_path, body))
+
+def test_load_config_reads_logging_levels_from_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZIGGY_LOG_LEVEL", "debug")
+    monkeypatch.setenv("ZIGGY_LOG_DISCORD_LEVEL", "error")
+
+    config = load_config(write_config(tmp_path, MINIMAL_CONFIG))
+
+    assert config.logging.level == "DEBUG"
+    assert config.logging.discord_min_level == "ERROR"
+
+
+@pytest.mark.parametrize("name", ["ZIGGY_LOG_LEVEL", "ZIGGY_LOG_DISCORD_LEVEL"])
+def test_load_config_rejects_invalid_logging_levels(tmp_path, monkeypatch, name):
+    monkeypatch.setenv(name, "not-a-level")
+
+    with pytest.raises(ConfigError, match=f"{name} is not a registered"):
+        load_config(write_config(tmp_path, MINIMAL_CONFIG))
 
 
 @pytest.mark.parametrize(
