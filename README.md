@@ -4,7 +4,7 @@
 
 Ziggy crawls and preserves websites you care about.
 
-[![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Python 3.15+](https://img.shields.io/badge/Python-3.15%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![CI](https://img.shields.io/github/actions/workflow/status/EthanC/Ziggy/ci.yml?branch=main&style=flat-square&label=build)](https://github.com/EthanC/Ziggy/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?style=flat-square)](https://github.com/EthanC/Ziggy/actions/workflows/ci.yml)
 
@@ -53,7 +53,7 @@ docker compose up -d
 
 ## Python
 
-Ziggy requires Python 3.14 and [`uv`](https://docs.astral.sh/uv/).
+Ziggy requires Python 3.15 and [`uv`](https://docs.astral.sh/uv/).
 
 ```console
 uv sync --locked

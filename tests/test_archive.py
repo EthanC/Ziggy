@@ -1694,18 +1694,18 @@ class NativeJob:
 async def test_adapter_submit_builds_required_options_without_network():
     native = NativeSubmitClient(NativeJob("native-job"))
     adapter = object.__new__(archive.ArchivistClient)
-    adapter._has_account = True  # noqa: SLF001
-    adapter._client = native  # noqa: SLF001
-    adapter._request_lock = asyncio.Lock()  # noqa: SLF001
-    adapter._request_delay = 0  # noqa: SLF001
-    adapter._adaptive_request_delay = 0  # noqa: SLF001
-    adapter._server_error_recovery_period = timedelta(minutes=15)  # noqa: SLF001
-    adapter._last_request_at = None  # noqa: SLF001
-    adapter._rate_limit_until = None  # noqa: SLF001
-    adapter._rate_limit_recovery_started_at = None  # noqa: SLF001
-    adapter._server_error_failures = 0  # noqa: SLF001
-    adapter._last_server_error_at = None  # noqa: SLF001
-    adapter._server_error_until = None  # noqa: SLF001
+    adapter._has_account = True
+    adapter._client = native
+    adapter._request_lock = asyncio.Lock()
+    adapter._request_delay = 0
+    adapter._adaptive_request_delay = 0
+    adapter._server_error_recovery_period = timedelta(minutes=15)
+    adapter._last_request_at = None
+    adapter._rate_limit_until = None
+    adapter._rate_limit_recovery_started_at = None
+    adapter._server_error_failures = 0
+    adapter._last_server_error_at = None
+    adapter._server_error_until = None
 
     result = await adapter.submit("https://example.com/", SETTINGS.dedupe_window)
 
@@ -1798,18 +1798,18 @@ class NativeClient:
 
 def adapter_with(native: NativeClient) -> archive.ArchivistClient:
     adapter = object.__new__(archive.ArchivistClient)
-    adapter._has_account = True  # noqa: SLF001
-    adapter._client = native  # noqa: SLF001
-    adapter._request_lock = asyncio.Lock()  # noqa: SLF001
-    adapter._request_delay = 0  # noqa: SLF001
-    adapter._adaptive_request_delay = 0  # noqa: SLF001
-    adapter._server_error_recovery_period = timedelta(minutes=15)  # noqa: SLF001
-    adapter._last_request_at = None  # noqa: SLF001
-    adapter._rate_limit_until = None  # noqa: SLF001
-    adapter._rate_limit_recovery_started_at = None  # noqa: SLF001
-    adapter._server_error_failures = 0  # noqa: SLF001
-    adapter._last_server_error_at = None  # noqa: SLF001
-    adapter._server_error_until = None  # noqa: SLF001
+    adapter._has_account = True
+    adapter._client = native
+    adapter._request_lock = asyncio.Lock()
+    adapter._request_delay = 0
+    adapter._adaptive_request_delay = 0
+    adapter._server_error_recovery_period = timedelta(minutes=15)
+    adapter._last_request_at = None
+    adapter._rate_limit_until = None
+    adapter._rate_limit_recovery_started_at = None
+    adapter._server_error_failures = 0
+    adapter._last_server_error_at = None
+    adapter._server_error_until = None
     return adapter
 
 

@@ -2,7 +2,7 @@
 
 FROM ghcr.io/astral-sh/uv:latest AS uv
 
-FROM python:alpine AS builder
+FROM python:3.15-alpine AS builder
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /build
 ENV UV_COMPILE_BYTECODE=1 \
@@ -12,7 +12,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project \
     && chmod -R a-w /build/.venv
 
-FROM python:alpine AS runtime
+FROM python:3.15-alpine AS runtime
 ARG VERSION=0.1.0
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="Ziggy" \

@@ -13,7 +13,7 @@ from ziggy.database import create_engine, session_factory
 from ziggy.http.routes import AdmissionRateLimiter, queue_submission
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
 
@@ -22,7 +22,7 @@ def create_app(database: Path) -> Starlette:
     engine = create_engine(database, busy_timeout_ms=250)
 
     @asynccontextmanager
-    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    async def lifespan(app: Starlette) -> AsyncGenerator[None]:
         del app
         try:
             yield
