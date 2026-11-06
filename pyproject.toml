@@ -11,7 +11,7 @@ dependencies = [
     "aiosqlite",
     "alembic",
     "archivist-py",
-    "cronsim>=2.7",
+    "cronsim>=2.8",
     "discord-clyde>=1.1.0",
     "environs>=15.2.0",
     "loguru",
@@ -19,8 +19,8 @@ dependencies = [
     "niquests",
     "sqlalchemy[asyncio]",
     "starlette",
-    "tzdata>=2026.4",
-    "tzlocal>=5.4.4",
+    "tzdata>=2026.6",
+    "tzlocal>=5.4.5",
     "uvicorn[standard]",
 ]
 
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.uv]
-required-version = ">=0.12.19"
+required-version = ">=0.13.7"
 package = false
 
 [tool.ruff]
